@@ -1,0 +1,47 @@
+# macOS metadata
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+
+# APK/ZIP originales y APK extraído completo (contiene el .so propietario del
+# juego bajo lib/armeabi/) -- nunca commitear el juego. Regenerable por el
+# usuario final a partir de su propia copia legal del APK.
+*.apk
+*.zip
+/inotia3-1-3-2/
+
+# Java decompilado con jadx (derivado de material propietario, regenerable con
+# `jadx -d decompiled_apk inotia3-1-3-2.apk` -- ver PORTING_PLAN.md Fase 1)
+/decompiled_apk/
+
+# Pseudo-C del .so decompilado con Ghidra/devrvk-so-decompiler (derivado,
+# regenerable -- ver PORTING_PLAN.md Fase 1)
+/decompiled_so/
+
+# Build artifacts
+/build/
+CMakeCache.txt
+CMakeFiles/
+Makefile
+cmake_install.cmake
+*.elf
+*.vpk
+*.suprx
+
+# Python bytecode cache
+__pycache__/
+*.pyc
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Depuración en hardware real (logs, core dumps bajados por FTP)
+/logs/
+log_*.txt
+*.psp2dmp
+
+# Legacy / rutas de entorno local
+PS Vita
