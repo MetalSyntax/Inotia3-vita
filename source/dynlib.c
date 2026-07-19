@@ -20,6 +20,7 @@
 #include <malloc.h>
 #include <math.h>
 #include <netdb.h>
+#include <arpa/inet.h>
 #include <string.h>
 #include <wchar.h>
 #include <wctype.h>
@@ -324,6 +325,7 @@ so_default_dynlib default_dynlib[] = {
         { "getservbyname", (uintptr_t)&getservbyname },
         { "getsockname", (uintptr_t)&getsockname },
         { "getsockopt", (uintptr_t)&getsockopt },
+        { "inet_addr", (uintptr_t)&inet_addr },
         { "inet_aton", (uintptr_t)&inet_aton },
         { "inet_ntoa", (uintptr_t)&inet_ntoa },
         { "inet_ntop", (uintptr_t)&inet_ntop },
@@ -372,6 +374,7 @@ so_default_dynlib default_dynlib[] = {
         { "readdir", (uintptr_t)&readdir_soloader },
         { "readdir_r", (uintptr_t)&readdir_r_soloader },
         { "stat", (uintptr_t)&stat_soloader },
+        { "statfs", (uintptr_t)&ret0 }, // no statfs() in VitaSDK newlib -- safe stub, not confirmed critical
         { "utime", (uintptr_t)&utime },
 
         #ifdef USE_SCELIBC_IO

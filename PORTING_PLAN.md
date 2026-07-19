@@ -143,25 +143,60 @@ GLES1 fijo sin shaders, I/O de archivos estándar (sin JNI de assets custom), 44
 clases Java. **Este port arranca desde cero** — no hay código de otro port para forkear directamente, solo
 arquitectura genérica de `psvita-porting`.
 
-### Fase 2: Bootstrap del Loader
-1. El boilerplate ya presente en `source/`/`lib/` (`so_util.c/h`, `lib/falso_jni/*` vendorizado, `dynlib.c`,
-   `java.c`, `main.c`) es el punto de partida genérico de SoLoBoP — **no** viene de Zenonia ni Dungeon
-   Hunter 2, hay que llenarlo con la lógica específica de Inotia 3, no adaptar código ya escrito de otro
-   juego.
-2. `source/java.c`: registrar los 44 métodos `Java_com_com2us_*` reales (ver sección 0) — priorizar los de
-   `WrapperRenderer` (ciclo de vida) y dejar como no-op silencioso los de `InApp`/`ADManager`/
-   `TapjoyManager`/`NewsBanner`/`WrapperProtection` hasta confirmar que alguno bloquea el arranque.
-3. `source/dynlib.c`: hooks de archivo (`fopen_hook`/`stat_hook`/`opendir_hook` → `ux0:data/inotia3/
-   assets/`, sin el truco de header Dalvik de 16 bytes que sí hacía falta en Zenonia) y wrappers GLES1 de
-   punto fijo (`glClearColorx`, etc. — ver sección 0, Gráficos).
-4. `source/main.c`: cargar `libgame.so`, resolver e invocar en orden `JNI_OnLoad` → (lo que dispare
-   `WrapperActivity`/`onCreate` real) → `nativePreInit(screenW, screenH)` → `nativeInit(...)`. Confirmar en
-   `out_ghidra.c` si hace falta alguna llamada adicional antes de estas dos (algunos wrappers Com2uS
-   inicializan un heap propio como Zenonia3's `GxCreateGlobalHeap` — buscar el patrón).
-5. `CMakeLists.txt`: ya actualizado con `VITA_APP_NAME "Inotia 3"`, `VITA_TITLEID "INOTIA3PV"`,
-   `VITA_VPKNAME "inotia3"`, `DATA_PATH "ux0:data/inotia3/"`, `SO_PATH "${DATA_PATH}libgame.so"`, nombre de
-   proyecto `inotia3`.
-6. Primer build: objetivo es que compile, no que corra.
+### Fase 2: Bootstrap del Loader — ✅ Compila (2026-07-19), pendiente primera corrida
+
+> **Estado real:** el boilerplate resultó estar mucho más completo de lo que parecía a primera vista — no
+> era una plantilla en blanco. `utils/init.c::soloader_init_all()` ya hacía **todo** el bootstrap genérico
+> (`so_file_load` → `settings_load` → `so_relocate` → `resolve_imports` → `so_patch` → `so_flush_caches` →
+> `so_initialize` → `gl_preload` → `jni_init`) y `source/dynlib.c` ya traía prácticamente el 100% de la
+> tabla de imports confirmada en la Fase 0 (todo el pipeline GLES1 fijo, libc, sockets, pthread, etc.) —
+> solo faltaban `inet_addr` y un stub de `statfs` (agregados). Lo que sí faltaba por completo:
+> `lib/falso_jni/` estaba **vacío** en disco (el submódulo git nunca se vendorizó en esta copia de trabajo)
+> — se copió el vendoring completo (MIT, v-atamanenko) desde `../Zenonia2-vita/lib/falso_jni/`.
+>
+> Un fork dedicado barrió `decompiled_so/libgame_armeabi/out_ghidra.c` (214k líneas) buscando toda llamada
+> JNIEnv que el `.so` hace *hacia* "Java" (no las 44 exportadas, esas se llaman directo por símbolo desde
+> `main.c`). Hallazgo clave: **de ~160 llamadas JNI encontradas, ninguna pertenece a `WrapperRenderer`** —
+> son todas de subsistemas opcionales (Hub, IAP, Tapjoy, ads, news banner, stats de memoria de un HUD de
+> debug) que ya estaban marcados como "no-op hasta que se demuestre necesario". Ghidra no pudo resolver el
+> nombre de la mayoría (firmas JNI quedaron como punteros `DAT_xxxxx` sin texto recuperable) — **solo se
+> registraron en `java.c` los 6 casos con firma JNI literal confirmada** (`HubInitialize`, `alertPopup`,
+> `setGameResolution`, `adCreate`, `setAdProperty`, `newsBannerInit`, todos no-ops seguros). El resto queda
+> deliberadamente sin registrar: un método no registrado hace que `GetMethodID` devuelva `NULL` (que el
+> motor debería chequear antes de llamar), mientras que registrarlo con un tipo de retorno *adivinado* mal
+> puede ser peor (`methodIntCall` devuelve `-1` para un id no encontrado en su tabla específica, que el
+> motor podría leer como `true`). Ver el header-comment de `source/java.c` para el detalle completo.
+>
+> **`source/main.c` reescrito** con la secuencia real: `JNI_OnLoad` → `nativePreInit(parameter[3], 960,
+> 544)` → `nativeInit(systemCurrentTime[1], appUpTime[1], pixel[1024*1024], gyro[3], activity_placeholder)`
+> (tamaños de `pixel`/`gyro` confirmados leyendo `WrapperJinterface.java`/`GyroManager.java` — `pixel` es un
+> buffer de glifos de texto de 1024×1024 ints, ~4MB, el mismo patrón que `text_rendering.md` de la skill
+> `psvita-porting`) → loop llamando solo `nativeReDraw()` + `gl_swap()` por ahora (sin `nativeEvent`/
+> `nativeRender` todavía — eso es Fase 5, Input).
+>
+> **Compilación real verificada** con el toolchain de VitaSDK instalado (`~/vitasdk`) vía `cmake`+`make` en
+> `/tmp/inotia3-build` (mismo workaround de ruta-con-espacio que usa `build_and_install.sh`): **build
+> exitoso, `inotia3.vpk`/`eboot.bin` generados sin errores** (solo warnings inofensivos de `mktemp`
+> deprecated y un cast en `FalsoJNI_ImplBridge.c` que es del vendoring, no nuestro). Se agregó
+> `game_log()` en `main.c` (bridge hacia `l_info` de `utils/logger.h`) porque `FalsoJNI_Logger.c` vendorizado
+> esperaba esa función para sus propios logs `[JNI]`/`[JNI WARN]`/`[JNI ERR]`.
+>
+> **Sin confirmar todavía (bloquea Fase 3, no Fase 2):**
+> - Convención real de rutas de archivo: el fork no pudo determinar con confianza si `fopen`/`stat` esperan
+>   rutas absolutas, relativas a `assets/`, o algo construido desde un callback tipo `getFilesDir()` — no se
+>   encontró ningún lookup JNI con firma `Ljava/io/File;` en los ~160 casos revisados (argumento débil en
+>   contra de esa última hipótesis, no una confirmación). `source/dynlib.c` todavía no tiene hooks de ruta
+>   específicos de Inotia 3 — hace falta un primer log de consola/Vita3K mostrando qué ruta pide el juego
+>   antes de escribir el hook, no adivinar.
+> - ABI real de los arrays que recibe `nativeInit` (Dalvik `ArrayObject` de 16 bytes crudo, como Zenonia, vs.
+>   `Get/ReleaseXxxArrayElements` reales vía JNIEnv) — se pasaron punteros C planos como hipótesis de
+>   trabajo; si el primer run crashea dentro de `nativeInit` con un patrón de memoria corrupta, este es el
+>   sospechoso número uno.
+> - El objeto `activity` pasado a `nativeInit` es un sentinel (`&fake_activity_obj`), no un `jobject` real —
+>   si el `.so` intenta `Call*Method` sobre él, el nombre pedido necesita un handler nuevo en `java.c`.
+>
+> `CMakeLists.txt` ya tiene `VITA_APP_NAME "Inotia 3"`, `VITA_TITLEID "INOTIA3PV"`, `VITA_VPKNAME "inotia3"`,
+> `DATA_PATH "ux0:data/inotia3/"`, `SO_PATH "${DATA_PATH}libgame.so"`, proyecto `inotia3`.
 
 ### Fase 3: Primera Puesta en Marcha (Vita3K primero, consola real después)
 Metodología igual a `psvita-porting`/`so-crash-triage`: **un log a la vez, un bug a la vez**, log con
