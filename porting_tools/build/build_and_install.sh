@@ -51,7 +51,8 @@ else
 fi
 
 cmake "$SRC_DIR" -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DCMAKE_BUILD_TYPE="$BUILD_TYPE"
-make -j$(sysctl -n hw.ncpu)
+NCPUS=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
+make -j$NCPUS
 
 echo "[3/3] Exportando archivos generados..."
 mkdir -p "$PROJECT_DIR/build"

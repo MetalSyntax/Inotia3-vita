@@ -9,9 +9,13 @@
 
 #include <psp2/kernel/clib.h>
 #include <psp2/kernel/threadmgr.h>
+#include <psp2/io/fcntl.h>
+#include <psp2/io/stat.h>
+#include <psp2/rtc.h>
 
 #include <stdbool.h>
 #include <stdatomic.h>
+#include <string.h>
 
 #define COLOR_RED    "\x1B[38;5;196m"
 #define COLOR_PINK   "\x1B[38;5;212m"
@@ -23,7 +27,11 @@
 #define COLOR_END    "\033[0m"
 
 static SceKernelLwMutexWork _log_mutex;
-static atomic_bool _log_mutex_ready = ATOMIC_VAR_INIT(false);
+// ATOMIC_VAR_INIT was deprecated in C17 and removed in C23; plain
+// initialisation is the documented replacement and builds on every toolchain.
+static atomic_bool _log_mutex_ready = false;
+static atomic_bool _log_file_ready = false;
+static SceUID log_fd = -1;
 
 // Buffer A is used to adjust the format string.
 static char buffer_a[2048];
@@ -40,6 +48,20 @@ void _log_print(int t, const char* fmt, ...) {
         atomic_store_explicit(&_log_mutex_ready, true, memory_order_relaxed);
     }
     sceKernelLockLwMutex(&_log_mutex, 1, NULL);
+
+    if (!atomic_load_explicit(&_log_file_ready, memory_order_relaxed)) {
+        sceIoMkdir("ux0:data/inotia3", 0777);
+        sceIoMkdir("ux0:data/inotia3/logs", 0777);
+
+        SceDateTime time;
+        sceRtcGetCurrentClockLocalTime(&time);
+        char log_path[128];
+        sceClibSnprintf(log_path, sizeof(log_path), "ux0:data/inotia3/logs/log_%04d-%02d-%02d_%02d-%02d-%02d.txt",
+                        time.year, time.month, time.day, time.hour, time.minute, time.second);
+        
+        log_fd = sceIoOpen(log_path, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
+        atomic_store_explicit(&_log_file_ready, true, memory_order_relaxed);
+    }
 
     switch (t) {
         case LT_DEBUG:
@@ -74,7 +96,11 @@ void _log_print(int t, const char* fmt, ...) {
     va_start(list, fmt);
     sceClibVsnprintf(buffer_b, sizeof(buffer_b), buffer_a, list);
     va_end(list);
+    
     sceClibPrintf(buffer_b);
+    if (log_fd >= 0) {
+        sceIoWrite(log_fd, buffer_b, strlen(buffer_b));
+    }
 
     if (atomic_load_explicit(&_log_mutex_ready, memory_order_relaxed)) {
         sceKernelUnlockLwMutex(&_log_mutex, 1);

@@ -2,6 +2,7 @@
 #include "utils/glutil.h"
 #include "utils/utils.h"
 #include "utils/logger.h"
+#include "wr_timer.h"
 
 #include <psp2/kernel/threadmgr.h>
 
@@ -64,6 +65,29 @@ void game_log(const char *fmt, ...) {
     l_info("%s", buf);
 }
 
+// Render-loop plumbing shared with the WrapperRenderer timer emulation
+// (wr_timer.c). The .so drives its game loop by asking WrapperJinterface for
+// timers (java.c -> wr_set_timer) and expects nativeRender(timerID) called back
+// when each is due; wr_run_timers() below does that dispatch.
+static jlong *g_sysTime_ptr = NULL;   // == the .so's CS_knlCurrentTime() source
+static jint  *g_upTime_ptr = NULL;    // == the .so's CS_knlUpTime() source
+static uint64_t g_start_time = 0;
+static void (*g_nativeRender)(void *env, void *clazz, int timerID) = NULL;
+
+// WrapperRenderer.UpdateCurTime(): refresh the shared clock arrays and return
+// the current wall-clock time in ms.
+static int64_t wr_update_time(void) {
+    uint64_t now = current_timestamp_ms();
+    g_sysTime_ptr[0] = (jlong) now;
+    g_upTime_ptr[0] = (jint) (now - g_start_time);
+    return (int64_t) now;
+}
+
+// WrapperRenderer.nativeRender(int) dispatch.
+static void wr_render(int timerID) {
+    g_nativeRender(&jni, NULL, timerID);
+}
+
 int main() {
     soloader_init_all();
 
@@ -82,7 +106,7 @@ int main() {
     // nativePreInit() writes into `parameter` (WrapperRenderer.java passes an
     // uninitialized `int[3]`) -- allocate zeroed, don't assume the .so
     // ignores it just because Java never reads it back itself.
-    int parameter[3] = {0, 0, 0};
+    jintArray parameter = jni->NewIntArray(&jni, 3);
     nativePreInit(&jni, NULL, parameter, SCREEN_W, SCREEN_H);
 
     // WrapperRenderer.UpdateCurTime() (Java) computes these two *before*
@@ -91,30 +115,58 @@ int main() {
     // (~0 here). Mirrored with current_timestamp_ms() rather than passing
     // zeros, since it's cheap to get right and unknown whether the .so reads
     // these once at init or relies on them being sane immediately.
-    long long systemCurrentTime[1] = { (long long) current_timestamp_ms() };
-    int appUpTime[1] = { 0 };
+    jlongArray systemCurrentTime = jni->NewLongArray(&jni, 1);
+    jlong *sysTime_ptr = jni->GetLongArrayElements(&jni, systemCurrentTime, NULL);
+    sysTime_ptr[0] = (jlong) current_timestamp_ms();
+
+    jintArray appUpTime = jni->NewIntArray(&jni, 1);
 
     // pixel: TEXTVIEW_HEIGHT * TEXTVIEW_WIDTH ints (~4MB) -- too big for the
     // stack, and it must stay alive for the lifetime of the .so (native code
     // keeps writing/reading it every frame via the pointer handed here once).
-    int *pixel = calloc((size_t) TEXTVIEW_WIDTH * TEXTVIEW_HEIGHT, sizeof(int));
+    jintArray pixel = jni->NewIntArray(&jni, TEXTVIEW_WIDTH * TEXTVIEW_HEIGHT);
 
     // GyroManager.gyro is a real `float[3]` (x/y/z) -- confirmed in
     // decompiled_apk's GyroManager.java. The Vita has no Android-style gyro
     // sensor API; zeroed is a safe placeholder until/unless a real run shows
     // the engine depends on nonzero motion values to boot.
-    float gyro[3] = { 0.0f, 0.0f, 0.0f };
+    jfloatArray gyro = jni->NewFloatArray(&jni, 3);
+
+    void (* nativeResume)(void *env, void *clazz) =
+        (void *) so_symbol(&so_mod, "Java_com_com2us_wrapper_WrapperRenderer_nativeResume");
+    void (* nativeResumeClet)(void *env, void *clazz) =
+        (void *) so_symbol(&so_mod, "Java_com_com2us_wrapper_WrapperRenderer_nativeResumeClet");
+    void (* nativeRender)(void *env, void *clazz, int timerID) =
+        (void *) so_symbol(&so_mod, "Java_com_com2us_wrapper_WrapperRenderer_nativeRender");
+
+    // Timer table must be in its constructed (empty, maxIndex == -1) state
+    // before nativeInit(): startClet() runs *inside* nativeInit() and
+    // immediately registers g_MainTimer via WrapperJinterface.SetTimer ->
+    // wr_set_timer().
+    wr_timer_reset();
+    g_nativeRender = nativeRender;
 
     nativeInit(&jni, NULL, systemCurrentTime, appUpTime, pixel, gyro, &fake_activity_obj);
 
-    l_success("nativeInit() returned -- entering render loop.");
+    nativeResume(&jni, NULL);
+    nativeResumeClet(&jni, NULL);
 
-    // Touch/button -> nativeEvent() and timer -> nativeRender() wiring is
-    // Fase 5 (Input) work and not implemented yet (see PORTING_PLAN.md) --
-    // this loop only drives the per-frame redraw call so far, which is the
-    // minimum needed to get anything on screen at all for the first
-    // Vita3K/hardware run.
+    l_success("nativeInit() and resume returned -- entering render loop.");
+
+    jint *upTime_ptr = jni->GetIntArrayElements(&jni, appUpTime, NULL);
+
+    g_sysTime_ptr = sysTime_ptr;
+    g_upTime_ptr = upTime_ptr;
+    g_start_time = current_timestamp_ms();
+
+    // Mirror of WrapperRenderer.onDrawFrame(): fire every due software timer
+    // (which is what actually calls nativeRender() to advance the game state),
+    // then redraw the frame. Touch/button -> nativeEvent() wiring is still
+    // Fase 5 (Input) work (see PORTING_PLAN.md); the game boots and animates on
+    // its timers alone.
     while (1) {
+        wr_run_timers(wr_update_time, wr_render);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
         nativeReDraw(&jni, NULL);
         gl_swap();
     }

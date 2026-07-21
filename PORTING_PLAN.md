@@ -197,10 +197,52 @@ arquitectura genérica de `psvita-porting`.
 >
 > `CMakeLists.txt` ya tiene `VITA_APP_NAME "Inotia 3"`, `VITA_TITLEID "INOTIA3PV"`, `VITA_VPKNAME "inotia3"`,
 > `DATA_PATH "ux0:data/inotia3/"`, `SO_PATH "${DATA_PATH}libgame.so"`, proyecto `inotia3`.
+>
+> **Nota de toolchain (VitaSDK moderno, GCC 15.2 / binutils nuevos).** En un VitaSDK con GCC 15 el build
+> falla por estrictez nueva del compilador/linker que toolchains viejos toleraban. El `CMakeLists.txt`
+> del repo **no** se tocó (sigue apto para el toolchain original del `build_and_install.sh`); en su lugar,
+> al compilar sobre GCC 15 hay que añadir a `CMAKE_C_FLAGS` tres flags de compatibilidad:
+> `-fpermissive` (GCC 15 promueve a error `int-conversion`/`return-mismatch`/`implicit-decl` del FalsoJNI
+> vendorizado), `-Wl,--no-warn-mismatch` (el nuevo `ld` da error —antes solo warning— por el mismatch de
+> ABI VFP entre nuestros objetos `-mfloat-abi=softfp` y las libs hard-float del SDK; **no** cambiar a
+> `-mfloat-abi=hard`, rompería la interop de floats con el `.so` softfp) y `-Wl,--allow-multiple-definition`
+> (el `libvitaGL.a` nuevo ya trae EGL, que choca con `source/reimpl/egl.c`; los objetos del proyecto se
+> enlazan primero y ganan). Aparte, `ATOMIC_VAR_INIT` (removido en C23) se reemplazó por init plano en
+> `logger.c` — eso sí es un fix real portable, ya commiteado.
 
 ### Fase 3: Primera Puesta en Marcha (Vita3K primero, consola real después)
 Metodología igual a `psvita-porting`/`so-crash-triage`: **un log a la vez, un bug a la vez**, log con
 timestamp por corrida en `ux0:data/inotia3/logs/`.
+
+> **Corrida 1 (2026-07-19) — pantalla negra, sin crash. Diagnosticada y corregida.** El `.so` llegaba
+> hasta `nativeInit() and resume returned -- entering render loop` pero no dibujaba nada. Cruzando el log
+> con `out_ghidra.c` se hallaron **dos causas encadenadas**, ambas ahora arregladas:
+>
+> 1. **El game loop es dirigido por timers, no por frames.** El `.so` registra timers con
+>    `CS_knlSetTimer → TM_Set → jSetTimer →` JNI `WrapperJinterface.SetTimer(id, firetime, interval)`
+>    (estático, firma `(IJJ)V`); en Android `WrapperRenderer.process()` los dispara de vuelta llamando
+>    `nativeRender(id)` cuando vencen, y `TM_Run(id)` ejecuta el callback nativo (p.ej. `MainProcess` para
+>    `g_MainTimer`, que corre toda la máquina de estados y el dibujado). El loop viejo solo llamaba
+>    `nativeRender(0)` → ningún timer real (id ≠ 0) se disparaba nunca. **Fix:** se portó la tabla de
+>    timers de `WrapperRenderer` verbatim a `source/wr_timer.c`/`.h` (32 slots, `process()`/`SetTimer()`/
+>    `UnsetTimer()`), handlers `SetTimer`/`UnsetTimer` en `java.c` (ids 25/26), y `wr_run_timers()` en el
+>    loop de `main.c`. El reloj del `.so` (`CS_knlCurrentTime() == *jsystemTimePtr`) **es** el array
+>    `sysTime[]` que le pasamos a `nativeInit`, así que el `firetime` que llega por `SetTimer` es absoluto
+>    en ese reloj — hay que seguir actualizando `sysTime[0]` cada frame (espejo de `UpdateCurTime`).
+>
+> 2. **El anti-tamper saltaba `startClet()`.** `nativeInit` solo llama `startClet(0,0)` (que registra
+>    `g_MainTimer`) si `excuteDirectly()==0 && jIsCracked()==0`. Ambas detectan hacks vía
+>    `system("ps > ux0:data/inotia3/temp")` + `fopen(temp)`; la Vita no tiene shell, `temp` nunca se crea,
+>    `fopen`→NULL, y ambas retornan 1 ("tampered"). `jGetMemoryHackCheckType()` está hardcodeada a
+>    `return 7` (no se puede desactivar por JNI) y `excuteDirectly` además hurga en internals de `FILE` de
+>    bionic (layout no portable). **Fix:** se hookean ambas a `return 0` en `patch.c` vía
+>    `hook_addr(text_base + off)`: `excuteDirectly=0x000ecf15`, `jIsCracked=0x000e981d` (Thumb, del symtab
+>    estático de `nm libgame.so` — no están en `.dynsym`, así que `so_symbol` no los encuentra).
+>
+> Prueba irrefutable en el log: `fopen(ux0:data/inotia3/temp, r): 0x0` justo antes de "entering render
+> loop", y cero llamadas `SetTimer`. **Pendiente:** correr de nuevo y confirmar que aparece actividad de
+> `MainProcess` + draw calls GL reales. Próximos bloqueos probables: carga de texturas/assets (Fase 6) y
+> audio (Fase 7, ya con stubs no-op puestos).
 
 ### Fase 4: Gráficos (Wrappers GLES1 de punto fijo)
 Ver sección 0 (Gráficos). Sin shaders que traducir — enfocarse en conversión de formato de textura,
@@ -227,6 +269,16 @@ antes de mapear a `sceAudioOut`. Formatos de audio reales confirmados con `strin
 Tremor para `.ogg`. No hay código de test de audio heredado de otro port aplicable aquí (ver
 `porting_tools/tests/run_tests.sh`, dejado como placeholder) — escribir uno nuevo contra el decoder real
 elegido antes de dar por buena la implementación.
+
+> **Stubs no-op ya puestos (2026-07-19).** El sistema `SOUNDSYSTEM_*`/`SOUNDPLAYER_*` es interno del
+> `.so`, pero delega la reproducción real a Android por JNI mediante 9 métodos estáticos de
+> `WrapperJinterface` (los wrappers `jSound*` del `.so`). Todos retornan `int`:
+> `SoundCreate(String,bool)` `(Ljava/lang/String;Z)I`, `SoundPlay(int,bool)` `(IZ)I`,
+> `SoundSetVolume(int,int)` `(II)I`, y `SoundDestroy/Pause/Resume/Stop/Prepare/GetVolume(int)` `(I)I`.
+> Registrados en `java.c` (ids 27–35) como no-ops: `SoundCreate` entrega un handle único creciente (para
+> que el motor trate cada sonido como "cargado" y no reintente cargarlo cada frame), `SoundGetVolume`
+> devuelve 100, el resto devuelve 0. Esto desbloquea el arranque sin audio; implementar el decode real
+> (`.ogg`/`.mmf` → `sceAudioOut`) reemplaza estos stubs manteniendo la misma superficie JNI.
 
 ### Fase 8: Construcción y LiveArea
 `extras/livearea/` ya tiene los 4 PNG + `template.xml` del boilerplate genérico — reemplazar por arte real

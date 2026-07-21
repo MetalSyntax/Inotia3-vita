@@ -56,13 +56,15 @@ endif()
 if (CMAKE_BUILD_TYPE STREQUAL "Debug")
   add_definitions(-DDEBUG_SOLOADER)
   # Uncomment this for verbose FalsoJNI logging:
-  #add_definitions(-DFALSOJNI_DEBUGLEVEL=0)
+  add_definitions(-DFALSOJNI_DEBUGLEVEL=0)
 endif()
+
+add_definitions(-DFALSOJNI_DEBUGLEVEL=0)
 
 # makes sincos, sincosf, etc. visible
 add_definitions(-D_GNU_SOURCE -D__POSIX_VISIBLE=999999)
 
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wl,-q -O3 -g -ffast-math -mfloat-abi=softfp -Wno-deprecated")
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wl,-q -O3 -g -ffast-math -Wno-deprecated -Wl,--allow-multiple-definition")
 set(CMAKE_CXX_FLAGS "${CMAKE_C_FLAGS} -std=gnu++20 -Wno-write-strings -Wno-psabi")
 
 add_executable(${CMAKE_PROJECT_NAME}
@@ -70,6 +72,7 @@ add_executable(${CMAKE_PROJECT_NAME}
                source/dynlib.c
                source/java.c
                source/patch.c
+               source/wr_timer.c
                source/reimpl/bits/_ctype.c
                source/reimpl/egl.c
                source/reimpl/errno.c

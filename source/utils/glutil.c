@@ -41,7 +41,7 @@ void gl_init() {
 }
 
 void gl_swap() {
-    vglSwapBuffers(GL_FALSE);
+    vglSwapBuffers(GL_TRUE);
 }
 
 void glShaderSource_soloader(GLuint shader, GLsizei count,

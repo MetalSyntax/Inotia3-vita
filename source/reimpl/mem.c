@@ -12,6 +12,7 @@
 
 #include <string.h>
 #include <malloc.h>
+#include <unistd.h>
 #include <psp2/kernel/clib.h>
 
 void *sceClibMemclr(void *dst, size_t len) {
@@ -24,8 +25,19 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offs) {
     if (length <= 0) {
         return MAP_FAILED;
     }
-    void* ret= malloc(length);
-    memset(ret, 0, length);
+    
+    void* ret = malloc(length);
+    if (!ret) return MAP_FAILED;
+    
+    if (fd != -1) {
+        off_t old_pos = lseek(fd, 0, SEEK_CUR);
+        lseek(fd, offs, SEEK_SET);
+        read(fd, ret, length);
+        lseek(fd, old_pos, SEEK_SET);
+    } else {
+        memset(ret, 0, length);
+    }
+    
     return ret;
 }
 

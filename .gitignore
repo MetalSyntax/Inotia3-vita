@@ -4,12 +4,29 @@
 .Spotlight-V100
 .Trashes
 
+# ==============================================================================
+# PROTECCIÓN CONTRA DMCA Y ARCHIVOS PROPIETARIOS
+# ==============================================================================
+
 # APK/ZIP originales y APK extraído completo (contiene el .so propietario del
 # juego bajo lib/armeabi/) -- nunca commitear el juego. Regenerable por el
 # usuario final a partir de su propia copia legal del APK.
 *.apk
 *.zip
+*.obb
+*.pak
+*.pk3
 /inotia3-1-3-2/
+
+# No subir los assets o recursos originales (música, imágenes, datos, etc.)
+/assets/
+/res/
+/lib/
+*.mp3
+*.ogg
+*.wav
+*.m4a
+*.mp4
 
 # Java decompilado con jadx (derivado de material propietario, regenerable con
 # `jadx -d decompiled_apk inotia3-1-3-2.apk` -- ver PORTING_PLAN.md Fase 1)
@@ -18,6 +35,21 @@
 # Pseudo-C del .so decompilado con Ghidra/devrvk-so-decompiler (derivado,
 # regenerable -- ver PORTING_PLAN.md Fase 1)
 /decompiled_so/
+
+# Librerías dinámicas originales no deben subirse (salvo que sea el binario final generado localmente, pero mejor ser restrictivo)
+*.so
+
+# ==============================================================================
+# IMÁGENES GENERADAS POR IA (GEMINI) / MOCKUPS
+# ==============================================================================
+Gemini_Generated_Image_*
+*gemini*.png
+*gemini*.jpg
+*gemini*.jpeg
+
+# ==============================================================================
+# ARTEFACTOS DE COMPILACIÓN Y SISTEMA
+# ==============================================================================
 
 # Build artifacts
 /build/
