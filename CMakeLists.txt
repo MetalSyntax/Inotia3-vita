@@ -6,7 +6,7 @@ endif ()
 
 set(CMAKE_TOOLCHAIN_FILE "$ENV{VITASDK}/share/vita.toolchain.cmake" CACHE PATH "Toolchain file")
 
-project(inotia3 C CXX)
+project(inotia3 C CXX ASM)
 
 include("${VITASDK}/share/vita.cmake" REQUIRED)
 
@@ -73,6 +73,10 @@ add_executable(${CMAKE_PROJECT_NAME}
                source/java.c
                source/patch.c
                source/wr_timer.c
+               source/wr_touch.c
+               source/reimpl/apk_zip.c
+               source/reimpl/jmp_shim.S
+               source/reimpl/jmp_shim_log.c
                source/reimpl/bits/_ctype.c
                source/reimpl/egl.c
                source/reimpl/errno.c

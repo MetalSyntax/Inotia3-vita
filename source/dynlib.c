@@ -46,6 +46,7 @@
 
 #include "reimpl/errno.h"
 #include "reimpl/io.h"
+#include "reimpl/jmp_shim.h"
 #include "reimpl/log.h"
 #include "reimpl/mem.h"
 #include "reimpl/pthr.h"
@@ -530,7 +531,7 @@ so_default_dynlib default_dynlib[] = {
         { "glCheckFramebufferStatusOES", (uintptr_t)&glCheckFramebufferStatus },
         { "glClear", (uintptr_t)&glClear },
         { "glClearColor", (uintptr_t)&glClearColor },
-        { "glClearColorx", (uintptr_t)&glClearColorx },
+        { "glClearColorx", (uintptr_t)&glClearColorx_soloader },
         { "glClearDepthf", (uintptr_t)&glClearDepthf },
         { "glClearDepthx", (uintptr_t)&glClearDepthx },
         { "glClearStencil", (uintptr_t)&glClearStencil },
@@ -541,7 +542,7 @@ so_default_dynlib default_dynlib[] = {
         { "glColor4ub", (uintptr_t)&glColor4ub },
         { "glColor4x", (uintptr_t)&glColor4x },
         { "glColorMask", (uintptr_t)&glColorMask },
-        { "glColorPointer", (uintptr_t)&glColorPointer },
+        { "glColorPointer", (uintptr_t)&glColorPointer_soloader },
         { "glCompileShader", (uintptr_t)&glCompileShader_soloader },
         { "glCompressedTexImage2D", (uintptr_t)&glCompressedTexImage2D },
         { "glCompressedTexSubImage2D", (uintptr_t)&ret0 },
@@ -567,8 +568,8 @@ so_default_dynlib default_dynlib[] = {
         { "glDisable", (uintptr_t)&glDisable },
         { "glDisableClientState", (uintptr_t)&glDisableClientState },
         { "glDisableVertexAttribArray", (uintptr_t)&glDisableVertexAttribArray },
-        { "glDrawArrays", (uintptr_t)&glDrawArrays },
-        { "glDrawElements", (uintptr_t)&glDrawElements },
+        { "glDrawArrays", (uintptr_t)&glDrawArrays_soloader },
+        { "glDrawElements", (uintptr_t)&glDrawElements_soloader },
         { "glDrawTexfOES", (uintptr_t)&ret0 },
         { "glDrawTexfvOES", (uintptr_t)&ret0 },
         { "glDrawTexiOES", (uintptr_t)&ret0 },
@@ -707,7 +708,7 @@ so_default_dynlib default_dynlib[] = {
         { "glStencilMask", (uintptr_t)&glStencilMask },
         { "glStencilOp", (uintptr_t)&glStencilOp },
         { "glStencilOpSeparate", (uintptr_t)&glStencilOpSeparate },
-        { "glTexCoordPointer", (uintptr_t)&glTexCoordPointer },
+        { "glTexCoordPointer", (uintptr_t)&glTexCoordPointer_soloader },
         { "glTexEnvf", (uintptr_t)&glTexEnvf },
         { "glTexEnvfv", (uintptr_t)&glTexEnvfv },
         { "glTexEnvi", (uintptr_t)&glTexEnvi },
@@ -720,14 +721,14 @@ so_default_dynlib default_dynlib[] = {
         { "glTexGenivOES", (uintptr_t)&ret0 },
         { "glTexGenxOES", (uintptr_t)&ret0 },
         { "glTexGenxvOES", (uintptr_t)&ret0 },
-        { "glTexImage2D", (uintptr_t)&glTexImage2D },
+        { "glTexImage2D", (uintptr_t)&glTexImage2D_soloader },
         { "glTexParameterf", (uintptr_t)&glTexParameterf },
         { "glTexParameterfv", (uintptr_t)&ret0 },
         { "glTexParameteri", (uintptr_t)&glTexParameteri },
         { "glTexParameteriv", (uintptr_t)&glTexParameteriv },
-        { "glTexParameterx", (uintptr_t)&glTexParameterx },
+        { "glTexParameterx", (uintptr_t)&glTexParameterx_soloader },
         { "glTexParameterxv", (uintptr_t)&ret0 },
-        { "glTexSubImage2D", (uintptr_t)&glTexSubImage2D },
+        { "glTexSubImage2D", (uintptr_t)&glTexSubImage2D_soloader },
         { "glTranslatef", (uintptr_t)&glTranslatef },
         { "glTranslatex", (uintptr_t)&glTranslatex },
         { "glUniform1f", (uintptr_t)&glUniform1f },
@@ -753,8 +754,8 @@ so_default_dynlib default_dynlib[] = {
         { "glVertexAttrib4f", (uintptr_t)&glVertexAttrib4f },
         { "glVertexAttrib4fv", (uintptr_t)&glVertexAttrib4fv },
         { "glVertexAttribPointer", (uintptr_t)&glVertexAttribPointer },
-        { "glVertexPointer", (uintptr_t)&glVertexPointer },
-        { "glViewport", (uintptr_t)&glViewport },
+        { "glVertexPointer", (uintptr_t)&glVertexPointer_soloader },
+        { "glViewport", (uintptr_t)&glViewport_soloader },
         { "glWeightPointerOES", (uintptr_t)&ret0 },
 
 
@@ -969,9 +970,16 @@ so_default_dynlib default_dynlib[] = {
         { "setenv", (uintptr_t)&setenv_soloader },
 
 
-        // Jmp
-        { "setjmp", (uintptr_t)&setjmp }, // TODO: May have different struct size?
-        { "longjmp", (uintptr_t)&longjmp }, // TODO: May have different struct size?
+        // Jmp -- setjmp_soloader/longjmp_soloader (reimpl/jmp_shim.S) replace
+        // VitaSDK newlib's own setjmp/longjmp: the .so was compiled against
+        // Android Bionic's jmp_buf layout/size, which we don't know and
+        // don't need to -- the shim only ever touches the minimal AAPCS
+        // callee-saved register set (40 bytes), guaranteed to fit within
+        // whatever real jmp_buf size the .so's own struct reserved (see
+        // PORTING_PLAN.md Fase 9: this was the confirmed cause of a real
+        // stack-protector crash inside libpng's png_create_read_struct_2).
+        { "setjmp", (uintptr_t)&setjmp_soloader },
+        { "longjmp", (uintptr_t)&longjmp_soloader },
 
 
         // Signals

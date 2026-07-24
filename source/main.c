@@ -3,6 +3,7 @@
 #include "utils/utils.h"
 #include "utils/logger.h"
 #include "wr_timer.h"
+#include "wr_touch.h"
 
 #include <psp2/kernel/threadmgr.h>
 
@@ -16,8 +17,17 @@
 int _newlib_heap_size_user = 256 * 1024 * 1024;
 
 #ifdef USE_SCELIBC_IO
-int sceLibcHeapSize = 4 * 1024 * 1024;
+int sceLibcHeapSize = 16 * 1024 * 1024;
 #endif
+
+// Corrida 15 (PORTING_PLAN.md): vitasdk's default main-thread stack (256KB)
+// is sized for simple homebrews, not a deeply-nested Android engine call
+// chain (JNI dispatch -> asset loader -> DecodePNG -> libpng ->
+// inflateInit_ -> zlib). A __stack_chk_fail kept firing inside libpng's
+// png_create_read_struct_2 with no local buffer overflow to account for it
+// -- the leading suspect left once heap size and jmp_shim were ruled out is
+// simply running the call stack too deep for the default reservation.
+unsigned int sceUserMainThreadStackSize = 4 * 1024 * 1024;
 
 so_module so_mod;
 
@@ -88,6 +98,14 @@ static void wr_render(int timerID) {
     g_nativeRender(&jni, NULL, timerID);
 }
 
+// WrapperRenderer.nativeEvent(int type, int p1, int p2, int touchCount)
+// dispatch -- see wr_touch.c for the touch-state machine that produces these
+// calls (Fase 5, Input).
+static void (*g_nativeEvent)(void *env, void *clazz, int type, int p1, int p2, int touchCount) = NULL;
+static void wr_dispatch_event(int type, int p1, int p2, int touchCount) {
+    g_nativeEvent(&jni, NULL, type, p1, p2, touchCount);
+}
+
 int main() {
     soloader_init_all();
 
@@ -138,6 +156,7 @@ int main() {
         (void *) so_symbol(&so_mod, "Java_com_com2us_wrapper_WrapperRenderer_nativeResumeClet");
     void (* nativeRender)(void *env, void *clazz, int timerID) =
         (void *) so_symbol(&so_mod, "Java_com_com2us_wrapper_WrapperRenderer_nativeRender");
+    g_nativeEvent = (void *) so_symbol(&so_mod, "Java_com_com2us_wrapper_WrapperRenderer_nativeEvent");
 
     // Timer table must be in its constructed (empty, maxIndex == -1) state
     // before nativeInit(): startClet() runs *inside* nativeInit() and
@@ -159,13 +178,26 @@ int main() {
     g_upTime_ptr = upTime_ptr;
     g_start_time = current_timestamp_ms();
 
-    // Mirror of WrapperRenderer.onDrawFrame(): fire every due software timer
-    // (which is what actually calls nativeRender() to advance the game state),
-    // then redraw the frame. Touch/button -> nativeEvent() wiring is still
-    // Fase 5 (Input) work (see PORTING_PLAN.md); the game boots and animates on
-    // its timers alone.
+    wr_touch_init();
+
+    // Mirror of WrapperRenderer.onDrawFrame() -> process(): drain queued
+    // touch events first (nativeEvent), then fire every due software timer
+    // (nativeRender -- which is what actually advances game state), then
+    // redraw the frame. Same order as WrapperRenderer.process() in
+    // decompiled_apk's WrapperRenderer.java.
     while (1) {
+        wr_process_touch(wr_dispatch_event);
         wr_run_timers(wr_update_time, wr_render);
+
+        // Defensive reset before our own clear: if the .so's own rendering
+        // left GL_SCISSOR_TEST enabled on a small rect from the previous
+        // frame (common with UI clipping), our glClear() below would only
+        // touch that rect too, leaving the rest of the panel showing
+        // whatever was last in VRAM there forever -- see PORTING_PLAN.md
+        // Fase 4 (same "reduced screen + border" symptom class already
+        // fixed once for glViewport in glutil.c's glViewport_soloader).
+        glDisable(GL_SCISSOR_TEST);
+        glViewport(0, 0, SCREEN_W, SCREEN_H);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
         nativeReDraw(&jni, NULL);
         gl_swap();

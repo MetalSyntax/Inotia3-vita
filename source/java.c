@@ -32,6 +32,26 @@
 
 #include "utils/logger.h"
 #include "wr_timer.h"
+#include "reimpl/apk_zip.h"
+
+#include <stdio.h>
+#include <string.h>
+#include <sys/stat.h>
+
+// WrapperData.java: getApkFilePath()/GAME_ASSETS_PATH/RES_NAME_APPEND.
+// GetFileDescriptor_stub below prefers a pre-extracted LOOSE copy of the
+// asset (see INOTIA3_LOOSE_ASSETS_PATH) -- no real .apk needed on the
+// console at all, matching how ../Zenonia2-vita/../Zenonia3-vita stage
+// their assets (plain files under ux0:data/..., never touching the .apk).
+// Inotia 3's own Android code just happens to route this one call through
+// AssetManager.openFd() (raw offset into the APK zip) rather than a
+// simple streaming readAssets()-style method like Zenonia's engine uses --
+// an engine difference, not a choice we made -- so falling back to parsing
+// the real .apk (apk_zip.c) only kicks in if the loose file isn't there.
+#define INOTIA3_APK_PATH "ux0:/data/inotia3/inotia3.apk"
+#define INOTIA3_GAME_ASSETS_PATH "common/game_res"
+#define INOTIA3_RES_NAME_APPEND ".jpg"
+#define INOTIA3_LOOSE_ASSETS_PATH "ux0:data/inotia3/assets/" INOTIA3_GAME_ASSETS_PATH "/"
 
 // Defined in main.c; also used by FalsoJNI_Logger.c. Routes engine/JNI traces
 // into this port's logger.
@@ -166,13 +186,16 @@ void Flush_stub(jmethodID id, va_list args) {
     // do nothing
 }
 
-// --- Audio no-op stubs (Fase 7) ---------------------------------------------
-// Hand out a unique, nonzero, monotonically increasing handle per SoundCreate.
+// --- Audio no-op stubs -------------------------------------------------------
+// Fase 7's real Tremor-backed playback (source/audio.c/.h) is temporarily
+// disconnected (not deleted) to eliminate the audio subsystem/mixer thread
+// as a variable while triaging the Fase 9 stack-protector crash in
+// png_create_read_struct_2 -- see PORTING_PLAN.md. Re-wire these back to
+// audio_sound_*() once that crash is resolved.
 static jint g_next_sound_handle = 1;
 
 jint SoundCreate_stub(jmethodID id, va_list args) {
     jstring name_obj = va_arg(args, jstring);
-    // jboolean isStreaming = va_arg(args, jint); // promoted to int in varargs
     if (name_obj) {
         const char *name = jni->GetStringUTFChars(&jni, name_obj, NULL);
         game_log("[Audio] SoundCreate(\"%s\") -> handle %d (no-op)", name, g_next_sound_handle);
@@ -181,12 +204,10 @@ jint SoundCreate_stub(jmethodID id, va_list args) {
     return g_next_sound_handle++;
 }
 
-// SoundPlay/Pause/Resume/Stop/Destroy/Prepare/SetVolume: accept and ignore.
 jint Sound_NoopOk(jmethodID id, va_list args) {
     return 0;
 }
 
-// SoundGetVolume(int): report full volume so the engine's mixer math stays sane.
 jint SoundGetVolume_stub(jmethodID id, va_list args) {
     return 100;
 }
@@ -260,12 +281,78 @@ jobject HttpPost_init_stub(jmethodID id, va_list args) {
     return (jobject)0x42424242; // Dummy object
 }
 
+// GetFileDescriptor_stub (below) resolves an asset to either a loose file
+// (offset 0, no .apk involved) or a real offset into INOTIA3_APK_PATH. Since
+// GetApkFilePath() is called separately, with no argument tying it to which
+// asset was just resolved, this one-shot flag is how the two calls stay in
+// sync -- set right before returning from GetFileDescriptor_stub, consumed
+// (and cleared) by the very next GetApkFilePath_stub call, matching the
+// call order confirmed in every real device log so far.
+static char g_pending_asset_path[256];
+static int g_pending_asset_is_loose = 0;
+
 jobject GetApkFilePath_stub(jmethodID id, va_list args) {
-    return jni->NewStringUTF(&jni, "ux0:/data/inotia3/inotia3.apk");
+    if (g_pending_asset_is_loose) {
+        g_pending_asset_is_loose = 0;
+        return jni->NewStringUTF(&jni, g_pending_asset_path);
+    }
+    return jni->NewStringUTF(&jni, INOTIA3_APK_PATH);
 }
 
+// WrapperJinterface.GetFileDescriptor(String filename, int[] value, boolean
+// closeFDdirectly): Object -- decompiled_so's jGetFileDescriptorEx() confirms
+// the reachable call site (CS_fsGetFileDescriptor) always passes
+// closeFDdirectly=1 and only reads the offset/length pair back out of
+// `value`, never the returned object -- so filling that array correctly and
+// returning NULL is exactly what the real Java implementation does too in
+// that path (WrapperJinterface.java: fd=null when closeFDdirectly). See
+// apk_zip.c for why the actual zip entry name needs ".jpg" appended.
 jobject GetFileDescriptor_stub(jmethodID id, va_list args) {
-    return (jobject)0; // return NULL, engine will probably try fallback
+    jstring name_obj = va_arg(args, jstring);
+    jintArray value_arr = va_arg(args, jintArray);
+    va_arg(args, jint); // closeFDdirectly -- always true at the only reachable call site
+
+    if (!name_obj || !value_arr) return 0;
+
+    const char *name = jni->GetStringUTFChars(&jni, name_obj, NULL);
+    jint *value = jni->GetIntArrayElements(&jni, value_arr, NULL);
+
+    char loose_path[256];
+    snprintf(loose_path, sizeof(loose_path), "%s%s%s",
+             INOTIA3_LOOSE_ASSETS_PATH, name, INOTIA3_RES_NAME_APPEND);
+
+    struct stat st;
+    if (stat(loose_path, &st) == 0) {
+        value[0] = 0;
+        value[1] = (jint) st.st_size;
+        strncpy(g_pending_asset_path, loose_path, sizeof(g_pending_asset_path) - 1);
+        g_pending_asset_path[sizeof(g_pending_asset_path) - 1] = '\0';
+        g_pending_asset_is_loose = 1;
+        l_debug("[Assets] GetFileDescriptor(\"%s\") -> loose file %s (length=%ld)",
+                name, loose_path, (long) st.st_size);
+    } else {
+        char entry_path[256];
+        snprintf(entry_path, sizeof(entry_path), "assets/%s/%s%s",
+                 INOTIA3_GAME_ASSETS_PATH, name, INOTIA3_RES_NAME_APPEND);
+
+        uint32_t offset = 0, length = 0;
+        int found = apk_zip_find_stored_entry(INOTIA3_APK_PATH, entry_path, &offset, &length);
+        g_pending_asset_is_loose = 0;
+
+        if (found == 0) {
+            value[0] = (jint) offset;
+            value[1] = (jint) length;
+            l_debug("[Assets] GetFileDescriptor(\"%s\") -> apk offset=%u length=%u", name, offset, length);
+        } else {
+            value[0] = -1;
+            value[1] = -1;
+            l_warn("[Assets] GetFileDescriptor(\"%s\") -> \"%s\" not found as a loose file (%s) or in the apk (%s)",
+                   name, loose_path, entry_path, INOTIA3_APK_PATH);
+        }
+    }
+
+    jni->ReleaseStringUTFChars(&jni, name_obj, (char *) name);
+    return 0;
 }
 
 jobject GetAppProperty_stub(jmethodID id, va_list args) {

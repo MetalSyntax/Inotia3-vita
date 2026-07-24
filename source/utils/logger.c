@@ -30,8 +30,8 @@ static SceKernelLwMutexWork _log_mutex;
 // ATOMIC_VAR_INIT was deprecated in C17 and removed in C23; plain
 // initialisation is the documented replacement and builds on every toolchain.
 static atomic_bool _log_mutex_ready = false;
-static atomic_bool _log_file_ready = false;
-static SceUID log_fd = -1;
+static atomic_bool _log_path_ready = false;
+static char log_path[128];
 
 // Buffer A is used to adjust the format string.
 static char buffer_a[2048];
@@ -49,18 +49,15 @@ void _log_print(int t, const char* fmt, ...) {
     }
     sceKernelLockLwMutex(&_log_mutex, 1, NULL);
 
-    if (!atomic_load_explicit(&_log_file_ready, memory_order_relaxed)) {
+    if (!atomic_load_explicit(&_log_path_ready, memory_order_relaxed)) {
         sceIoMkdir("ux0:data/inotia3", 0777);
         sceIoMkdir("ux0:data/inotia3/logs", 0777);
 
         SceDateTime time;
         sceRtcGetCurrentClockLocalTime(&time);
-        char log_path[128];
         sceClibSnprintf(log_path, sizeof(log_path), "ux0:data/inotia3/logs/log_%04d-%02d-%02d_%02d-%02d-%02d.txt",
                         time.year, time.month, time.day, time.hour, time.minute, time.second);
-        
-        log_fd = sceIoOpen(log_path, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
-        atomic_store_explicit(&_log_file_ready, true, memory_order_relaxed);
+        atomic_store_explicit(&_log_path_ready, true, memory_order_relaxed);
     }
 
     switch (t) {
@@ -98,8 +95,20 @@ void _log_print(int t, const char* fmt, ...) {
     va_end(list);
     
     sceClibPrintf(buffer_b);
-    if (log_fd >= 0) {
-        sceIoWrite(log_fd, buffer_b, strlen(buffer_b));
+    // so-crash-triage (2026-07-21): keeping a single log_fd open for the
+    // whole process and writing to it via sceIoWrite() lost data on a real
+    // hard crash -- confirmed empirically (one run captured all 475 lines,
+    // others came back truncated to just the final fatal line, same code
+    // path every time) and NOT fixed by adding sceIoSyncByFd() after each
+    // write either. Opening, writing, and closing the file fresh on every
+    // single line is slower but makes each line's durability independent of
+    // whatever OS-level write-back caching this device/storage combo does --
+    // a close() is a far more universally-honored flush boundary than an
+    // explicit sync call.
+    SceUID fd = sceIoOpen(log_path, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0777);
+    if (fd >= 0) {
+        sceIoWrite(fd, buffer_b, strlen(buffer_b));
+        sceIoClose(fd);
     }
 
     if (atomic_load_explicit(&_log_mutex_ready, memory_order_relaxed)) {

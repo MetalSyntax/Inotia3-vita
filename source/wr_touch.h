@@ -1,0 +1,51 @@
+/*
+ * @file  wr_touch.h
+ * @brief Host-side reimplementation of com.com2us.wrapper.WrapperEventHandler's
+ *        MultiTouchListener (decompiled_apk's WrapperEventHandler.java).
+ *
+ * `WrapperActivity.IsMultiTouch` defaults to `true` and MainActivity never
+ * overrides it (PORTING_PLAN.md Fase 5), so Inotia 3 always runs the
+ * MultiTouchListener branch (MAX_TOUCH_POINT = 5), never the single-touch one.
+ * That listener packs each event as:
+ *
+ *   nativeEvent(type, PointID + 1, MAKEWORD(x, y), touchCount)
+ *
+ * where MAKEWORD(x,y) = ((x & 0xFFFF) << 16) | (y & 0xFFFF), PointID is a
+ * *stable* per-finger slot 0..4 (Android's MotionEvent pointer id -- NOT
+ * SceTouchReport::id, which is an ever-growing 8-bit hardware counter; see
+ * psvita-porting skill's input_handling.md for why passing that raw id
+ * corrupts the engine's fixed-size per-touch arrays), and `type` is one of
+ * WR_TOUCH_DOWN/DRAG/UP below. GetScreenWidth()/GetRealScreenWidth() (and
+ * the Height pair) are both stubbed to 960/544 in java.c, so
+ * WrapperEventHandler's ViewPortWay letterbox offset is always a no-op here
+ * -- no extra coordinate transform needed beyond panel-to-screen scaling.
+ */
+
+#ifndef INOTIA3_WR_TOUCH_H
+#define INOTIA3_WR_TOUCH_H
+
+// Mirrors WrapperEventHandler.MAX_TOUCH_POINT (== 5, the MultiTouchListener branch).
+#define WR_MAX_TOUCH_POINT 5
+
+// MultiTouchListener's CS_APP_EVENT_*_EX constants (0x80000004/5/6).
+#define WR_TOUCH_DOWN (-2147483644)
+#define WR_TOUCH_DRAG (-2147483643)
+#define WR_TOUCH_UP   (-2147483642)
+
+// WrapperRenderer.nativeEvent(int type, int p1, int p2, int touchCount) dispatch.
+typedef void (*wr_native_event_fn)(int type, int p1, int p2, int touchCount);
+
+// Call once, before the render loop starts -- sceTouchPeek() always reports
+// reportNum == 0 until the front panel's sampling is explicitly enabled
+// (psvita-porting skill's input_handling.md).
+void wr_touch_init(void);
+
+// Call once per frame. Reads sceTouchPeek(), assigns stable 0..4 slots to
+// each active hardware touch id, and calls native_event() for every
+// begin/drag/end -- mirroring MultiTouchListener.onTouch()'s ACTION_DOWN/
+// POINTER_DOWN (case 0/5), ACTION_UP/POINTER_UP (case 1/6), and
+// ACTION_MOVE (case 2, gated by the same 40ms + >2px drag threshold as the
+// Java original) branches.
+void wr_process_touch(wr_native_event_fn native_event);
+
+#endif // INOTIA3_WR_TOUCH_H

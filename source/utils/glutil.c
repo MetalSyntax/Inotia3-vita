@@ -44,6 +44,161 @@ void gl_swap() {
     vglSwapBuffers(GL_TRUE);
 }
 
+void glViewport_soloader(GLint x, GLint y, GLsizei width, GLsizei height) {
+    static int log_count = 0;
+    if (log_count < 10) {
+        l_debug("[GL] glViewport requested x=%d y=%d w=%d h=%d -- forcing 0,0,960,544", x, y, width, height);
+        log_count++;
+    }
+    glViewport(0, 0, 960, 544);
+}
+
+static void force_linear_filter(GLenum target) {
+    glTexParameteri(target, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(target, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+}
+
+void glTexImage2D_soloader(GLenum target, GLint level, GLint internalformat,
+                           GLsizei width, GLsizei height, GLint border,
+                           GLenum format, GLenum type, const void *pixels) {
+    static int log_count = 0;
+    if (log_count < 10) {
+        l_debug("[GL] glTexImage2D level=%d intFmt=%x w=%d h=%d format=%x type=%x",
+                level, internalformat, width, height, format, type);
+        log_count++;
+    }
+    glTexImage2D(target, level, internalformat, width, height, border, format, type, pixels);
+    force_linear_filter(target);
+}
+
+void glTexSubImage2D_soloader(GLenum target, GLint level, GLint xoffset, GLint yoffset,
+                              GLsizei width, GLsizei height, GLenum format,
+                              GLenum type, const void *pixels) {
+    glTexSubImage2D(target, level, xoffset, yoffset, width, height, format, type, pixels);
+    force_linear_filter(target);
+}
+
+void glClearColorx_soloader(GLfixed red, GLfixed green, GLfixed blue, GLfixed alpha) {
+    glClearColor(red / 65536.0f, green / 65536.0f, blue / 65536.0f, alpha / 65536.0f);
+}
+
+void glTexParameterx_soloader(GLenum target, GLenum pname, GLfixed param) {
+    glTexParameteri(target, pname, param);
+}
+
+// Deferred GL_FIXED -> GL_FLOAT conversion state for the vertex/color/
+// texcoord arrays (see glutil.h comment). Populated by the *Pointer_soloader
+// setters below, consumed and cleared by glDrawArrays_soloader/
+// glDrawElements_soloader once the real vertex count is known.
+static const int32_t *pending_fixed_verts = NULL;
+static GLint pending_fixed_vert_size = 0;
+static GLsizei pending_fixed_vert_stride = 0;
+static GLfloat *fixed_vert_buf = NULL;
+static int fixed_vert_buf_cap = 0;
+
+static const int32_t *pending_fixed_colors = NULL;
+static GLint pending_fixed_color_size = 0;
+static GLsizei pending_fixed_color_stride = 0;
+static GLfloat *fixed_color_buf = NULL;
+static int fixed_color_buf_cap = 0;
+
+static const int32_t *pending_fixed_texcoords = NULL;
+static GLint pending_fixed_texcoord_size = 0;
+static GLsizei pending_fixed_texcoord_stride = 0;
+static GLfloat *fixed_texcoord_buf = NULL;
+static int fixed_texcoord_buf_cap = 0;
+
+void glVertexPointer_soloader(GLint size, GLenum type, GLsizei stride, const GLvoid *pointer) {
+    if (type == GL_FIXED) {
+        pending_fixed_verts = (const int32_t *) pointer;
+        pending_fixed_vert_size = size;
+        pending_fixed_vert_stride = stride;
+        return;
+    }
+    pending_fixed_verts = NULL;
+    glVertexPointer(size, type, stride, pointer);
+}
+
+void glColorPointer_soloader(GLint size, GLenum type, GLsizei stride, const GLvoid *pointer) {
+    if (type == GL_FIXED) {
+        pending_fixed_colors = (const int32_t *) pointer;
+        pending_fixed_color_size = size;
+        pending_fixed_color_stride = stride;
+        return;
+    }
+    pending_fixed_colors = NULL;
+    glColorPointer(size, type, stride, pointer);
+}
+
+void glTexCoordPointer_soloader(GLint size, GLenum type, GLsizei stride, const GLvoid *pointer) {
+    if (type == GL_FIXED) {
+        pending_fixed_texcoords = (const int32_t *) pointer;
+        pending_fixed_texcoord_size = size;
+        pending_fixed_texcoord_stride = stride;
+        return;
+    }
+    pending_fixed_texcoords = NULL;
+    glTexCoordPointer(size, type, stride, pointer);
+}
+
+static void convert_fixed_array(const int32_t *src, GLint size, GLsizei stride,
+                                 int needed_verts, GLfloat **buf, int *buf_cap) {
+    int needed_floats = needed_verts * size;
+    if (needed_floats > *buf_cap) {
+        *buf = (GLfloat *) realloc(*buf, needed_floats * sizeof(GLfloat));
+        *buf_cap = needed_floats;
+    }
+    int stride_elems = stride > 0 ? stride / (int) sizeof(int32_t) : size;
+    for (int i = 0; i < needed_verts; i++) {
+        const int32_t *s = src + i * stride_elems;
+        GLfloat *d = *buf + i * size;
+        for (int c = 0; c < size; c++) {
+            d[c] = s[c] / 65536.0f;
+        }
+    }
+}
+
+// Shared by glDrawArrays_soloader/glDrawElements_soloader: converts and
+// re-binds whichever of the three arrays are currently pending GL_FIXED
+// data, covering vertex indices [0, needed_verts).
+static void flush_pending_fixed_arrays(int needed_verts) {
+    if (pending_fixed_verts) {
+        convert_fixed_array(pending_fixed_verts, pending_fixed_vert_size, pending_fixed_vert_stride,
+                             needed_verts, &fixed_vert_buf, &fixed_vert_buf_cap);
+        glVertexPointer(pending_fixed_vert_size, GL_FLOAT, 0, fixed_vert_buf);
+    }
+    if (pending_fixed_colors) {
+        convert_fixed_array(pending_fixed_colors, pending_fixed_color_size, pending_fixed_color_stride,
+                             needed_verts, &fixed_color_buf, &fixed_color_buf_cap);
+        glColorPointer(pending_fixed_color_size, GL_FLOAT, 0, fixed_color_buf);
+    }
+    if (pending_fixed_texcoords) {
+        convert_fixed_array(pending_fixed_texcoords, pending_fixed_texcoord_size, pending_fixed_texcoord_stride,
+                             needed_verts, &fixed_texcoord_buf, &fixed_texcoord_buf_cap);
+        glTexCoordPointer(pending_fixed_texcoord_size, GL_FLOAT, 0, fixed_texcoord_buf);
+    }
+}
+
+void glDrawArrays_soloader(GLenum mode, GLint first, GLsizei count) {
+    flush_pending_fixed_arrays(first + count);
+    glDrawArrays(mode, first, count);
+}
+
+void glDrawElements_soloader(GLenum mode, GLsizei count, GLenum type, const GLvoid *indices) {
+    if (pending_fixed_verts || pending_fixed_colors || pending_fixed_texcoords) {
+        int max_index = 0;
+        if (type == GL_UNSIGNED_BYTE) {
+            const uint8_t *idx = (const uint8_t *) indices;
+            for (int i = 0; i < count; i++) if (idx[i] > max_index) max_index = idx[i];
+        } else {
+            const uint16_t *idx = (const uint16_t *) indices;
+            for (int i = 0; i < count; i++) if (idx[i] > max_index) max_index = idx[i];
+        }
+        flush_pending_fixed_arrays(max_index + 1);
+    }
+    glDrawElements(mode, count, type, indices);
+}
+
 void glShaderSource_soloader(GLuint shader, GLsizei count,
                              const GLchar **string, const GLint *_length) {
 #ifdef DEBUG_OPENGL
