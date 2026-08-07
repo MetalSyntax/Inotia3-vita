@@ -141,6 +141,29 @@ NameToMethodID nameToMethodId[] = {
     { 42, "GetAppProperty", METHOD_TYPE_OBJECT },
     { 43, "GetUDID", METHOD_TYPE_OBJECT },
     { 44, "GetPhoneNumber", METHOD_TYPE_OBJECT },
+
+    // Corrida 40: WrapperJinterface.GetNoticeHttp(String): Object -- fetches
+    // the "notice board" message from http://s.com2us.net/game/inotia3/
+    // notice.php (a 2013-era Com2uS server, long gone). Extend_RequestNotice
+    // (out_ghidra.c:117731) does `strcpy(buf, (char*)jRequestNotice(url))`
+    // with NO null check on the result -- confirmed by disassembly/dump
+    // (Corrida 40): an unregistered Object-returning method defaults to NULL
+    // in FalsoJNI, and `strcpy(dst, NULL)` crashes immediately (R1==0 in the
+    // dump). Must return a real (non-NULL) string.
+    { 45, "GetNoticeHttp", METHOD_TYPE_OBJECT },
+
+    // Corrida 44: WrapperJinterface.GetStringWidthHeightInRect(String, int,
+    // int, int, int, int[]): int -- confirmed literal signature
+    // "(Ljava/lang/String;IIII[I)I". Left unregistered, this always returns
+    // 0 ("everything fits") from FalsoJNI's default -- and the game's own
+    // native word-wrap loop (used to lay out long text blocks like
+    // memorytext_en.dat, a ~109KB lore document) never finds a real line
+    // break, spinning hundreds of calls per invocation without ever making
+    // progress -- observed on device as an apparent infinite loop stuck on
+    // the loading screen (766 calls logged in a single run before the
+    // console's log buffer was cut short). Must return a real width so the
+    // caller's wrap loop actually terminates.
+    { 46, "GetStringWidthHeightInRect", METHOD_TYPE_INT },
 };
 
 MethodsBoolean methodsBoolean[] = {};
@@ -182,8 +205,113 @@ jlong GetMaxMemory_stub(jmethodID id, va_list args) {
     return 256 * 1024 * 1024;
 }
 
+// Corrida 44: per-byte width table replicated from this port's OWN native
+// bitmap-font metric, FONT_GetSubStringWidth (out_ghidra.c:19780-19828) --
+// space=4px, a high-bit-set/multibyte lead byte=9px (consumes 2 bytes), any
+// other byte=6px. Copied directly rather than calling into the .so: it's a
+// trivial, self-contained per-byte cost table with no dependency on
+// FONT_pFontData or any other .so-internal state.
+static int inotia3_char_width(const unsigned char *s, size_t i, size_t len, size_t *advance) {
+    if (s[i] == ' ') {
+        *advance = 1;
+        return 4;
+    }
+    if (s[i] & 0x80) {
+        *advance = (i + 1 < len) ? 2 : 1;
+        return 9;
+    }
+    *advance = 1;
+    return 6;
+}
+
+// WrapperJinterface.GetStringWidthHeightInRect(String, int, int, int, int,
+// int[]): int -- see the NameToMethodID comment (Corrida 44) for why this
+// needs a real implementation, not just a safe default. Greedy word-wrap,
+// O(n) single pass, preferring to break at the last whitespace seen on the
+// current line (mirrors the real Java implementation's own word-boundary
+// preference) when one is available. fontSize/fontStyle/isBreak are ignored
+// -- this port's bitmap font has one fixed per-byte metric, not a scalable
+// one, and both of the real isBreak modes end up wrapping on width with a
+// whitespace preference anyway.
+jint GetStringWidthHeightInRect_stub(jmethodID id, va_list args) {
+    jstring str_obj = va_arg(args, jstring);
+    va_arg(args, jint); // fontSize
+    va_arg(args, jint); // fontStyle
+    jint rectWidth = va_arg(args, jint);
+    va_arg(args, jint); // isBreak
+    jintArray value_arr = va_arg(args, jintArray);
+
+    if (!str_obj || !value_arr) return 0;
+
+    const unsigned char *str = (const unsigned char *) jni->GetStringUTFChars(&jni, str_obj, NULL);
+    jint *value = jni->GetIntArrayElements(&jni, value_arr, NULL);
+
+    size_t len = strlen((const char *) str);
+    if (rectWidth <= 0) rectWidth = 1;
+
+    const int line_height = 16;
+    int max_width = 0;
+    int total_height = 0;
+    size_t i = 0;
+    size_t line_start = 0;
+    int line_width = 0;
+    size_t last_space = (size_t) -1;
+    int width_at_last_space = 0;
+
+    while (i < len) {
+        size_t advance;
+        int cw = inotia3_char_width(str, i, len, &advance);
+
+        if (str[i] == '\n') {
+            if (line_width > max_width) max_width = line_width;
+            total_height += line_height;
+            i++;
+            line_start = i;
+            line_width = 0;
+            last_space = (size_t) -1;
+            continue;
+        }
+
+        if (line_width + cw > rectWidth && i > line_start) {
+            int have_space = (last_space != (size_t) -1 && last_space > line_start);
+            size_t break_at = have_space ? last_space : i;
+            int width_used = have_space ? width_at_last_space : line_width;
+            if (width_used > max_width) max_width = width_used;
+            total_height += line_height;
+            i = break_at;
+            while (i < len && str[i] == ' ') i++;
+            line_start = i;
+            line_width = 0;
+            last_space = (size_t) -1;
+            continue;
+        }
+
+        if (str[i] == ' ') {
+            last_space = i;
+            width_at_last_space = line_width;
+        }
+        line_width += cw;
+        i += advance;
+    }
+    if (i > line_start) {
+        if (line_width > max_width) max_width = line_width;
+        total_height += line_height;
+    }
+    if (max_width > rectWidth) max_width = rectWidth;
+
+    value[0] = max_width;
+    value[1] = total_height;
+
+    jni->ReleaseStringUTFChars(&jni, str_obj, (char *) str);
+    return max_width;
+}
+
+// WrapperJinterface.Flush() -> wrapperRenderer.Flush() -> GLSurfaceView.
+// requestRender() under WrapperDirtyRenderer (see wr_timer.h Corrida 31): the
+// .so calling this is the ONLY signal that the frame it just drew should
+// actually be presented. Was a pure no-op until Corrida 31 -- see wr_timer.h.
 void Flush_stub(jmethodID id, va_list args) {
-    // do nothing
+    wr_request_present();
 }
 
 // --- Audio no-op stubs -------------------------------------------------------
@@ -229,6 +357,7 @@ MethodsInt methodsInt[] = {
     { 35, Sound_NoopOk },    // SoundPrepare
     { 36, GetScreenWidth_stub },
     { 37, GetScreenHeight_stub },
+    { 46, GetStringWidthHeightInRect_stub },
 };
 MethodsLong methodsLong[] = {
     { 38, GetMaxMemory_stub },
@@ -297,6 +426,25 @@ jobject GetApkFilePath_stub(jmethodID id, va_list args) {
         return jni->NewStringUTF(&jni, g_pending_asset_path);
     }
     return jni->NewStringUTF(&jni, INOTIA3_APK_PATH);
+}
+
+// Corrida 37: jGetApkFilePath() (the real .so function, not this JNI stub)
+// caches its own return value the FIRST time it's ever called and never asks
+// Java again (device log confirmed: the "GetApkFilePath" JNI call fires
+// exactly once, for the very first asset resolved -- every later asset's
+// call into jGetApkFilePath_real() just replays that first cached string).
+// File_GetFullPathName_hook's mode==2 branch (source/patch.c) used to build
+// its "@offset|length|path" string from that call -- which meant every asset
+// after the first got the FIRST asset's path baked into its own permanently
+// cached ResourceInformation struct, truncating/misreading it later. This
+// exposes the SAME decision GetApkFilePath_stub above makes -- without the
+// one-shot consumption -- so the hook can read the CURRENT asset's real path
+// directly (fresh every call, since it's set synchronously by
+// GetFileDescriptor_stub just above, for the same `name`, moments earlier in
+// the same File::GetFullPathName(mode=2) call) instead of trusting the .so's
+// stale cache.
+const char *java_peek_current_asset_path(void) {
+    return g_pending_asset_is_loose ? g_pending_asset_path : INOTIA3_APK_PATH;
 }
 
 // WrapperJinterface.GetFileDescriptor(String filename, int[] value, boolean
@@ -370,6 +518,16 @@ jobject GetPhoneNumber_stub(jmethodID id, va_list args) {
     return jni->NewStringUTF(&jni, "0000000000");
 }
 
+// Corrida 40: an empty string makes Extend_RequestNotice's own
+// `strtok(acStack_f2c, "|")` return NULL immediately (nothing to tokenize),
+// which short-circuits its `pcVar3 != NULL && strcmp(pcVar3,"OK")==0` check
+// to false -- exactly the same "no notice today" path the real server
+// produces whenever it doesn't reply with "OK|...". Faithful no-op, not a
+// guess: never crashes, never fabricates a notice popup.
+jobject GetNoticeHttp_stub(jmethodID id, va_list args) {
+    return jni->NewStringUTF(&jni, "");
+}
+
 MethodsObject methodsObject[] = {
     { 7, GetUserDir_stub },
     { 8, GetUserDir_stub },
@@ -388,6 +546,7 @@ MethodsObject methodsObject[] = {
     { 42, GetAppProperty_stub },
     { 43, GetUDID_stub },
     { 44, GetPhoneNumber_stub },
+    { 45, GetNoticeHttp_stub },
 };
 MethodsShort methodsShort[] = {};
 

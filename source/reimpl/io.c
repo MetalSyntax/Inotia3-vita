@@ -176,3 +176,31 @@ int fsync_soloader(int fd) {
     l_debug("fsync(%i): %i", fd, ret);
     return ret;
 }
+
+// Corrida 20 (PORTING_PLAN.md Fase 9): "read" is normally imported straight
+// to the real libc read() (no logging) -- but the "Not a PNG file" error
+// from Corrida 19 means whatever ReadStream/DecodePNG eventually sees does
+// NOT start with the real PNG signature, even though the loose asset file on
+// disk does (confirmed via xxd in Corrida 19). This wrapper dumps the first
+// bytes actually returned by every read() the .so makes so the next crash log
+// shows, directly, whether the bytes read off disk for the failing fd are
+// correct at the source -- narrowing "somewhere in the read pipeline" down to
+// either "before read()" (fd/offset resolution) or "after read()" (buffer
+// hand-off into SGL_Resource/DecodePNG).
+ssize_t read_soloader(int fd, void *buf, size_t count) {
+    ssize_t ret = read(fd, buf, count);
+
+    if (ret > 0) {
+        uint8_t *b = (uint8_t *) buf;
+        size_t n = (size_t) ret < 16 ? (size_t) ret : 16;
+        char hex[16 * 3 + 1];
+        for (size_t i = 0; i < n; i++) {
+            snprintf(hex + i * 3, 4, "%02x ", b[i]);
+        }
+        l_debug("read(%i, %p, %lu): %li -- first bytes: %s", fd, buf, (unsigned long) count, (long) ret, hex);
+    } else {
+        l_debug("read(%i, %p, %lu): %li", fd, buf, (unsigned long) count, (long) ret);
+    }
+
+    return ret;
+}

@@ -21,11 +21,18 @@ VITA_LOGS_DIR = "/ux0:/data/inotia3/logs"
 VITA_CG_DIR = "ux0:/data/inotia3/cg"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-def print_banner():
-    print("====================================================")
-    print("         PS VITA DEPLOYMENT & DEBUG TOOL            ")
-    print("                    (Inotia 3)                     ")
-    print("====================================================")
+def getch():
+    import sys, tty, termios
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        ch = sys.stdin.read(1)
+        if ch == '\x1b':
+            ch += sys.stdin.read(2)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+    return ch
 
 def disconnect_proton_vpn():
     print("[*] Intentando desconectar Proton VPN...")
@@ -657,71 +664,72 @@ def run_script(folder, script_name, is_python=False):
         print(f"[-] Error: No se encontró el script en '{script_path}'.")
 
 def main():
+    options = [
+        ("Subir VPK compilado a la PS Vita (ux0:downloads/)", upload_vpk),
+        ("Subir SOLO el eboot.bin a la PS Vita (ux0:app/INOTIA3PV/)", upload_eboot),
+        ("Descargar el último dump (.dmp) y log (.txt) de Inotia 3", download_latest_debug_files),
+        ("Desconectar Proton VPN ahora mismo", disconnect_proton_vpn),
+        ("Ejecutar clean_macos.sh (build/)", lambda: run_script("build", "clean_macos.sh")),
+        ("Ejecutar build_and_install.sh (build/)", lambda: run_script("build", "build_and_install.sh")),
+        ("Ejecutar deploy_and_launch_vita3k.sh (build/)", lambda: run_script("build", "deploy_and_launch_vita3k.sh")),
+        ("Ejecutar decompile_all.sh (build/)", lambda: run_script("build", "decompile_all.sh")),
+        ("Ejecutar run_tests.sh (tests/)", lambda: run_script("tests", "run_tests.sh")),
+        ("Ejecutar get_dump.sh (misc/)", lambda: run_script("misc", "get_dump.sh")),
+        ("Descargar Shaders GLSL dumpeados", download_glsl_shaders),
+        ("Subir Shaders CG traducidos (assets/cg/ -> Vita)", upload_cg_shaders),
+        ("Sincronizar Shaders (descargar GLSL + subir CG)", sync_shaders),
+        ("Chequear libshacccg.suprx (tamano/existencia por FTP)", check_libshacccg),
+        ("Verificar data/ completa (conteo de archivos local vs Vita)", verify_data_assets),
+        ("Analizar crash dump (.psp2dmp) con vita-parse-core", analyze_crash_dump),
+        ("Salir", None)
+    ]
+    
+    current_idx = 0
     while True:
-        print_banner()
-        print("1. Subir VPK compilado a la PS Vita (ux0:downloads/) -- elige entre los .vpk de build/")
-        print("2. Subir SOLO el eboot.bin a la PS Vita (ux0:app/INOTIA3PV/) para actualizar rápido")
-        print("3. Descargar el último dump (.dmp) y log (.txt) de Inotia 3")
-        print("4. Desconectar Proton VPN ahora mismo")
-        print("5. Ejecutar clean_macos.sh (build/)")
-        print("6. Ejecutar build_and_install.sh (build/)")
-        print("7. Ejecutar deploy_and_launch_vita3k.sh (build/)")
-        print("8. Ejecutar decompile_all.sh (build/)")
-        print("9. Ejecutar run_tests.sh (tests/)")
-        print("10. Ejecutar get_dump.sh (misc/)")
-        print("11. Descargar Shaders GLSL dumpeados")
-        print("12. Subir Shaders CG traducidos (assets/cg/ -> Vita)")
-        print("13. Sincronizar Shaders (descargar GLSL + subir CG, todo en uno)")
-        print("14. Chequear libshacccg.suprx (tamano/existencia por FTP)")
-        print("15. Verificar data/ completa (conteo de archivos local vs Vita)")
-        print("16. Analizar crash dump (.psp2dmp) con vita-parse-core, ELF y libgame.so")
-        print("17. Salir")
-        print("====================================================")
-        try:
-            opcion = input("Elige una opción (1-17): ").strip()
-            print()
-            if opcion == "1":
-                upload_vpk()
-            elif opcion == "2":
-                upload_eboot()
-            elif opcion == "3":
-                download_latest_debug_files()
-            elif opcion == "4":
-                disconnect_proton_vpn()
-            elif opcion == "5":
-                run_script("build", "clean_macos.sh")
-            elif opcion == "6":
-                run_script("build", "build_and_install.sh")
-            elif opcion == "7":
-                run_script("build", "deploy_and_launch_vita3k.sh")
-            elif opcion == "8":
-                run_script("build", "decompile_all.sh")
-            elif opcion == "9":
-                run_script("tests", "run_tests.sh")
-            elif opcion == "10":
-                run_script("misc", "get_dump.sh")
-            elif opcion == "11":
-                download_glsl_shaders()
-            elif opcion == "12":
-                upload_cg_shaders()
-            elif opcion == "13":
-                sync_shaders()
-            elif opcion == "14":
-                check_libshacccg()
-            elif opcion == "15":
-                verify_data_assets()
-            elif opcion == "16":
-                analyze_crash_dump()
-            elif opcion == "17":
-                print("¡Hasta luego!")
-                break
+        # Limpiar la pantalla
+        print("\033[H\033[J", end="")
+        print("\033[96m====================================================\033[0m")
+        print("\033[92m         PS VITA DEPLOYMENT & DEBUG TOOL            \033[0m")
+        print("\033[93m                    (Inotia 3)                     \033[0m")
+        print("\033[96m====================================================\033[0m")
+        print("\033[90mUsa las flechas \033[97m↑/↓\033[90m para moverte y \033[97mENTER\033[90m para elegir.\033[0m\n")
+        
+        for i, (text, func) in enumerate(options):
+            prefix = f"{i+1:2d}. "
+            if i == current_idx:
+                print(f"\033[44;97m> {prefix}{text}\033[0m")
             else:
-                print("[-] Opción no válida. Inténtalo de nuevo.")
-        except KeyboardInterrupt:
-            print("\n¡Hasta luego!")
+                print(f"  {prefix}{text}")
+                
+        print("\033[96m====================================================\033[0m")
+        
+        c = getch()
+        if c == '\x1b[A': # up arrow
+            current_idx = (current_idx - 1) % len(options)
+        elif c == '\x1b[B': # down arrow
+            current_idx = (current_idx + 1) % len(options)
+        elif c in ('\r', '\n'): # enter
+            print("\033[H\033[J", end="")
+            print(f"\033[92m[*] Ejecutando: {options[current_idx][0]}\033[0m\n")
+            if options[current_idx][1] is None:
+                print("\033[93m¡Hasta luego!\033[0m")
+                break
+            
+            try:
+                options[current_idx][1]()
+            except Exception as e:
+                print(f"\033[91m[-] Error inesperado en la ejecución: {e}\033[0m")
+                
+            print("\n\033[90m[ \033[97mPresiona ENTER para volver al menú principal...\033[90m ]\033[0m")
+            input()
+        elif c == '\x03': # Ctrl+C
+            print("\n\033[93m¡Hasta luego!\033[0m")
             break
-        print("\nPresiona ENTER para volver al menú principal...")
-        input()
+        elif c.isdigit():
+            # Si presiona un número del 1 al 9, saltar directamente a esa opción
+            val = int(c)
+            if 1 <= val <= min(9, len(options)):
+                current_idx = val - 1
 
 if __name__ == "__main__":
     main()

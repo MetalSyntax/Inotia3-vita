@@ -1145,6 +1145,1412 @@ decompilado ante cualquier crash con `.psp2dmp`.
 > -- si ya difieren ahí, la corrupción es casi instantánea (buscar qué corre en paralelo: hilos de
 > red/sonido, pollers de anti-tamper); si coinciden, acotar el siguiente checkpoint más adelante en la
 > función (después de `png_malloc`/`inflateInit_`).
+>
+> **Corrida 18 (2026-07-24) — Respondida la pregunta pendiente de la Corrida 17: la corrupción NO es
+> instantánea, pasa DENTRO de la ejecución de la función.** `logs/log_2026-07-23_20-38-57.txt` +
+> `Inotia3-psp2core-1784871223-...psp2dmp`: mismo crash exacto una vez más (`png_create_read_struct_2+0x229`,
+> `setjmp=2 longjmp=1`, `saved=836a7e10` == la dirección de `png_ptr` de esta corrida, igual que en todas
+> las anteriores -- confirma que no hay ASLR y el heap se reparte igual en cada corrida idéntica). El
+> checkpoint `type=1` de la Corrida 17 SÍ llegó esta vez:
+> `canary_now=ff0a0000 guard_now=ff0a0000` (coinciden, correcto) justo después de la primera llamada a
+> `png_create_struct_2` -- y el `saved` en el `Stack collapsed` final es `836a7e10` (corrupto). Mismo `sp`
+> exacto (`0x81800cb0`) en ambos puntos, confirmado por lectura directa de memoria: es literalmente el
+> mismo frame. **Conclusión: la corrupción ocurre en algún punto entre el primer `setjmp()` y el chequeo
+> final del canario dentro de ESTA MISMA invocación de `png_create_read_struct_2`** -- no es una escritura
+> externa instantánea (hilo de red/sonido corriendo en paralelo), es interna a la ejecución de la función
+> o a algo que ella llama directamente.
+>
+> Se releyó el desensamblado completo (`arm-vita-eabi-objdump -M force-thumb`, `0x10fd74`-`0x10ffd0`) y se
+> cruzó línea por línea contra el pseudo-C de Ghidra (`decompiled_so/libgame_armeabi/out_ghidra.c:192839`)
+> para descartar el único otro candidato de escritura hacia el rango `sp+52`..`sp+132`: un buffer local de
+> 80 bytes (`acStack_64`, para `snprintf` en la rama de "versión de libpng incompatible") que termina
+> EXACTAMENTE en el offset del canario. Se confirmó que esa rama es efectivamente inalcanzable en la
+> práctica: el juego pasa `"1.2.24"` a `png_create_read_struct`, y aunque la comparación byte-a-byte
+> contra `png_libpng_ver` (el string de versión compilado en el `.so`) marcase alguna diferencia, el
+> propio código tiene un atajo que salta directo a `LAB_0011fe80` (saltándose el `snprintf`/`png_warning`
+> por completo) con solo que `param_1[0]=='1' && param_1[2]=='2'` -- ambos ciertos para `"1.2.24"` sin
+> importar qué tan corrupto esté `png_libpng_ver`. Descartado con alta confianza.
+>
+> Confirmado también (releyendo el desensamblado instrucción por instrucción) que NINGUNA de las funciones
+> llamadas entre el primer `setjmp` y el chequeo final (`png_set_mem_fn`, `png_set_error_fn`, `png_malloc`,
+> `inflateInit_`, `png_set_read_fn`) recibe un puntero hacia ESTE stack frame como argumento -- todas
+> reciben `png_ptr` (heap) y punteros a funciones/constantes globales, nunca una dirección de pila nuestra.
+> Eso deja como única vía de instrumentación no invasiva el SEGUNDO `setjmp()` de la función (línea
+> `png_ptr; setjmp(png_ptr)` justo antes del chequeo, `0x10ff1e`) -- que ya es código 100% nuestro
+> (`jmp_shim.S`/`source/reimpl/sys.c`), así que no hace falta ningún hook invasivo sobre el `.so`.
+>
+> **Instrumentación agregada** (`source/reimpl/jmp_shim.S` + `source/reimpl/jmp_shim_log.c`):
+> `setjmp_soloader`/`longjmp_soloader` ahora capturan el `sp` del LLAMADOR (`mov r1/r2, sp` antes de tocar
+> la pila, ya que `bl`/`blx` no modifican `sp`) y se lo pasan a `jmp_shim_log_setjmp`/`_longjmp`, que
+> loguean (nivel `l_info`, no fatal -- ya confirmado que estos sobreviven al log si ocurren ANTES del
+> crash, igual que los checkpoints de `png_create_struct_2`) `caller_sp` y el valor actual en
+> `caller_sp+132` (el offset del canario de `png_create_read_struct_2`, sin asumir que TODO llamador de
+> `setjmp`/`longjmp` en el `.so` comparte ese layout -- solo es significativo cuando `caller_sp` coincide
+> con el frame conocido `0x81800cb0`). Esto da checkpoints GRATIS en ambas llamadas a `setjmp()` dentro de
+> `png_create_read_struct_2` sin tocar el `.so` para nada. Build compilado y verificado
+> (`build/inotia3.vpk`/`eboot.bin`/`inotia3.elf`, 2026-07-24).
+>
+> **Pendiente**: redeployar (`porting_tools/manage_vita.py`), reproducir el mismo crash (cargar
+> `MainMenu.png`), y mandar el log + `.psp2dmp` nuevo. Buscar las DOS líneas
+> `setjmp_soloader checkpoint` con `caller_sp=0x81800cb0` (puede variar levemente si el heap se corre) --
+> la primera (justo después de `png_malloc`) debería mostrar `canary_at_sp132` correcto (ya lo sabemos por
+> el checkpoint de `png_create_struct_2`); si la SEGUNDA (justo antes del chequeo final, después de
+> `png_set_read_fn`) ya muestra el valor corrupto, la ventana queda acotada a
+> `png_malloc`/`inflateInit_`/`png_set_read_fn` -- haría falta entonces revisar `inflateInit_` (zlib, más
+> complejo) y el propio `png_malloc` con más detalle, posiblemente instrumentando sus argumentos también.
+>
+> **Corrida 19 (2026-07-24) — ES UN BUG COMPLETAMENTE DISTINTO: `png_create_read_struct_2` termina LIMPIA.
+> El "Stack collapsed" que veníamos persiguiendo desde la Corrida 5 es un SÍNTOMA corriente abajo, no la
+> causa.** `logs/log_2026-07-24_02-40-24.txt` +
+> `Inotia3-psp2core-1784875276-0x000110215b-eboot.bin.psp2dmp`: los checkpoints de `setjmp_soloader`
+> (agregados en la Corrida 18) dieron el dato decisivo --
+> ```
+> png_create_struct_2 checkpoint: caller_sp=0x81800cb0 canary_now=ff0a0000 guard_now=ff0a0000 type=1
+> setjmp_soloader checkpoint: call#=1 buf=0x836a7e10 caller_sp=0x81800cb0 canary_at_sp132=ff0a0000
+> setjmp_soloader checkpoint: call#=2 buf=0x836a7e10 caller_sp=0x81800cb0 canary_at_sp132=ff0a0000
+> png_create_struct_2 checkpoint: caller_sp=0x81800d58 canary_now=00000000 guard_now=ff0a0000 type=2
+> longjmp_soloader checkpoint: call#=1 buf=0x836a7e10 val=1 caller_sp=0x81800cb0 canary_at_sp132=836a7e10
+> ! fatal Stack collapsed at 0x9810ff9d (...) saved=836a7e10 sp=0x81800cb0
+> ```
+> **Los DOS `setjmp()` de `png_create_read_struct_2` corren con el canario intacto** (`canary_at_sp132`
+> coincide con `guard_now` las dos veces) -- la función termina y retorna con éxito. Después, `type=2`
+> (creación del `info_struct`, un `caller_sp` distinto y más "alto" -- confirma que es OTRA función, llamada
+> DESPUÉS de que `png_create_read_struct_2` ya retornó). Y ENTONCES aparece un `longjmp_soloader` con
+> `buf=0x836a7e10` -- el MISMO `png_ptr` -- pero con `caller_sp=0x81800cb0`: **exactamente la misma dirección
+> de pila que ya usaba `png_create_read_struct_2`, una función que YA RETORNÓ**. En ese momento
+> `canary_at_sp132` YA está corrupto (`836a7e10`) -- pero no importa si coincide o no, porque esa dirección
+> de pila ya no le pertenece a nadie: es memoria reciclada por lo que sea que corrió después (la propia
+> creación del `info_struct`, validación de cabecera, etc.).
+>
+> **La causa real**: releyendo `DecodePNG` (`decompiled_so/libgame_armeabi/out_ghidra.c:179667`) --
+> ```c
+> local_24 = png_create_read_struct("1.2.24",param_2,param_3,0,0,0);
+> local_28 = png_create_info_struct();
+> png_set_read_fn(local_24,0,ReadStream + 1);
+> png_read_png(local_24,local_28,0,0);
+> ```
+> **`DecodePNG` NUNCA llama su propio `setjmp()`** -- el patrón correcto/estándar de libpng es que la
+> APLICACIÓN llame `setjmp(png_jmpbuf(png_ptr))` ella misma DESPUÉS de crear los structs y ANTES de leer,
+> para que cualquier `png_error()` durante la lectura vuelva a SU PROPIO frame (que sigue vivo). Acá eso no
+> pasa: el único `setjmp()` registrado es el que `png_create_read_struct_2` hizo sobre SU PROPIO frame,
+> justo antes de retornar -- confirmado también por el contador global (`call#=2` es el último `setjmp`
+> antes del crash, ningún `call#=3`). Si `png_read_png()` dispara UN SOLO `png_error()` por CUALQUIER razón,
+> el `longjmp` va a resolver a un frame que ya no existe -- comportamiento indefinido en CUALQUIER
+> plataforma, no un bug de Vita/newlib. Confirmado además vía pseudo-C de `png_error` (`out_ghidra.c:190532`):
+> llama al `error_fn` custom SI existe (pero de forma ADICIONAL, nunca en vez de) y SIEMPRE termina en
+> `longjmp(png_ptr, 1)` -- coincide exactamente con lo observado.
+>
+> Esto en el APK real de Android nunca se manifiesta porque, para los assets que el juego shippea,
+> `png_read_png()` nunca dispara `png_error()` (ninguna imagen real les da error) -- es un bug LATENTE en el
+> juego original que nuestro port expone porque, por la razón que sea, EN NUESTRO ENTORNO sí se dispara un
+> `png_error()` real decodificando `MainMenu.png.jpg` (confirmado real PNG 512x512 RGBA con perfil ICC
+> embebido -- `pHYs`+`iCCP` -- vía `xxd`/`file`, no es un JPEG pese al nombre; ver `source/reimpl/apk_zip.c`
+> y `source/audio.h` para el porqué del sufijo `.jpg` en assets que son otra cosa, ya documentado y no
+> relacionado con este bug). **Falta el dato que dice CUÁL `png_error()` es.**
+>
+> **Instrumentación agregada** (`source/patch.c`): hook sobre `png_error` (offset `0x0010dcf1`, real, no de
+> PLT -- confirmado con `objdump -T`) que loguea `(png_ptr, message)` y replica FIELMENTE el único efecto de
+> control de flujo que YA sabemos que la función real siempre produce (`longjmp(png_ptr, 1)`,
+> `source/reimpl/jmp_shim.h`) -- no cambia ningún comportamiento del juego, solo revela qué mensaje de error
+> real dispara el `longjmp`. Nivel `l_fatal` (no `l_info`) a propósito: por Corrida 7/8, ante un crash real
+> solo la PRIMERA línea fatal sobrevive de forma confiable, y este mensaje es más valioso que el ya
+> conocido "Stack collapsed" de siempre. Build compilado y verificado
+> (`build/inotia3.vpk`/`eboot.bin`/`inotia3.elf`, 2026-07-24 03:04).
+>
+> **Pendiente**: redeployar, reproducir, mandar el log nuevo. Buscar la línea
+> `png_error(png_ptr=..., "...")` -- el mensaje exacto dice qué falla realmente (¿lectura del stream
+> `ReadStream`? ¿un chunk `iCCP`/`pHYs` mal soportado? ¿un límite de memoria/`sceLibcHeapSize`?) y de ahí
+> sale el fix real: lo más probable es que el fix no sea "arreglar libpng" sino agregar nuestro PROPIO
+> `setjmp(png_jmpbuf(png_ptr))` en el punto donde `DecodePNG` debería haberlo puesto -- posiblemente
+> envolviendo la llamada a `png_read_png` con nuestro propio `setjmp`/manejo de error vía un hook sobre
+> `DecodePNG` o `SetImage4GL`, ya que no podemos tocar el código fuente del `.so` directamente.
+
+> **Corrida 20 (2026-07-24) — El hook de la Corrida 19 dio el mensaje: `png_error(png_ptr=0x836a7e10,
+> "Not a PNG file")`.** `logs/log_2026-07-24_03-26-51.txt` +
+> `Inotia3-psp2core-1784878019-0x0000033f91-eboot.bin.psp2dmp`: el `png_error_hook` disparó, logueó el
+> mensaje real, y replicó el `longjmp(png_ptr, 1)` fielmente -- pero como ya sabíamos desde la Corrida 19,
+> ese `longjmp` resuelve a un frame ya retornado (`png_create_read_struct_2`), así que el crash de
+> siempre (`_kill_r`/`abort`/`__stack_chk_fail_soloader`) vuelve a aparecer, ahora con una línea `fatal`
+> extra ANTES que dice la causa real.
+>
+> `"Not a PNG file"` sale literalmente de `png_read_info` (`decompiled_so/libgame_armeabi/out_ghidra.c:
+> 192450-192469`): lee 8 bytes vía `png_read_data`->`ReadStream` y los compara con `png_sig_cmp` contra la
+> firma real de PNG (`89 50 4E 47 0D 0A 1A 0A`); si no coinciden, error. Esto contradice directamente lo ya
+> confirmado en la Corrida 19 (`xxd`/`file` sobre el archivo real en disco: 512x512 RGBA con `pHYs`+`iCCP`,
+> firma PNG genuina) -- **el archivo en disco es válido, así que la corrupción/desalineación pasa en algún
+> punto de la cadena que lo lleva desde el disco hasta el buffer que `ReadStream` sirve**.
+>
+> Se rastreó esa cadena completa vía pseudo-C (sin asumir nada, cruzando cada eslabón):
+> `SGL_Texture::FromResource` -> `DecodePNG(out_struct, buf, len)` (`out_ghidra.c:179667` -- `buf`/`len`
+> son el 2do/3er argumento reales, confirmado en el call site de `SetImage4GL:178547` que pasa los MISMOS
+> `param_2`/`param_3` que recibió) -> `png_create_read_struct("1.2.24", buf, len, 0,0,0)` (guarda `buf`/
+> `len`/`pos=0` en 3 campos fijos de `png_ptr`, offsets `0x118`/`0x11c`/`0x120` -- confirmado porque
+> `ReadStream` (`out_ghidra.c:179649`) lee exactamente esos 3 offsets de su `param_1` para hacer
+> `memcpy` puro desde un buffer EN MEMORIA, sin tocar ningún file descriptor -- este PNG se decodifica
+> 100% desde RAM, no hay short-read de disco posible en esta etapa). `buf`/`len` llegan de
+> `SGL_Resource` (campos `+4`/`+8`), poblado por `SGL_Resource::FromBundle` -> `CS_knlGetResourceID` +
+> `CS_knlAlloc` + `CS_knlGetResource`.
+>
+> `CS_knlGetResource` (`out_ghidra.c:157400`) resuelve el archivo real vía `MMappedFile::Open` ->
+> `File::Open` -> `File::GetFullPathName`, la MISMA función ya instrumentada indirectamente por el JNI
+> log (`GetFileDescriptor`+`GetApkFilePath`, modo `param_4==2`, formato `"@offset|length|path"`) --
+> coincide con la secuencia real del log (`GetFileDescriptor("MainMenu.png") -> loose file .../
+> MainMenu.png.jpg (length=148229)` seguido de `open(...): 4`, `fstat(4): 0`, `close(4): 0`) y confirma
+> que el `fd`/tamaño resuelven correctamente. Pero **el `read()` real que llena el buffer entre el
+> `fstat` y el `close` no está logueado en absoluto** -- `source/dynlib.c` mapea `"read"` directo a la
+> `read()` real de newlib (sin wrapper, sin log), a diferencia de `open`/`fstat`/`close`/`stat` que sí
+> pasan por `source/reimpl/io.c` con `l_debug`. Es el único eslabón de la cadena completa (JNI resolve ->
+> `File::Open` -> `read()` -> `memcpy` en `ReadStream` -> `png_sig_cmp`) que sigue siendo una caja negra --
+> no hay evidencia todavía de si el `read()` devuelve los bytes reales del archivo, un conteo parcial, o
+> si el buffer que `png_create_read_struct` recibe como `buf` no es siquiera el que `read()` llenó (habría
+> que descartar también un mal cómputo de puntero/alias en `CS_knlAlloc`/`CS_GETDPTR`, pero esos son
+> internos al `.so`, no reimplementados por nosotros -- read() sí lo es).
+>
+> **Instrumentación agregada** (`source/reimpl/io.c`/`.h` + `source/dynlib.c`): nuevo `read_soloader()`
+> que llama al `read()` real y loguea (`l_debug`, mismo estilo que `open_soloader`/`fstat_soloader`) el
+> `fd`, los bytes pedidos, los bytes devueltos, y los primeros hasta 16 bytes leídos en hex -- comparables
+> a ojo contra la firma PNG real (`89 50 4e 47 0d 0a 1a 0a`). `source/dynlib.c` ahora importa `"read"` ->
+> `read_soloader` en vez del símbolo real directo (antes sin logging). Solo afecta las llamadas a `read()`
+> que hace el `.so` vía su tabla de imports -- el `read()` interno de nuestro propio `source/reimpl/mem.c`
+> (usado por el `mmap()` fake) sigue llamando directo a la función real de newlib, sin pasar por este
+> wrapper (no hace falta instrumentarlo: el `mmap` fake no interviene en esta ruta de carga, que confirmado
+> arriba nunca invoca `mmap`/`munmap` -- ninguna línea `mmap(...)` aparece en ningún log hasta ahora).
+> Build compilado (cross real vía VitaSDK, `arm-vita-eabi-g++`, sin usar el script interactivo de
+> `porting_tools/build/build_and_install.sh` porque su `read -p` de modo debug rompe en un shell no
+> interactivo -- se replicaron sus mismos pasos de `rsync`+`cmake`+`make` a mano) y verificado
+> (`build/inotia3.vpk`/`eboot.bin`/`inotia3.elf`, 2026-07-24).
+>
+> **Pendiente**: redeployar, reproducir, mandar el log nuevo. Buscar la línea `read(4, ...)` (el `fd` real
+> puede variar levemente) justo antes del `png_error`/`Stack collapsed` de siempre -- si los primeros bytes
+> logueados YA no son `89 50 4e 47 0d 0a 1a 0a`, la causa está confirmada entre el disco y el `read()`
+> (permisos, ruta, tamaño de archivo real en el dispositivo vs. lo esperado, o un bug de I/O de
+> `sceIoRead`/newlib en este VitaSDK con archivos de este tamaño/ubicación en `ux0:`); si SÍ son correctos
+> ahí, la corrupción pasa DESPUÉS del `read()` -- en el manejo del puntero/alias dentro de `CS_knlAlloc`/
+> `CS_GETDPTR`/`CS_knlGetResource` (código 100% del `.so`, requeriría un hook similar a
+> `png_create_struct_2_hook` pero sobre esas funciones para volcar el puntero real que reciben vs. el que
+> `png_create_read_struct` termina usando).
+
+> **Corrida 21 (2026-07-24) — Causa real encontrada y arreglada: NO era corrupción de datos, era un
+> `read()` que nunca se llegaba a hacer.** `logs/log_2026-07-24_23-01-50.txt` +
+> `Inotia3-psp2core-1784948518-0x00006a321b-eboot.bin.psp2dmp`: el `read_soloader()` de la Corrida 20
+> demostró trabajar perfectamente para OTROS archivos en el mismo log (`read(3, ..., 4): 4 -- first bytes:
+> cc 00 00 00` para `Com2usProtection.sav`, `read(4, ..., 35): 35 -- ...` para `init.dat`) -- pero para
+> `MainMenu.png.jpg` (`open(...): 4`, `fstat(4): 0`, `close(4): 0`) **no aparece NINGUNA línea `read(4,
+> ...)` entre el `open` y el `close`**. El archivo nunca se lee -- ni corrompido, ni parcial: cero bytes.
+>
+> Rastreando hacia atrás en `out_ghidra.c` sin asumir nada: `SGL_Texture::FromResource` (`161450`) llama
+> `DecodePNG(buf, buf_ptr, buf_len)` con `buf_ptr`/`buf_len` provistos por un `SGL_Resource` construido
+> por `SGL_Resource::FromBundle` (`161132`) vía `CS_knlGetResourceID` + `CS_knlAlloc` + `CS_knlGetResource`
+> (`157400`). `CS_knlGetResource` abre su archivo con
+> `MMappedFile::Open(path=*(char**)(resourceInfo+0x104), offset, length, 1, 3)` -- el **`3` está
+> hardcodeado en el propio `.so`**, sin ningún fallback a otro modo. Eso baja a
+> `File::Open`->`File::GetFullPathName(name, out, size, mode=3)` (`174929`), cuyo modo 3 SIEMPRE construye
+> `"/sdcard/Android/data/<pkg>/files/<name>"` -- **salvo que `name[0]=='/'`, en cuyo caso usa `name`
+> literal** (`174946`).
+>
+> La pieza que cierra el caso: `jGetApkFilePath()` (`145992`) cachea su resultado la PRIMERA vez que se
+> llama (`if (DAT_0017ded8=='\0') { resolver... } return DAT_0017ded8;`) y jamás vuelve a preguntarle a
+> Java después -- tiene sentido en Android real, donde TODOS los assets viven en el mismo `.apk`, así que
+> resolverlo una sola vez y reusar ese path para cualquier recurso es válido. Ese valor cacheado es
+> exactamente el `name` que `CS_knlGetResource` usa como `path` para TODOS los recursos futuros. En Android
+> real, `jGetApkFilePath()` devuelve la ruta real absoluta del `.apk` (`"/data/app/....apk"`, empieza con
+> `/`), así que el modo 3 SIEMPRE toma el atajo "ya resuelto, usar literal" y termina mmapeando el `.apk`
+> real al offset/length cacheados de cada recurso -- el modo 3 nunca construye de verdad la ruta
+> `/sdcard/...` en la práctica.
+>
+> Nuestro `GetApkFilePath_stub` (`source/java.c`) devuelve en cambio la ruta suelta de Vita
+> (`"ux0:data/inotia3/assets/common/game_res/MainMenu.png.jpg"`) -- correcta y ya comprobada abrible por
+> `open()` (es exactamente el `open(...): 4` que sí funciona, en la llamada de REGISTRO del recurso vía el
+> modo 2 de esta misma función) -- pero **no empieza con `/`**, así que el atajo de modo 3 nunca dispara,
+> y `CS_knlGetResource` cae en la construcción real
+> `"/sdcard/Android/data/inotia3/files/ux0:data/inotia3/assets/common/game_res/MainMenu.png.jpg"` -- que
+> por supuesto no existe (no hay emulación de `/sdcard` en este port, ni falta que hace) y falla con `-1`
+> (confirmado en AMBOS logs, Corridas 19/20: `open(/sdcard/Android/data/inotia3/files/ux0:data/..., 0):
+> -1`). `CS_knlGetResource` no chequea ese fallo antes de retornar, así que `SGL_Resource::FromBundle` le
+> entrega a `DecodePNG` un buffer que `CS_knlAlloc` reservó pero que **nunca se llenó** -- de ahí "Not a
+> PNG file": no hay corrupción, simplemente nunca hubo datos.
+>
+> **Fix** (`source/patch.c`): se hookeó `File::GetFullPathName` completa (símbolo real, no PLT --
+> `_ZN4File15GetFullPathNameEPKcPcmi`, confirmado vía `objdump -T`) con una reimplementación fiel que llama
+> a las mismas funciones reales del `.so` (`jGetUserDir`/`jGetPackageName`/`jGetApkFilePath`/
+> `CS_fsGetFileDescriptor`, también símbolos reales resueltos vía `objdump -T`) para los modos 0/2/3 EXACTO
+> igual que el original -- el único cambio real es que el atajo de "ya resuelto, usar literal" ahora
+> también reconoce cualquier ruta con estilo de dispositivo de Vita (contiene `:`, ej. `"ux0:..."`) además
+> de la que empieza con `/` -- un nombre corto de recurso Android nunca contiene `:`, así que es una señal
+> inequívoca de que `name` ya es una ruta resuelta por nuestros propios stubs JNI, no un nombre corto que
+> el modo 3 necesite prefijar. No se tocó nada del comportamiento de los modos 0/2 (siguen llamando
+> exactamente a las mismas funciones reales del `.so`), minimizando el riesgo de romper otras rutas de
+> carga de archivos que ya funcionan. Build compilado (cross real vía VitaSDK) y verificado
+> (`build/inotia3.vpk`/`eboot.bin`/`inotia3.elf`, 2026-07-24).
+>
+> **Pendiente**: redeployar, reproducir (cargar `MainMenu.png`), mandar el log + `.psp2dmp` nuevo. Si el
+> fix es correcto, debería aparecer una línea `read(4, ...)` real para `MainMenu.png.jpg` esta vez (con los
+> primeros bytes coincidiendo con la firma PNG real, `89 50 4e 47 0d 0a 1a 0a`) y el juego debería avanzar
+> más allá de la carga del menú principal -- si sigue fallando, buscar si ahora el crash se movió a un
+> punto distinto (progreso) o si `File_GetFullPathName_hook` introdujo una regresión en algún otro modo/
+> caller (revisar el log completo por nuevos `open(...): -1` inesperados que no aparecían antes).
+
+> **Corrida 22 (2026-07-25) — El fix de la Corrida 21 funcionó: CONFIRMADO, ya no crashea.** `logs/
+> log_2026-07-25_00-30-47.txt`: `MainMenu.png.jpg` ahora sí se abre, se mapea con `mmap(0x0, 148229, 1, 2,
+> 4, 0)` (el `mmap` fake de `source/reimpl/mem.c`, funcionando -- confirma que SÍ era `CS_knlGetResource`
+> quien usaba `mmap`, no `read()` directo, tal como predecía la Corrida 21) y sube como textura real
+> (`glTexImage2D ... w=512 h=512`). `font.fnt` (el mismo mecanismo) también carga bien. El juego llega a
+> `nativeInit() and resume returned -- entering render loop.` y se queda corriendo en el loop principal
+> (~173 iteraciones de `SetTimer` capturadas en el log, consistente con varios segundos de ejecución real,
+> no un loop trabado -- `wr_run_timers`/`source/wr_timer.c` re-arma el timer del motor cada frame, es
+> comportamiento esperado, no un bug).
+>
+> Pantalla en negro pese a esto. Antes de instrumentar nada se descartó la causa más común de este síntoma
+> específico en ports vitaGL (`libshacccg.suprx` faltante): `source/utils/glutil.c:27-32`
+> (`gl_preload()`) ya llama `fatal_error()` si no encuentra `ur0:/data/libshacccg.suprx` (o su ruta
+> `external/`) ANTES de que el juego llegue a ninguna parte -- y el log muestra "OpenGL preloaded." y todo
+> el `nativeInit`/carga de texturas/render loop corriendo sin ningún diálogo de error, así que `gl_init()`
+> ya pasó ese chequeo con éxito. Se descarta sin necesidad de FTP-chequear el archivo en la consola (aunque
+> `porting_tools/manage_vita.py` opción 14 sigue siendo el chequeo directo si hiciera falta en el futuro).
+>
+> El problema real es que **ninguna función de este archivo logueaba si el `.so` llega a emitir un draw
+> call real** -- `glDrawArrays_soloader`/`glDrawElements_soloader` (`source/utils/glutil.c`) ya envuelven
+> TODAS las llamadas a dibujo del `.so` (por la conversión `GL_FIXED`->`GL_FLOAT`), pero no logueaban nada;
+> sin eso, "pantalla negra" es ambiguo entre "no se llama a dibujar nada" (bug de estado/lógica de juego,
+> más profundo) y "se dibuja pero no se ve nada" (textura vacía, blend/depth mal configurado, viewport,
+> etc. -- un bug de rendering más superficial).
+>
+> **Instrumentación agregada** (`source/utils/glutil.c`): las primeras 20 llamadas a `glDrawArrays`/
+> `glDrawElements` ahora loguean `mode`, `count`, la textura 2D bound (`GL_TEXTURE_BINDING_2D`), y el
+> estado de `GL_BLEND`/`GL_DEPTH_TEST` en ese momento -- suficiente para saber de una sola pasada si hay
+> draw calls en absoluto y, si los hay, si están usando una textura válida (id != 0, coincidiendo con la
+> que subió `glTexImage2D` para `MainMenu.png`) o si el blend/profundidad están en un estado que
+> explicaría que se dibuje pero no se vea (ej. blend con factores que dan alpha 0, o depth test fallando
+> contra un buffer sin limpiar bien). También se agregó logueo a `glClearColorx_soloader` (las primeras 10
+> llamadas) para ver a qué color pide limpiar el `.so` -- si pide negro explícitamente en algún punto,
+> descarta que sea SOLO nuestro `glClear()` de `source/main.c` (que ya limpia a negro por default de
+> OpenGL, sin fijar color, cada frame) el que está "ganándole" al contenido real. Build compilado y
+> verificado (`build/inotia3.vpk`/`eboot.bin`/`inotia3.elf`, 2026-07-25).
+>
+> **Pendiente**: redeployar, dejar correr varios segundos en la pantalla negra, mandar el log nuevo.
+> Buscar las líneas `[GL] glDrawArrays`/`[GL] glDrawElements` (si NO aparecen en absoluto, el bug está en
+> que el `.so` nunca llega a la lógica de dibujo -- revisar qué hace `nativeReDraw`/el estado inicial del
+> menú antes de asumir nada más -- ; si SÍ aparecen, revisar `bound_tex` -- `0` significa que se está
+> dibujando sin ninguna textura bound, un blanco/negro sólido según el color de vértice -- y `blend`/
+> `depth_test` contra lo esperado para UI 2D simple, que normalmente NO debería necesitar depth test
+> activo).
+
+> **Corrida 23 (2026-07-25) — Draw calls confirmados reales (no es "nunca se dibuja nada"); otra sesión ya
+> encontró y arregló en paralelo un bug real de conversión `GL_FIXED` que faltaba en un grupo grande de
+> funciones de matriz/color/proyección; instrumentación adicional agregada para confirmar de una vez si
+> ese fix alcanza.** `logs/log_2026-07-25_01-04-22.txt` y `log_2026-07-25_01-20-17.txt` (ambos generados
+> ANTES de que terminara la build con el fix nuevo, confirmado por el propio mensaje de la otra sesión):
+> los logs de la Corrida 22 confirman `[GL] glDrawArrays mode=5 count=4 bound_tex=3/4/5 blend=0
+> depth_test=0` repetido consistentemente frame a frame -- **sí hay draw calls reales**, con texturas
+> bound válidas (ids no-cero, coincidiendo con las que subieron `MainMenu.png`/`font.fnt`), sin blend ni
+> depth test activos (normal para UI 2D). Descarta "nunca se llega a dibujar nada" -- el bug está en
+> CÓMO se dibuja, no en si se dibuja.
+>
+> Otra sesión, en paralelo, encontró independientemente que `source/dynlib.c` mapeaba una familia grande
+> de funciones `gl*x` (`glOrthox`, `glFrustumx`, `glLoadMatrixx`, `glMultMatrixx`, `glColor4x`,
+> `glTranslatex`, `glRotatex`, `glScalex`, etc. -- las variantes de punto fijo Q16.16 de GLES1) directo a
+> sus símbolos reales de vitaGL SIN pasar por ningún wrapper de conversión -- mismo bug de clase que
+> `glClearColorx_soloader`/`glTexParameterx_soloader` (los únicos dos `*x` que sí tenían wrapper) ya
+> arreglaban, simplemente sin cobertura completa. vitaGL trata sus argumentos `GLfloat` como floats reales
+> sin importar qué variante GLES1 los originó -- pasarle un entero Q16.16 CRUDO (típicamente del orden de
+> decenas de millones para valores como "960.0") como si fuera un float produce una matriz de
+> proyección/vista con escalas o traslaciones absurdamente grandes, empujando TODA la geometría 2D fuera
+> del frustum visible -- coincide EXACTO con el síntoma "hay draw calls, con texturas y estado normal, pero
+> no se ve nada". Se agregaron wrappers `*_soloader` faithful (dividir por 65536.0f) para toda la familia
+> y se remapearon en `dynlib.c`; confirmado con `objdump -T` contra el `.so` real que efectivamente importa
+> `glOrthox`/`glFrustumx` (NO `glOrthof`/`glFrustumf` -- el juego usa la variante de punto fijo para su
+> configuración de proyección), así que este fix aplica directo a la ruta de código relevante, no es
+> especulativo.
+>
+> **No hay todavía un log post-fix para confirmar si esto solucionó el render** (la sesión paralela
+> reporta que una prueba más reciente sigue en negro, pero no compartió ese log). Antes de asumir que el
+> fix de `GL_FIXED` no alcanzó, hace falta un log real generado DESPUÉS de este build para saber si
+> `glOrthox` siquiera se llegó a ejecutar con los wrappers nuevos.
+>
+> **Instrumentación agregada** (`source/utils/glutil.c`, extendiendo el `log_draw_call` de la Corrida 22):
+> ahora también vuelca, en las primeras 20 llamadas a `glDrawArrays`/`glDrawElements`: `GL_VIEWPORT`,
+> `GL_SCISSOR_TEST`+`GL_SCISSOR_BOX`, los términos de escala/traslación (`[0]`,`[5]`,`[12]`,`[13]`) de
+> `GL_PROJECTION_MATRIX` y `GL_MODELVIEW_MATRIX`, y (si el draw usó vértices `GL_FIXED`, ya convertidos a
+> float por `flush_pending_fixed_arrays`) las coordenadas reales de los primeros 2 vértices enviados. Con
+> esto, un solo log nuevo alcanza para confirmar/descartar la hipótesis de la proyección sin necesidad de
+> otra ronda de instrumentación: si `proj`/`mv` tienen valores absurdos (miles/millones en vez de un rango
+> típico ortho tipo `sx=0.002 tx=-1.0`) o si las coordenadas de vértice caen muy fuera de `0..960 x
+> 0..544`, confirma la causa; si todo se ve razonable y aun así no se ve nada en pantalla, hay que mirar
+> otra cosa (contenido real de la textura, orden de draw calls tapando el fondo con algo transparente,
+> etc.). Build compilado (cross real vía VitaSDK) y verificado
+> (`build/inotia3.vpk`/`eboot.bin`/`inotia3.elf`, 2026-07-25).
+>
+> **Pendiente**: redeployar el build actual (incluye AMBOS fixes: los wrappers `GL_FIXED` completos + esta
+> instrumentación nueva), reproducir, mandar el log. Buscar las líneas `[GL] glDrawArrays`/
+> `glDrawElements` extendidas -- son el dato decisivo para saber si ya se arregló, o hacia dónde seguir.
+
+> **Corrida 24 (2026-07-25) — El fix `GL_FIXED` de la Corrida 23 SÍ está andando y es matemáticamente
+> correcto -- pero la pantalla sigue en negro, así que la causa real es otra cosa. Instrumentación
+> agregada para las dos hipótesis restantes más probables (iluminación fixed-function mal configurada,
+> contenido de textura realmente negro).** `logs/log_2026-07-25_02-38-34.txt` -- primer log generado
+> DESPUÉS del build con el fix completo, confirmado por la línea nueva ya presente:
+> `[GL] glOrthox l=0.0 r=384.0 b=0.0 t=256.0` (valores razonables de coordenadas de pantalla, no los
+> enteros Q16.16 crudos de antes). Verificación matemática completa contra la matriz real leída por
+> `glGetFloatv`: para esa llamada, `proj(sx=0.005 sy=-0.008 tx=-1.000 ty=1.000)` coincide con la fórmula
+> estándar de `glOrtho` (`sx=2/(r-l)=2/384=0.0052`, `sy=-2/(t-b)=-2/256=-0.0078`) -- **la conversión
+> `GL_FIXED`->`float` para la proyección es correcta, confirmado con números reales, no en teoría**. La
+> segunda llamada (`glOrthox l=0 r=480 b=0 t=320`) también coincide (`sx=0.004`≈`2/480`,
+> `sy=-0.006`≈`-2/320`). Los vértices reales dibujados (`v0=(0.0,0.0) v1=(0.0,256.0)`) caen bien adentro de
+> ambos rangos de proyección. **La hipótesis de la Corrida 23 (proyección con escala absurda empujando la
+> geometría fuera de cámara) queda descartada como causa del negro: la proyección y la geometría ya están
+> bien.**
+>
+> Sin nuevos `fatal`/`ERR` en el log (mismos warnings benignos ya conocidos de corridas anteriores:
+> `/sdcard/...` inexistente, `save0/1/2.dat` inexistentes, métodos JNI opcionales no encontrados) y
+> `nativeInit() and resume returned -- entering render loop.` sin problema. El render loop sigue estable.
+>
+> **Instrumentación agregada** (`source/utils/glutil.c`) para las dos hipótesis clásicas de GLES1
+> fixed-function que quedan y que el dump anterior no cubría:
+> - `glTexImage2D_soloader`: ahora samplea (paso primo 997, hasta 4096 muestras, para no pegarse siempre al
+>   mismo canal de un pixel RGBA de 4 bytes) los bytes crudos del buffer de píxeles que el `.so` sube y
+>   loguea `min`/`max`/`avg` -- si `MainMenu.png` realmente se decodificó a negro/vacío (bug de
+>   antes-de-GL, en `DecodePNG`/libpng, no en GL), esto lo va a mostrar directo sin necesidad de volcar el
+>   archivo.
+> - `log_draw_call`: se agregó `GL_LIGHTING`, `GL_TEXTURE_2D`, `GL_CULL_FACE` al dump existente.
+>   `GL_LIGHTING` activado sin ninguna luz configurada es el bug clásico de pipeline fixed-function que
+>   produce EXACTAMENTE este síntoma (geometría y textura correctas, pero cada fragmento se multiplica por
+>   una contribución de luz ~0 -> todo negro) -- y es plausible que nunca se haya inicializado ningún
+>   `glLight*`/`glEnable(GL_LIGHT0)` en este port ya que Inotia 3 es un motor 2D de UI, no debería
+>   necesitar iluminación en absoluto, así que si `lighting=1` aparece en el log es una pista muy fuerte.
+>   `GL_TEXTURE_2D` desactivado daría blanco (color de vértice plano), no negro, pero se descarta igual de
+>   paso; `GL_CULL_FACE` activado con el winding equivocado descartaría el triangle strip completo
+>   (renderizaría transparente/lo-que-hubiera-antes, no necesariamente negro, pero vale chequear). Build
+>   compilado y verificado (`build/inotia3.vpk`/`eboot.bin`/`inotia3.elf`, 2026-07-25).
+>
+> **Pendiente**: redeployar, reproducir, mandar el log. Buscar `lighting=` en las líneas `[GL]
+> glDrawArrays`/`glDrawElements` -- si aparece `lighting=1`, ese es el bug (fix: `glDisable(GL_LIGHTING)`
+> a la fuerza en nuestro propio loop, igual que ya se hace con `GL_SCISSOR_TEST` en `source/main.c`, o
+> encontrar y neutralizar el `glEnable(GL_LIGHTING)` real si aparece desde el `.so`). Si `lighting=0`,
+> mirar `pixel_sample` en las líneas `[GL] glTexImage2D` -- si `avg` está cerca de `0` con `max` también
+> bajo, la textura decodificada YA es negra antes de llegar a GL (habría que volver a mirar `DecodePNG`/
+> `libpng`, no más código de GL) y ese sería el siguiente hilo a seguir.
+
+> **Corrida 25 (2026-07-25) — `lighting=0` en las 20 llamadas logueadas: se descarta la hipótesis de
+> iluminación. Pero aparece un hallazgo mucho más fuerte: `texture_2d=0` en TODAS las 20 llamadas
+> logueadas, y `pixel_sample(n=0)` para el upload real de `MainMenu.png`/`font.fnt` (512x512,
+> `intFmt=1908`/`GL_RGBA` `type=1401`/`GL_UNSIGNED_BYTE` -- el chequeo de tipo SÍ pasaba, así que `n=0` no
+> era por eso).** `logs/log_2026-07-25_02-59-49.txt`: mismo patrón estable ya visto en la Corrida 24
+> (`glDrawArrays mode=5 count=4` alternando `bound_tex=3/4`, dos `glOrthox` distintos con matrices de
+> proyección correctas) pero ahora con los campos nuevos -- `lighting=0 texture_2d=0 cull_face=0` en las
+> 20 llamadas. **`GL_TEXTURE_2D` desactivado en CADA draw call logueado, a pesar de tener una textura real
+> bound (`bound_tex` no-cero) es la pista más fuerte hasta ahora**: en el pipeline fixed-function, sin
+> `GL_TEXTURE_2D` habilitado el color de cada fragmento sale del color de vértice plano/interpolado, NO de
+> la textura -- si ese color también resulta oscuro (no necesariamente blanco puro como asumía la Corrida 24;
+> el color de vértice puede variar por draw call vía `glColor4x` o un color-array por-vértice que la
+> Corrida 22-24 nunca inspeccionó), esto solo alcanza para explicar negro directamente.
+>
+> El límite de 20 llamadas logueadas (Corridas 22-24) solo alcanzaba a cubrir el arranque de la pantalla
+> de carga -- nunca llegaba a ver los draws reales de la pantalla de menú, que es lo que en realidad
+> importa para "¿se ve `MainMenu.png`?".
+>
+> **Instrumentación agregada** (`source/utils/glutil.c` + `.h`, `source/dynlib.c`):
+> - Límite de `log_draw_call` subido de 20 a 400 -- para cubrir muchos más frames, no solo el arranque.
+> - Nuevo `glEnable_soloader`/`glDisable_soloader` (mapeados en `dynlib.c` reemplazando el paso directo sin
+>   wrapper de antes) que loguean cada vez que el `.so` activa/desactiva una de las capacidades que más
+>   importan para visibilidad (`GL_TEXTURE_2D`, `GL_LIGHTING`, `GL_BLEND`, `GL_ALPHA_TEST`, `GL_CULL_FACE`,
+>   `GL_DEPTH_TEST`) -- así se ve la TRANSICIÓN real (o su ausencia total) en vez de solo un muestreo pasivo
+>   en el momento del draw.
+> - `log_draw_call` ahora también vuelca `GL_COLOR_ARRAY` (¿hay un color por-vértice en vez de uno plano?)
+>   y, si el draw usó un color-array `GL_FIXED` (ya convertido a float), el color real del primer vértice
+>   (`c0=(r,g,b,a)`) -- para confirmar directamente si el color efectivo con el que se rellena cada
+>   fragmento (dado que `texture_2d=0`) es oscuro/negro o no.
+> - `glTexImage2D_soloader`/`glTexSubImage2D_soloader`: además de `pixel_sample`, ahora logean el puntero
+>   `pixels` crudo -- si es `NULL` en el upload de 512x512, confirma que la subida real de bytes pasa por
+>   `glTexSubImage2D` (que ahora también samplea) y no por `glTexImage2D` (que solo reservaría el storage).
+>   Límite subido de 10 a 40 en ambas.
+>
+> Build compilado (cross real vía VitaSDK) y verificado (`build/inotia3.vpk`/`eboot.bin`/`inotia3.elf`,
+> 2026-07-25).
+>
+> **Pendiente**: redeployar, reproducir, mandar el log. Prioridad de lectura:
+> 1. Buscar `glEnable(x)`/`glDisable(x)` -- ¿se llega a habilitar `GL_TEXTURE_2D` (`x=de`) en ALGÚN
+>    momento del run? Si nunca aparece un `glEnable(de)`, el `.so` nunca lo activa para estos draws --
+>    posible pista de que el juego espera que el estado de texturing sea "sticky" desde alguna
+>    inicialización que nuestro puerto no está replicando bien, o que estos primeros draws
+>    deliberadamente no usan textura (fondo de color plano) y los draws reales SÍ vienen después, ahora
+>    visibles gracias al límite de 400.
+> 2. Si aparece `color_array=1` y `c0=(...)` en algún draw con `texture_2d=0`, ese color es literalmente lo
+>    que se está pintando en pantalla para ese draw -- si es oscuro/negro, ahí está el "por qué se ve
+>    negro" para ESE draw específico (aunque falte explicar por qué texturing sigue apagado).
+> 3. Buscar `pixels=` en las líneas `glTexImage2D`/`glTexSubImage2D` para el upload de 512x512 -- confirmar
+>    cuál de las dos llamadas trae los bytes reales, y si su `pixel_sample` (ahora que se está mirando la
+>    correcta) tiene `avg` cercano a `0`.
+
+> **Corrida 26 (2026-07-25) — Causa raíz real encontrada: el orden del render loop en `main.c` borraba el
+> frame DESPUÉS de dibujarlo. Además, dos bugs en la instrumentación misma venían dando pistas falsas.**
+> `logs/log_2026-07-25_03-36-52.txt` (2114 líneas): confirmó que sí hay draws reales con texturas reales
+> (`glTexSubImage2D` 512x512 `RGBA`/`GL_UNSIGNED_BYTE` con `pixel_sample avg=118.3` -- datos de píxel
+> genuinos, no vacíos) y que `glEnable(de1)` (`GL_TEXTURE_2D`) se llama explícitamente en la secuencia de
+> inicio (líneas 308/434/436) antes de que empiecen los draws en línea 499 -- pero el dump de
+> `log_draw_call` seguía mostrando `texture_2d=0`/`blend=0`/etc. en las 400 llamadas logueadas, sin
+> excepción, mientras `bound_tex`, `proj(...)` y `scissor`/`viewport` sí variaban normalmente entre draws.
+> Un valor que nunca cambia mientras los campos vecinos sí lo hacen es la firma de un bug de lectura, no de
+> un estado real -- **`source/utils/glutil.c`'s `log_draw_call` usaba `glGetIntegerv(GL_TEXTURE_2D/
+> GL_BLEND/GL_DEPTH_TEST/GL_LIGHTING/GL_CULL_FACE/GL_COLOR_ARRAY, ...)` para leer capacidades de
+> habilitación -- esos son enums de `glEnable`/`glDisable`/`glIsEnabled`, no `pname` válidos de
+> `glGetIntegerv`, y vitaGL evidentemente no los soporta por esa vía (siempre devuelve 0)**. Se cambió a
+> `glIsEnabled(cap)`, la API portable correcta. Un segundo bug, independiente: `log_draw_call` siempre leía
+> el índice `0` del buffer de vértices/colores ya convertido (`first_verts[0]`/`first_color[0]`) en vez del
+> índice `first` que ese draw call específico realmente consume (`glDrawArrays(mode, first, count)` dibuja
+> desde el índice `first`, no desde `0`) -- por eso `v0=(0.0,0.0)` y `c0=(0.00,0.00,0.00,0.00)` salían
+> idénticos en los 400 draws pese a ser objetos distintos. Corregido para indexar por `first` (y por
+> `indices[0]` en el caso de `glDrawElements`).
+>
+> Con las lecturas de capacidad descartadas como confiables, se revisó el loop de render en `source/
+> main.c` línea por línea contra el `WrapperRenderer.java` decompilado
+> (`decompiled_apk/sources/com/com2us/wrapper/WrapperRenderer.java`) -- **`onDrawFrame()` real no tiene
+> NINGÚN `glClear` propio; el Java solo hace `process()` (touch + `nativeRender`, que es donde el `.so`
+> dibuja todo) seguido de `nativeReDraw()`**. El loop de este port, en cambio, llamaba
+> `wr_run_timers(...)` (que dispara `nativeRender()`, donde el juego emite los 400 `glDrawArrays` del log)
+> y **DESPUÉS** hacía `glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)` -- justo antes de `nativeReDraw()`
+> y `gl_swap()` -- borrando el framebuffer exactamente después de que el juego terminó de dibujar su
+> frame y antes de presentarlo. Cada frame: el juego dibuja sus sprites -> se borra el framebuffer -> se
+> presenta la pantalla vacía. Esto explica tanto la pantalla negra como los FPS más bajos reportados por el
+> usuario (si está haciendo el trabajo de render, solo para descartarlo).
+>
+> **Fix aplicado** (`source/main.c`): el bloque de reset defensivo de scissor/viewport + `glClear` (agregado
+> en la Corrida 2 de Fase 4 para el bug de "pantalla reducida con borde") se movió de **después** de
+> `wr_run_timers(...)` a **antes**, preservando la intención original (limpiar antes de que el `.so` dibuje,
+> no destruir lo que ya dibujó).
+>
+> Build compilado (cross real vía VitaSDK, `/tmp/inotia3-build`) y verificado sin errores/warnings nuevos
+> (`build/inotia3.vpk`/`eboot.bin`/`inotia3.elf`, 2026-07-25).
+
+> **Corrida 27 (2026-07-25) — El fix de orden del `glClear` de la Corrida 26 era real pero NO es la única
+> causa: pantalla sigue en negro. Instrumentación de la Corrida 26 confirmada funcionando (datos ya
+> confiables), y aparece un hallazgo nuevo: la matriz modelview nunca cambia, lo cual no encaja con cómo
+> el `.so` arma su geometría.** `logs/log_2026-07-25_18-19-38.txt` (1514 líneas, generado ya con el fix de
+> la Corrida 26 desplegado): `texture_2d=2` (no-cero => habilitado) y `blend=1` en prácticamente los 384
+> draws logueados -- confirma que el fix `glIsEnabled` de la Corrida 26 funciona y que texturing/blend
+> están genuinamente activos, descartando esas dos hipótesis del todo. `bound_tex` alterna entre 3 y 4
+> (dos atlases, probablemente fuente/UI) con una sola aparición de `bound_tex=5` (la textura 512x512 tipo
+> `MainMenu.png`). Pero **`v0=(0.0,0.0)` y `mv(sx=1.000 sy=1.000 tx=0.000 ty=0.000)` (modelview identidad)
+> siguen siendo idénticos en los 384 draws, ahora YA con el fix del índice `first` de la Corrida 26
+> aplicado** -- es decir, o bien `first` es genuinamente `0` en cada uno de estos draws, o queda un bug
+> nuevo.
+>
+> Se cruzó esto contra el `.so` real decompilado (`decompiled_so/libgame_armeabi/out_ghidra.c`):
+> `glVertexPointer(2, 0x140c /*GL_FIXED*/, 0, &DAT_001778a8)` se llama en múltiples sitios distintos
+> (líneas 106964, 107176, 107446, 107464, 108559, 108579) **reutilizando la MISMA dirección estática de
+> buffer de vértices** -- el patrón clásico de "quad plantilla fija + reposicionar con la matriz modelview
+> (`glTranslatex`/`glLoadMatrixx`) antes de cada draw", no de un buffer por-objeto con offsets. Si ese es el
+> mecanismo real, la matriz modelview leída en el momento del draw NO debería ser idéntica siempre --
+> a menos que haya un bug de lectura en vitaGL para `glGetFloatv(GL_MODELVIEW_MATRIX)` análogo al de
+> `glGetIntegerv` con los enums de capacidad que ya se corrigió en la Corrida 26 (incluso `glTranslatex_
+> soloader`/`glLoadMatrixx_soloader`/`glMultMatrixx_soloader`, que sí están wrapeados en `dynlib.c`, no
+> logueaban nada hasta ahora -- no había forma de saber si el `.so` siquiera las estaba llamando).
+>
+> **Instrumentación agregada** (`source/utils/glutil.c`):
+> - `log_draw_call`: ahora vuelca los 4 vértices del quad (no solo el vértice `first`) más su bounding box
+>   (`bbox=(minx,miny)-(maxx,maxy)`) y el valor real de `first` usado, en vez de inferir la posición/tamaño
+>   del quad a partir de un solo vértice.
+> - `glTranslatex_soloader`, `glLoadMatrixx_soloader`, `glMultMatrixx_soloader`: antes silenciosos, ahora
+>   loguean (tope de 20 cada uno) los valores de traslación/escala reales que el `.so` pasa, para poder
+>   cruzarlos directamente contra la lectura de `glGetFloatv(GL_MODELVIEW_MATRIX)` en el mismo log.
+>
+> Build compilado (cross real vía VitaSDK) y verificado sin errores nuevos (`build/inotia3.vpk`/
+> `eboot.bin`/`inotia3.elf`, 2026-07-25).
+>
+> **Pendiente (sesión cerrada sin resolver aún -- retomar acá la próxima vez)**: redeployar, reproducir,
+> mandar el log. Prioridad de lectura:
+> 1. Buscar `glTranslatex`/`glLoadMatrixx`/`glMultMatrixx` en el log nuevo -- si aparecen con valores `tx`/
+>    `ty` no-cero, pero `mv(...)` en las líneas `glDrawArrays` inmediatamente después sigue mostrando
+>    `tx=0.000 ty=0.000`, eso CONFIRMA un bug de lectura en `glGetFloatv(GL_MODELVIEW_MATRIX)` de vitaGL
+>    (no un bug del juego) -- la mitigación sería mantener nuestro propio shadow-tracking de la matriz
+>    modelview en vez de confiar en el query de vitaGL para diagnóstico (y, si el bug fuera real más allá
+>    del diagnóstico -- i.e. si vitaGL también usa mal esa matriz internamente al transformar vértices, no
+>    solo al reportarla -- sería un bug de vitaGL en sí que ameritaría reportarlo upstream).
+> 2. Si NUNCA aparece ningún `glTranslatex`/`glLoadMatrixx`/`glMultMatrixx` en absoluto durante los draws de
+>    menú, el `.so` genuinamente no está reposicionando nada -- revisar si hay una llamada equivalente en
+>    punto flotante (`glTranslatef`/`glLoadMatrixf`, mapeadas directo a GL real en `dynlib.c` sin wrapper
+>    propio, así que sin logging hoy) que sí se esté usando; si es así, agregarles logging también.
+> 3. Mirar el nuevo `bbox=(...)` por draw call -- si el bbox es literalmente un punto (`minx==maxx` y
+>    `miny==maxy`), el quad mismo es degenerado (buffer de vértices mal armado o mal leído, no solo un
+>    problema de posición) y el hilo a seguir es la conversión `GL_FIXED`->`float` en
+>    `convert_fixed_array`/`flush_pending_fixed_arrays`, no la matriz.
+
+> **Corrida 28 (2026-07-26) — Nuevo ángulo: el render loop en régimen estable NUNCA vuelve a dibujar
+> `MainMenu.png` tras el arranque; solo repite dos texturas RGB565 (`GL_UNSIGNED_SHORT_5_6_5`) frame tras
+> frame, y nuestra instrumentación no podía leer su contenido real. Fix de instrumentación aplicado,
+> compilado, pendiente de un log nuevo.** `logs/log_2026-07-26_23-44-33.txt` (1301 líneas, corrida corta):
+> sin `fatal`/crash. `GetFileDescriptor("MainMenu.png")`/`("font.fnt")` exitosos (ahora resueltos como
+> archivo suelto en `ux0:data/inotia3/assets/common/game_res/*.jpg`, no vía offset dentro del `.apk` —
+> aparentemente los assets ya están extraídos sueltos en la consola de prueba actual, cambio de método
+> válido, mismo resultado). `nativeInit() and resume returned -- entering render loop.` en la línea 683.
+>
+> **Contando `bound_tex` en las 281 draw calls logueadas de todo el archivo: `bound_tex=3` → 140,
+> `bound_tex=4` → 140, `bound_tex=5` (la textura RGBA 512x512 real de `MainMenu.png`, la única con
+> `pixel_sample avg=118.3` confirmado no-negro) → exactamente 1 vez, en la línea 500 — y esa única
+> aparición ocurre ANTES de la línea 683 ("entering render loop"), es decir durante el setup/`nativeInit`,
+> no durante el loop estable.** Después de "entering render loop" el patrón por frame es siempre
+> idéntico y nunca cambia en los ~140 frames capturados: `GetEnv` + `CallStaticVoidMethod(...,25,...)`
+> (re-armado de `SetTimer`, ya documentado como normal) + exactamente 2 `glDrawArrays` (uno con
+> `bound_tex=3`, otro con `bound_tex=4`) — sin ninguna otra actividad JNI/archivo/socket en el medio. Todos
+> los draws comparten el mismo quad (`verts=[(0,0),(0,256),(384,0),(384,256)]`, siempre igual) dentro de
+> una proyección ortho de `480x320` (`sx=0.004≈2/480 sy=-0.006≈-2/320`) — geométricamente razonable (un
+> gráfico de 384x256 alineado arriba-a-la-izquierda dentro del canvas de diseño de 480x320, no fuera de
+> rango), `texture_2d=2` (activo) y `blend=1` en ambos — es decir, a nivel de estado GL todo se ve
+> correcto, no hay ningún interruptor mal puesto.
+>
+> Las dos texturas usadas en el loop (`glTexImage2D`/`glTexSubImage2D`, líneas 302-305 y 420-423/497) son
+> `intFmt=0x1907` (`GL_RGB`) `type=0x8363` (`GL_UNSIGNED_SHORT_5_6_5`) de `512x256` y `512x64` — **ambas
+> se suben ANTES de que el `.so` siquiera pida `MainMenu.png`/`font.fnt` por `GetFileDescriptor`** (línea
+> 445+), así que no son la imagen de menú ni la fuente reales — más probablemente un fondo/ícono de
+> pantalla de carga y una franja de fuente propios del motor, cacheados en RGB565 para ahorrar memoria.
+> **Punto ciego real:** `sample_pixels()` en `source/utils/glutil.c` solo sabía leer `GL_UNSIGNED_BYTE` —
+> para `GL_UNSIGNED_SHORT_5_6_5` devolvía `pixel_sample(n=0 ... avg=-1.0)` siempre, sin importar si el
+> contenido real era una imagen válida o basura/negro — exactamente los dos únicos texels que se dibujan
+> en régimen estable, sin visibilidad de si su contenido es la causa del negro.
+>
+> Dos hipótesis quedan abiertas y son mutuamente excluyentes con el dato que falta:
+> 1. **Bug de contenido/formato**: los dos RGB565 están genuinamente negros o corruptos (banda de color
+>    equivocada, endianness, u otro bug de conversión no relacionado con `GL_FIXED`) — explicaría el negro
+>    directamente pese a que el resto del pipeline esté bien.
+> 2. **Bug de lógica de juego/estado**: son un fondo+ícono de pantalla de "cargando" legítimos (con
+>    contenido real, no negro) y el `.so` simplemente nunca transiciona a la escena de menú real (que sí
+>    usaría `MainMenu.png`/`font.fnt`, cargados con éxito pero jamás vueltos a dibujar) — un stall de
+>    máquina de estados esperando algo que este port nunca satisface (candidatos: Hub/red no-op,
+>    inicialización de audio, algún flag de "carga completa" nunca seteado), no un problema de GL en sí.
+>
+> **Fix de instrumentación aplicado** (`source/utils/glutil.c`, `sample_pixels()`): ahora decodifica
+> `GL_UNSIGNED_SHORT_5_6_5`/`4_4_4_4`/`5_5_5_1` a una luma aproximada de 0-255 por texel muestreado (antes
+> silenciosamente ignorados), para que `min`/`max`/`avg` en los logs de `glTexImage2D`/`glTexSubImage2D`
+> signifiquen lo mismo que para el camino `GL_UNSIGNED_BYTE` ya existente. Build compilado y verificado
+> (cross real vía VitaSDK, `/tmp/inotia3-build` → `build/inotia3.vpk`/`eboot.bin`/`inotia3.elf`,
+> 2026-07-26) — sin warnings nuevos.
+>
+> **Pendiente**: redeployar, reproducir, mandar el log. Buscar las líneas `[GL] glTexImage2D`/
+> `glTexSubImage2D` de los dos uploads `512x256`/`512x64` (`type=8363`) — si `avg` sale cercano a `0` con
+> `max` también bajo, confirma la Hipótesis 1 (contenido negro/corrupto, seguir por conversión de formato,
+> no lógica de juego); si `avg`/`max` muestran variación real (imagen con contenido), confirma la Hipótesis
+> 2 (stall de estado — el próximo paso sería rastrear en `out_ghidra.c` qué condición gatea la transición
+> fuera de la pantalla de carga, no seguir tocando código de GL).
+
+> **Corrida 29 (2026-07-27) — Confirmado con datos reales: la textura RGB565 que se dibuja en régimen
+> estable está en negro puro (`avg=0.0`, no un bug de instrumentación); causa raíz localizada a un nivel
+> más — el subsistema "CSFB" (framebuffer de software del motor) nunca refresca su contenido — y hook de
+> diagnóstico agregado, pendiente de un log nuevo.** `logs/log_2026-07-27_00-19-07.txt`: con el fix de
+> `sample_pixels()` de la Corrida 28 ya desplegado, el upload real (`x=0 y=0 w=384 h=256 type=8363`,
+> puntero `0x83653388`) sale `pixel_sample(n=1612 min=0 max=0 avg=0.0)` — **negro genuino**, mientras que
+> en el mismo log el upload RGBA de `MainMenu.png` sigue saliendo correcto (`avg=118.3 max=255`),
+> confirmando que el decodificador RGB565 nuevo funciona y que esto no es un artefacto de logging.
+>
+> Investigación (fork dedicado sobre `decompiled_so/libgame_armeabi/out_ghidra.c`, 214k líneas) encontró
+> que el motor tiene DOS rutas de dibujo completamente separadas: `MainMenu.png` se dibuja vía
+> `SGL_DrawTexture`/`GRPX_DrawPart` (el sprite-renderer normal, el mismo que ya arregló la Corrida 21 vía
+> `File_GetFullPathName_hook`) — corrió **una sola vez**, durante el setup, nunca de nuevo. Las dos
+> texturas RGB565 que se repiten cada frame son el **"CSFB" (software framebuffer)**: `RenderCoreInitialize`
+> las crea vacías (`glTexImage2D(...,NULL)`, confirmado ya en Corrida 28: `pixels=0x0`), y
+> `nativeReDraw()` → `RenderCoreRedraw()` las redibuja TODOS los frames sin excepción — con su propio
+> `glClearColor(0,0,0,1)`+`glClear` primero, **tapando lo que sea que `nativeRender` haya dibujado en el
+> mismo frame** — mediante `glDrawArrays` puro, sin ningún `glTexSubImage2D`. La única función que subiría
+> contenido real es `CSFB_grpFlushLcd` → `RenderCoreFlush` → `RenderCoreFlush320` (el `glTexSubImage2D`
+> real), alcanzable solo a través de `CS_grpFlushLcd()` → `(*__CS_grpFlushLcd)()`
+> (`out_ghidra.c:155178-155181`). **Una búsqueda de texto completa por `CS_grpFlushLcd(` en las 214k
+> líneas del pseudo-C no encontró ningún call site** — ni siquiera indirecto vía otro wrapper nombrado —
+> consistente exactamente con lo que ya sabíamos por el log (esa textura se sube una sola vez, en negro,
+> y nunca más).
+>
+> `jGetRenderer()` sigue hardcodeada a `return 0` (selecciona CSFB **también en Android real** — no es una
+> mala elección de renderer de este port). Esto significa que en el binario real este mecanismo de flush
+> SÍ se dispara de alguna forma (el juego funciona en Android) — probablemente a través de un puntero a
+> función/slot de vtable que Ghidra no pudo nombrar en su análisis estático, no código muerto.
+>
+> **Instrumentación agregada** (`source/patch.c`): `CS_grpFlushLcd` y su global `__CS_grpFlushLcd` están
+> exportados en `.dynsym` (confirmado con `objdump -T`: `CS_grpFlushLcd` @ `0xf55c4`, `__CS_grpFlushLcd`
+> @ `0x56e1bc`, junto con `RenderCoreFlush` @ `0xf0a80`, `CSFB_grpFlushLcd` @ `0x10ab6c`,
+> `RenderCoreRedraw` @ `0xef83c`, `RenderCoreInitialize` @ `0xf0c4c`, `jGetRenderer` @ `0x598a8` — todos
+> resolubles por nombre vía `so_symbol()`, a diferencia de `excuteDirectly`/`jIsCracked` de la Fase 3 que
+> requirieron offsets fijos por no estar en `.dynsym`). Se hookeó `CS_grpFlushLcd` (una función de una
+> sola instrucción: `(*__CS_grpFlushLcd)()`) con `CS_grpFlushLcd_hook()`, que loguea cada invocación
+> (tope de 30) y **preserva el comportamiento real exactamente** (dereferencia el mismo puntero global y
+> lo invoca) — no es una reimplementación arriesgada como el fix de `File_GetFullPathName`, es un logging
+> transparente sobre una función de una sola línea. Build compilado y verificado (cross real vía VitaSDK,
+> `build/inotia3.vpk`/`eboot.bin`/`inotia3.elf`, 2026-07-27).
+>
+> **Pendiente**: redeployar, reproducir, mandar el log. Buscar `[CSFB] CS_grpFlushLcd() called` —
+> - Si **nunca aparece**, confirma que el disparador real (lo que sea que llame a esto en Android) no se
+>   está ejecutando en este port — siguiente paso sería buscar qué llama a esto vía un puntero a función
+>   NO nombrado por Ghidra (buscar dónde se TOMA la dirección de `CS_grpFlushLcd` — no solo dónde se
+>   llama — como dato asignado a un campo de struct/vtable; o revisar si depende de un pthread dedicado
+>   que este port no esté arrancando).
+> - Si **sí aparece**, el mecanismo de flush corre pero el contenido igual sale negro — el problema
+>   estaría más adentro (`RenderCoreFlush`/`CS_GRP_GET_FRAME_BUFFER_POINTER`, el puntero al framebuffer de
+>   software real que la Corrida 21 nunca tocó) — haría falta instrumentar esa capa en vez de seguir
+>   subiendo por la cadena de llamadas.
+
+> **Corrida 30 (2026-08-04) — `CS_grpFlushLcd`/CSFB confirmado como callejón sin salida real, no un bug de
+> este port.** `logs/log_2026-08-04_21-15-18.txt` (con el hook de la Corrida 29 desplegado): `[CSFB]
+> CS_grpFlushLcd() called` **nunca aparece**, en todo un run que llega y se mantiene estable en el render
+> loop. Un fork dedicado sobre `out_ghidra.c` (214k líneas) confirmó por qué: `__CS_grpFlushLcd` solo se
+> asigna a `CSFB_grpFlushLcd`/`CSOGL_grpFlushLcd` dentro de `InitializeApp()` según `jGetRenderer()`
+> (hardcodeada a 0 → rama CSFB siempre), y `CS_grpFlushLcd` no tiene NINGÚN call site en todo el binario —
+> ni directo ni como dato/vtable — confirmado con una búsqueda de bytes crudos del literal de dirección
+> sobre el `.so` completo (un solo hit, en su propia entrada de `.dynsym`). Tampoco hay ningún `pthread_create`
+> cerca de `RenderCoreInitialize`/CSFB. **CSFB es código muerto también en el binario real de Android, no
+> algo que este port rompió** — cerrado como pista.
+>
+> El mismo fork encontró el camino real de presentación de sprites, totalmente separado de CSFB: `GRP_Flush()`
+> (`out_ghidra.c:20404`) → `GRPX_GetFlag()` bifurca a `GRPX_FlushAll()` → `SGL_grpFlushLcd(...)`
+> (`:123810/123813`) o `GRPX_Flush()` → `SGL_FrameBufferToScreen()` (`:123819/123822`) — la misma
+> `SGL_FrameBufferToScreen` ya implicada en el bug de "pantalla reducida con borde blanco" de la Fase 4.
+> `GRP_Flush()` tiene 10 call sites reales en código de juego. Los 5 símbolos están exportados en `.dynsym`
+> (sin offsets fijos necesarios). Se instrumentaron con hooks transparentes (`source/patch.c`, macro nueva
+> `SO_CONTINUE_VOID` ya que `SO_CONTINUE` de `so_util.h` no compila con `type=void`) que preservan el
+> comportamiento real. Build compilado y verificado sin errores.
+
+> **Corrida 31 (2026-08-04) — Causa raíz real, arquitectónica: este port asumía la clase `WrapperRenderer`
+> equivocada. Inotia 3 usa `WrapperDirtyRenderer`, cuyo modelo de presentación es completamente distinto, y
+> el loop de `main.c` lo violaba en cada frame. Fix aplicado y compilado, pendiente de confirmar en
+> consola.** `logs/log_2026-08-04_22-28-10.txt` (con los hooks `[FLUSH]` de la Corrida 30 desplegados):
+> `GRP_Flush()` (#1) → `GRPX_GetFlag() -> 1` → `GRPX_Flush()` → `SGL_FrameBufferToScreen()` se disparan
+> **una única vez**, durante el setup (junto con el único `glTexSubImage2D` real de `MainMenu.png`,
+> `avg=118.3`) — y **nunca de nuevo** en el resto del run, aunque el loop estable sigue corriendo cientos de
+> frames después de "entering render loop". Mismo patrón que CSFB en la Corrida 28/29, pero esta vez sobre
+> el camino de dibujo REAL del juego, no uno muerto.
+>
+> Justo después del único `SGL_FrameBufferToScreen()`, el log muestra `GetStaticMethodID(..., "Flush",
+> "()V"): 41` + `CallStaticVoidMethod(..., 41, ...)` — el `.so` llamando de vuelta a
+> `WrapperJinterface.Flush()`. Cruzando esto contra `decompiled_apk/sources/com/com2us/wrapper/`:
+> `WrapperJinterface.Flush()` (línea 377-378) llama a `wrapperRenderer.Flush()` — pero **`WrapperRenderer.
+> Flush()` (la clase base, línea 446) es un no-op vacío**, mientras que `WrapperDirtyRenderer.Flush()`
+> (línea 231-233, override) hace `this.wrapperView.requestRender()`. Cuál de las dos aplica depende de cuál
+> clase instancia el juego — y `decompiled_apk/sources/com/com2us/inotia3/.../MainActivity.java:117` lo
+> resuelve sin ambigüedad: `this.wrapperRenderer = new WrapperDirtyRenderer(...)`, **incondicional, sin
+> rama alternativa**. Todo el análisis de arquitectura en la §0 de este documento (y cada Corrida hasta
+> ahora) se basó en `WrapperRenderer.onDrawFrame()` (`process()` + `nativeReDraw()`, sin `glClear` propio) —
+> pero **Inotia 3 nunca usa esa clase**; usa la subclase, que la overridea por completo:
+> - `WrapperDirtyRenderer.onDrawFrame()` (línea 212-213) está **completamente vacío** — no llama a
+>   `process()` ni a `nativeReDraw()`.
+> - El `GLSurfaceView` corre en `RENDERMODE_WHEN_DIRTY` (`setRenderMode(0)`, línea 62) — Android NO llama a
+>   `onDrawFrame()`/no hace swap del framebuffer por su cuenta en cada tick, solo cuando algo pide
+>   explícitamente `requestRender()`.
+> - `process()` (touch + `nativeRender()` — donde el `.so` dibuja) corre en un hilo dedicado propio
+>   (`timerThread`, líneas 9-61) con su propio ciclo `wait()`/`notify()`, encolado sobre el hilo de GL vía
+>   `queueEvent()` — desacoplado de cualquier vsync/frame automático.
+> - El único disparador real de un swap de pantalla es `Flush()` → `requestRender()`, que agenda exactamente
+>   una llamada al `onDrawFrame()` vacío + el swap EGL implícito que GLSurfaceView hace después — presentando
+>   lo que sea que `process()` ya haya dibujado en el back buffer hasta ese momento.
+> - **No hay ningún `glClear()` en absoluto en toda esta cadena Java.** El framebuffer solo se limpia si el
+>   propio `.so` lo hace como parte de su dibujo.
+>
+> Es decir: en Android real, `GRP_Flush()` disparándose una sola vez durante la pantalla de carga y nunca
+> más es **exactamente el comportamiento correcto** — la pantalla de carga se dibuja, se presenta una vez
+> vía `Flush()`/`requestRender()`, y se queda estática en el framebuffer (nadie la borra) hasta que el juego
+> decida redibujar/presentar la siguiente pantalla. **El loop de `main.c` de este port, en cambio, hacía
+> `glClear()` + (hasta la Corrida 26) `nativeReDraw()` + `gl_swap()` incondicionalmente en CADA iteración,
+> sin importar si el `.so` había pedido presentar algo** — literalmente borrando el único frame real
+> dibujado en el próximo ciclo del loop, y presentando en su lugar contenido vacío/las texturas CSFB negras
+> de `nativeReDraw()` (código muerto también en Android real, confirmado en la Corrida 30) para siempre.
+> Esto es la causa raíz real detrás de la pantalla negra perseguida desde la Corrida 1 — todos los bugs
+> reales encontrados y corregidos en el camino (orden del `glClear` en la Corrida 26, `GL_FIXED`, viewport/
+> scissor de la Fase 4, `File_GetFullPathName` de la Corrida 21, etc.) eran genuinos, pero todos corren
+> río abajo de este malentendido arquitectónico de fondo.
+>
+> **Fix aplicado**:
+> - `source/wr_timer.h`/`.c`: nuevo par `wr_request_present()`/`wr_take_present_request()` — un flag simple
+>   que mirroa `requestRender()`.
+> - `source/java.c`: `Flush_stub` (method id 41, antes no-op) ahora llama a `wr_request_present()`.
+> - `source/main.c`: el loop principal ya NO llama a `nativeReDraw()` (código muerto en la clase real que
+>   usa este juego, confirmado arriba) ni hace `glClear()` incondicional cada iteración. Ahora: drena touch,
+>   corre `wr_run_timers()` (que dispara `nativeRender()`, donde el `.so` dibuja Y limpia lo que necesite
+>   por su cuenta), y solo hace `gl_swap()` si `wr_take_present_request()` reporta un `Flush()` pendiente.
+>   Se agregó un clear+swap de ambos buffers una sola vez antes de entrar al loop (mismo rol que la garantía
+>   de EGL de entregar una superficie nueva ya en blanco, que este port no tiene gratis).
+> - Build compilado y verificado (cross real vía VitaSDK, `build/inotia3.vpk`/`eboot.bin`/`inotia3.elf`,
+>   2026-08-04) — sin errores ni warnings nuevos.
+>
+> **Pendiente**: redeployar, reproducir, mandar el log. Si los sprites aparecen pero con tearing/flicker o
+> contenido viejo asomando entre `Flush()`s, el próximo sospechoso es el comportamiento de preservación del
+> back buffer de vitaGL entre swaps (Android puede estar confiando en que el buffer persiste entre frames
+> sin swap de por medio — un supuesto que vitaGL podría no cumplir igual); si la pantalla sigue
+> completamente negra, revisar si `Flush()` realmente se está llamando más de una vez en el nuevo log (buscar
+> múltiples `CallStaticVoidMethod(..., 41, ...)`) — si sigue siendo una sola vez, el problema vuelve a ser de
+> lógica de juego/estado (por qué el `.so` no redibuja nada después de la pantalla de carga), no de
+> plomería de presentación.
+
+> **Corrida 32 (2026-08-04) — Confirmado: `Flush()`/`GRP_Flush` siguen en una sola invocación con el fix de
+> la Corrida 31 desplegado — es lógica de juego/estado, no plomería. Localizado el candidato exacto:
+> `MainProcess` corta camino sobre `gAppSleepInfo`, y `main.c` llama a `nativeResume`/`nativeResumeClet` en
+> CADA arranque cuando Android real solo los llama tras un pause real. Instrumentación agregada, pendiente
+> de confirmar con datos reales.** `logs/log_2026-08-04_23-10-46.txt` (con el logging nuevo de
+> `source/wr_timer.c` desplegado): en todo el run existe **un solo timer ID registrado y disparado**
+> (`id=-1730838840`, `intervaltime=100` — un timer que se re-arma cada 100ms él mismo, consistente con
+> `g_MainTimer`/`MainProcess` documentado desde la Corrida 1) — ningún otro timer se registra ni se
+> desregistra jamás. `[FLUSH]` sigue apareciendo una sola vez, **antes** de que este timer siquiera se
+> registre (la única invocación de `GRP_Flush` ocurre durante el setup de `nativeInit`, no dentro del loop
+> timer-driven). Es decir: el único driver per-frame del juego corre estable cada 100ms durante todo el run,
+> pero jamás vuelve a pedir presentar nada.
+>
+> Leyendo `MainProcess` completo en `out_ghidra.c:25352`: la primera línea es
+> `if (gAppSleepInfo != '\0') { CS_knlSetTimer(...,100,0,0); ...; return; }` — si `gAppSleepInfo` es no-cero,
+> la función SOLO re-arma su propio timer y vuelve, sin llamar a `STATE_fpProcess()` (el dispatcher de
+> update/draw por-escena que eventualmente llegaría a `GRP_Flush`) ni a `SOUNDSYSTEM_Process()`. Esto
+> explicaría el patrón exacto observado: un timer que tiquetea para siempre sin hacer nada más.
+>
+> `gAppSleepInfo` se pone en 1 SOLO en `pauseClet()` (`:24894`) y se limpia a 0 en `resumeClet()` (`:24847`,
+> incondicional), en `DelegateCall_startClet()` (`:24990`, dentro de la cadena de `startClet()` que corre
+> DENTRO de `nativeInit()`), y en `destroyClet()` (`:24762`). Cruzando esto contra
+> `decompiled_apk/sources/com/com2us/wrapper/WrapperDirtyRenderer.java` (la clase real que usa Inotia 3,
+> Corrida 31): tanto `onResume()` (línea 121: `if (this.isPaused) { ... }`) como `onResumeClet()` (línea
+> 156: `if (this.isPaused) { ... }`) **solo disparan la cadena que llega a `nativeResume`/`nativeResumeClet`
+> si `isPaused` es `true`** — falso en un arranque limpio que nunca pasó por pausa, así que en Android real
+> **ninguno de los dos se invoca en el primer arranque**; `gAppSleepInfo` simplemente queda en el `0` que
+> `DelegateCall_startClet()` ya puso dentro de `nativeInit()`. **`source/main.c`, en cambio, llama a
+> `nativeResume(&jni, NULL); nativeResumeClet(&jni, NULL);` incondicionalmente, en TODOS los arranques,
+> primer arranque incluido** — un camino que Android real nunca ejecuta en esta situación. Si esa secuencia
+> deja `gAppSleepInfo` en 1 en vez de 0 (o si `nativeResumeClet()` no mapea 1:1 a `resumeClet()` como se
+> asume), esto explicaría un stall permanente exactamente con esta forma.
+>
+> **Instrumentación agregada** (`source/patch.c`): `MainProcess` (offset exportado en `.dynsym`,
+> `so_symbol()`, sin offset fijo) hookeado transparentemente (`SO_CONTINUE_VOID`) para loguear el valor real
+> de `gAppSleepInfo` (también resuelto por símbolo, `.bss` de 1 byte) al principio de cada una de sus
+> primeras 20 invocaciones. Build compilado y verificado (cross real vía VitaSDK,
+> `build/inotia3.vpk`/`eboot.bin`/`inotia3.elf`, 2026-08-04) — sin errores nuevos.
+>
+> **Pendiente**: redeployar, reproducir, mandar el log. Buscar `[MAINPROC] MainProcess() called` —
+> - Si `gAppSleepInfo=1` en TODAS las invocaciones, confirma la hipótesis: el fix sería no llamar a
+>   `nativeResume()`/`nativeResumeClet()` en el arranque inicial (solo deberían dispararse ante un pause/
+>   resume real más adelante, si este port llega a implementar esa transición) — probar removiendo esas dos
+>   líneas de `main.c` y ver si el juego avanza.
+> - Si `gAppSleepInfo=0`, la hipótesis está descartada y el corte está en otro lado dentro de `MainProcess`
+>   (revisar `STATE_fpProcess`/`STATE_nState`/`GAMESTATE_nState` — qué controla si hay un "estado" real
+>   asignado, y si `STATE_fpProcess` es NULL por algo que `startClet()`/`StartCletProcess()` no terminó de
+>   inicializar en este port).
+
+> **Corrida 33 (2026-08-04/05) — `gAppSleepInfo=0` confirmado en las 20 invocaciones logueadas (hipótesis de
+> la Corrida 32 descartada) — pero la lectura completa de `MainProcess` reveló la causa real: NADA llama
+> jamás a `STATE_Set()`, así que `STATE_fpProcess` queda en NULL para siempre y el dispatch por-escena
+> nunca corre. Fix aplicado, compilado, pendiente de confirmar en consola.** `logs/log_2026-08-04_23-51-15.
+> txt`: `[MAINPROC] ... gAppSleepInfo=0` en las 20 líneas — el corte NO es ahí.
+>
+> Leyendo `MainProcess` (`out_ghidra.c:25352`) después del check de `gAppSleepInfo`: drena
+> `INPUTQUEUE_Get`, y en cada vuelta (incluso sin input) llama `if (STATE_fpProcess != (code*)0x0)
+> (*STATE_fpProcess)()` — es decir, el dispatcher por-escena que eventualmente llamaría a `GRP_Flush` SOLO
+> corre si `STATE_fpProcess` es no-nulo. `STATE_fpProcess`/`STATE_nState` son globales `.bss` (confirmado
+> con `objdump -T`) — arrancan en `0`/`NULL` hasta que algo llame a `STATE_Set()` (`:24479`, la máquina de
+> estados: switch por id, asigna `STATE_fpEnter/fpExit/fpProcess/fpPressKey` y al final SIEMPRE invoca
+> `(*pcVar1)()`, el `Enter` del estado nuevo). **Un `grep` de TODOS los call sites de `STATE_Set(` en las
+> 214k líneas del `.so` no encuentra ninguno para el id `0` ("Init") salvo dentro de `UserAgreeCallback`
+> (`:24932-24940`, solo si `param_1==0`)** — y `UserAgreeCallback` en sí solo se invoca desde quien llame a
+> `Java_com_com2us_module_activeuser_ActiveUser_jniUserAgreeNotifier` (`:141236`), un export JNI que espera
+> que un módulo Java de Com2uS ("ActiveUser"/UserAgree, parte del mismo sistema de Hub/social que
+> `CLAUDE.md` ya marca como no-op-hasta-probar-necesario) lo llame de vuelta con el puntero a función
+> previamente registrado.
+>
+> Cruzando contra `startClet()` (`:24998-25038`, corre DENTRO de `nativeInit()`): registra ese callback vía
+> `CS_UserAgreeSetCallback(UserAgreeCallback+1)`, y SOLO muestra una UI real (`CS_UserAgreeShowUI()`) si el
+> idioma del dispositivo es coreano (`strcmp(lang,"kor")==0`) — **para cualquier otro idioma (este build:
+> `com.com2us.inotia3.normal.freefull.google.global`, confirmado no-coreano), depende ENTERAMENTE de que
+> ese sistema de módulos externo dispare el callback por su cuenta, sin ninguna UI**. Este port no tiene esa
+> capa de módulos (ni Hub ni ActiveUser reales) — así que ese callback simplemente nunca se dispara, y
+> `STATE_fpProcess` se queda en `NULL` para siempre. Esto explica exactamente el patrón observado desde la
+> Corrida 28: el timer principal tiquetea estable cada 100ms sin fallar nunca, pero no pasa nada más — el
+> único frame real dibujado (`MainMenu.png`/`GRP_Flush` de las Corridas 30-32) se dibujó desde OTRO código de
+> init anterior a esto (una pantalla de carga hardcodeada, no gateada por `STATE_*`), no desde la máquina de
+> estados — que nunca llegó a arrancar.
+>
+> **Fix aplicado** (`source/patch.c`): hook transparente sobre `CS_UserAgreeSetCallback` (exportado en
+> `.dynsym`) que llama a la función real (`SO_CONTINUE_VOID`) y además guarda el puntero al callback
+> registrado en `g_user_agree_callback`, sin invocarlo todavía. Nueva función `patch_fire_user_agree_
+> callback()` que lo invoca con argumento `0` ("de acuerdo"/sin error) — llamada UNA VEZ desde
+> `source/main.c`, después de que `nativeResume()`/`nativeResumeClet()` retornan (es decir, después de que
+> `startClet()` terminó TODA su inicialización, incluyendo `CS_ActiveUserStart()`/news banner/registro de
+> `g_MainTimer` — deliberadamente NO desde dentro del hook mismo, para no adelantar el primer `Enter` de la
+> máquina de estados a un punto donde esas otras piezas todavía no existen). Build compilado y verificado
+> (cross real vía VitaSDK, `build/inotia3.vpk`/`eboot.bin`/`inotia3.elf`, 2026-08-05) — sin errores nuevos.
+>
+> **Pendiente**: redeployar, reproducir, mandar el log. Buscar `[STATE] firing UserAgree callback(0)` (debe
+> aparecer una vez, después de "entering render loop" YA NO debería ser cierto que solo aparece un
+> `[FLUSH]` — si la máquina de estados arranca de verdad, debería haber MÁS invocaciones de `GRP_Flush`/
+> `Flush()` a medida que el juego transiciona de estado (Init → Logo → Hub/Title → Menu). Si sigue
+> apareciendo un solo `[FLUSH]` a pesar de que el callback se dispara, el próximo sospechoso es que
+> `STATE_EnterInit`/`STATE_ProcessInit` (el primer estado real) tenga su propia condición de espera interna
+> (revisar su cuerpo en `out_ghidra.c` directamente) — si nunca aparece `[STATE] firing...` en absoluto,
+> revisar el warning `Corrida 33: startClet() never registered a UserAgree callback` (confirmaría que
+> `CS_UserAgreeSetCallback` no se llamó como se asumió, y hay que reabrir la traza desde `startClet()`).
+
+> **Corrida 34 (2026-08-05) — ¡El fix de la Corrida 33 funciona! La máquina de estados arrancó de verdad
+> (segundo `[FLUSH]` real, nunca visto en 33 Corridas previas) y el juego avanza de la pantalla de carga a
+> "Title" — pero crashea ahí con un bug nuevo, más profundo: el `length` usado para mmapear `MainMenu.png.
+> jpg` en su SEGUNDA apertura sale contaminado con el `length` de `Title.png`, truncando el archivo y
+> rompiendo el CRC de libpng. Investigación en curso (fork dedicado).** `logs/log_2026-08-05_00-33-46.txt` +
+> dump `Inotia3-psp2core-1785904438-...psp2dmp`: secuencia confirmada línea por línea —
+> `[STATE] firing UserAgree callback(0)` → **`[FLUSH] GRP_Flush() called (#2)`** (la primera vez en toda la
+> historia de este port que `GRP_Flush` se dispara más de una vez) → `entering render loop` → `MainProcess`
+> tiquetea → el juego resuelve `"Title.png"` vía `GetFileDescriptor` (JNI, `length=110266` correcto) → **sin
+> ninguna llamada JNI nueva**, reabre `MainMenu.png.jpg` con `open()`/`fstat()`/`close()`/`open()`/
+> `mmap(0x0, 110266, ...)` — **el mismo 110266 de Title.png, no los 148229 reales de MainMenu.png** — trunca
+> el archivo → `libpng`: `png_error(..., "IDAT: CRC error")` → `longjmp` hacia el stack frame ya retornado de
+> `png_create_read_struct_2` (el riesgo ya documentado en la Corrida 19) → crash real (el `.psp2dmp`
+> muestra `PC=0x9810ff2a`, muy por fuera del rango de cualquier módulo cargado — consistente con un salto a
+> memoria basura después de ese `longjmp` a un frame muerto, no información nueva sobre la causa raíz).
+>
+> Rastreo parcial en `out_ghidra.c`: `CS_knlGetResource(resourceID, dest, destSize)` (`:157400`) busca un
+> struct por **ID numérico** vía `ResourceManager::FindInformation` (NO por nombre de archivo) y pasa
+> `path=+0x104`, `offset=+0x210`, `length=+0x214` de ESE struct directo a `MMappedFile::Open`
+> (`:175057`) — que solo re-consulta el tamaño real (`File::GetSize()`) si el `length` que le pasan es
+> `0`; si ya viene no-cero (como pasaría con un struct cacheado), lo usa tal cual sin refrescarlo NUNCA.
+> Falta confirmar qué función popula ese struct (`ResourceManager::Register` o similar), si "MainMenu.png"
+> y "Title.png" comparten el mismo slot/ID (pool chico reciclado) o si hay una variable global de "último
+> length resuelto" compartida por error entre resoluciones — y si esto depende de que este port bypasea el
+> formato `"@offset|length|path"` (passthrough literal de `File_GetFullPathName_hook` para paths con `:`)
+> en vez de forzar SIEMPRE ese formato, que sí re-resuelve offset/length en cada apertura vía
+> `ParseOffsetAndLengthAndPath`.
+>
+> **Causa raíz confirmada por el fork y fix aplicado**: NO es colisión de ID/slot (el ID de recurso es un
+> contador secuencial simple, `ResourceManager::GetID()` `:176167` — MainMenu.png y Title.png tienen IDs
+> distintos). Es una lectura de **memoria de stack sin inicializar** dentro del propio `.so`: `File::Open`/
+> `File::GetFullPathName` (`:175020-175028`, `:175130+`) solo escriben los campos internos de offset/length
+> que `File::GetLength()` lee cuando el path resuelto empieza con `'@'` (formato `"@offset|length|path"`,
+> parseado por `ParseOffsetAndLengthAndPath`) — **si el path NO tiene ese prefijo, esos campos nunca se
+> escriben y quedan con lo que sea que había antes en esa región de stack** (un `File` local dentro de
+> `ResourceManager::Add`/`MMappedFile::Open`). Nuestro propio `File_GetFullPathName_hook` (`source/
+> patch.c`, Corrida 21) hace passthrough LITERAL para cualquier path con `':'` (todo asset suelto en
+> `ux0:...`) — nunca produce el formato `'@...'` — así que esos campos JAMÁS se refrescan para assets
+> sueltos. La primera carga de MainMenu.png tuvo suerte (esa región de stack estaba en `0`, y
+> `MMappedFile::Open` solo refresca via `File::GetSize()` cuando el length recibido es exactamente `0` —
+> `:175092-175094` — así que cayó en el fallback correcto); después de resolver `Title.png` (misma
+> profundidad de pila), esa misma región quedó con SU length (`110266`), y la siguiente apertura de
+> MainMenu.png leyó esa basura no-cero directo, sin refrescar nada. **En Android real todo recurso vive en
+> el mismo `.apk`, así que SIEMPRE resuelve a un path `'@offset|length|path'` — este bug de stack del `.so`
+> es real pero estructuralmente inalcanzable ahí**; es un bug latente que el propio passthrough de este
+> port expuso por primera vez.
+>
+> **Fix aplicado** (`source/patch.c`, `File_GetFullPathName_hook`): la rama de passthrough (paths con `':'`
+> o `'/'`) ahora formatea igual que la rama `mode==2` — `"@0|<length real via stat()>|<path>"` — en vez de
+> devolver el path literal. Esto fuerza a que `File::Open` SIEMPRE tome la rama `'@'` y refresque offset/
+> length en CADA apertura, igual que ocurre naturalmente en Android real, sin tocar código del `.so`
+> (`ResourceManager`/`MMappedFile`). Build compilado y verificado (cross real vía VitaSDK,
+> `build/inotia3.vpk`/`eboot.bin`/`inotia3.elf`, 2026-08-05) — sin errores nuevos.
+>
+> **Pendiente**: redeployar, reproducir, mandar el log (+ `.psp2dmp` si vuelve a crashear). Si el fix
+> funciona, la transición Title→Menu ya no debería crashear con "IDAT: CRC error" y deberían aparecer más
+> `[FLUSH]`/sprites reales en pantalla a medida que el juego avanza de estado.
+
+> **Corrida 35 (2026-08-06) — El fix de la Corrida 34 NO funcionó: mismo crash exacto en un binario
+> reconstruido que sí lo incluye. Instrumentación en runtime agregada para reemplazar la teoría de análisis
+> estático por datos reales.** `logs/log_2026-08-05_00-33-46.txt` (+ su casi-duplicado
+> `log_2026-08-05_00-55-35.txt`, idéntico salvo un timestamp de timer) + dumps
+> `Inotia3-psp2core-1785904438-...psp2dmp` (build viejo, el mismo que documentó la Corrida 34) y
+> `Inotia3-psp2core-1785905746-...psp2dmp` (build NUEVO, confirmado por el propio tamaño de `inotia3`
+> cambiando de `0xbefd4` a `0xbf014` — sí incluye el fix de `File_GetFullPathName_hook`): **ambos dumps son
+> el mismo crash byte a byte** (`PC=0x9810ff2a`, mismo `LR`, mismo stack trace completo, solo difieren en
+> unos pocos punteros de ASLR/carga de módulos). El log confirma el mismo patrón ya visto: `MainMenu.png.jpg`
+> se reabre sin ninguna llamada JNI nueva, primero con el `length` de `font.fnt` (3960) pegado, después con
+> el de `Title.png` (110266) pegado — mismo "IDAT: CRC error" → mismo `longjmp` a un frame ya retornado de
+> `png_create_read_struct_2` → mismo crash.
+>
+> Se lanzó un análisis de desensamblado real (`arm-vita-eabi-objdump -M force-thumb`, no solo pseudo-C) de
+> toda la cadena: `ResourceManager::Add` (`_ZN15ResourceManager3AddEPKcPm`, `0x1012ac`) → `File::Open`
+> (`_ZN4File4OpenEPKci`, `0xff4b8`) → `File::GetFullPathName` 3-arg (`_ZN4File15GetFullPathNameEPKcPcm`,
+> `0xff3c0`, que internamente llama a la 4-arg que SÍ hookeamos, `0xff038` = `OFF_File_GetFullPathName`,
+> primero con `mode=3` y si falla con `mode=2`) → `ParseOffsetAndLengthAndPath` (`0xfea24`) →
+> `File::GetOffset`/`GetLength` (`0xfeaf4`/`0xfeafc`, leen `this+0x10C`/`this+0x110`). **Confirmado: el hook
+> SÍ se invoca (el `name` siempre contiene `:`, entra por la rama de passthrough en ambos intentos de mode) y
+> `ParseOffsetAndLengthAndPath` SÍ escribe `this+0x10C`/`+0x110` explícitamente a partir del string
+> `"@0|<len>|<path>"` — la teoría de la Corrida 34 ("lectura de stack sin inicializar") no sobrevive al
+> desensamblado real: con el fix, esos campos ya no dependen de basura de ningún lado.** Esto contradice
+> directamente el síntoma observado en consola — análisis estático llegó a su límite.
+>
+> **Instrumentación agregada** (`source/patch.c`): hooks transparentes (llaman a la función real, no cambian
+> comportamiento) sobre `ResourceManager::Add(char const*, ulong*)` (el registro/cacheo por nombre que usa
+> `CS_knlGetResourceID`) y `MMappedFile::Open` (lo que `CS_knlGetResource` usa para mmapear de verdad),
+> logueando `name`/`length` de entrada y salida de cada uno. Esto va a mostrar en el próximo log si
+> `"MainMenu.png.jpg"` se cachea con el length YA MAL desde el registro inicial, o si `CS_knlGetResource`
+> le pasa a `MMappedFile::Open` el struct cacheado de OTRO recurso (aliasing) al momento de mmapear. Build
+> compilado y verificado (cross real vía VitaSDK, `build/inotia3.vpk`/`eboot.bin`/`inotia3.elf`,
+> 2026-08-06) — sin errores nuevos.
+>
+> **Pendiente**: redeployar, reproducir (llegar hasta el crash de Title→Menu), mandar el log nuevo. Buscar
+> las líneas `[RESMGR] Add(name="...")` y `[MMAP] MMappedFile::Open(path="...", ...)` para las tres
+> resoluciones de recurso en juego (`MainMenu.png.jpg`, `font.fnt.jpg`, `Title.png.jpg`) — si el `[RESMGR]
+> Add` de MainMenu ya muestra `length` correcto (148229) en su primera y ÚNICA invocación (no debería volver
+> a llamarse para el mismo nombre) pero el `[MMAP] MMappedFile::Open` posterior muestra un `length` distinto
+> al que ese mismo `Add` cacheó, confirma aliasing/corrupción del struct `ResourceInformation` entre el
+> registro y el uso. Si en cambio el `[MMAP]` siempre coincide con lo que su `[RESMGR] Add` correspondiente
+> cacheó, el bug está en OTRO lado todavía no instrumentado (revisar si hay más de un resourceID para el
+> mismo nombre lógico, o si el struct de 0x218 bytes que `operator_new` reserva colisiona con otro por un
+> bug de heap).
+
+> **Corrida 36 (2026-08-06) — Los logs `[RESMGR]`/`[MMAP]` de la Corrida 35 dieron el dato clave: NO es el
+> `path` el que se corrompe (siempre es correctamente "MainMenu.png.jpg"), es el `length` cacheado el que
+> pasa a valer EXACTAMENTE el del recurso que se acaba de registrar justo antes -- demasiado preciso para
+> ser basura de memoria genérica.** `logs/log_2026-08-06_20-02-04.txt` +
+> `Inotia3-psp2core-1786060936-...psp2dmp` (mismo crash de siempre, `PC=0x9810ff2a`, confirma que las dos
+> instrumentaciones nuevas no cambiaron el comportamiento, como se esperaba):
+> ```
+> [RESMGR] Add(name="MainMenu.png") -> id=1 length=148229                     <- correcto, registro inicial
+> [MMAP]   MMappedFile::Open(path="...MainMenu.png.jpg", length=148229, ...)  <- correcto, primer uso
+> ...
+> [RESMGR] Add(name="font.fnt") -> id=2 length=3960                           <- correcto, registro de OTRO recurso
+> [MMAP]   MMappedFile::Open(path="...MainMenu.png.jpg", length=3960, ...)    <- BUG: path de MainMenu, length de font.fnt
+> ...
+> [RESMGR] Add(name="Title.png") -> id=3 length=110266                        <- correcto, registro de OTRO recurso
+> [MMAP]   MMappedFile::Open(path="...MainMenu.png.jpg", length=110266, ...)  <- BUG: path de MainMenu, length de Title.png -> CRC error -> crash
+> ```
+> El propio `Add()` de cada recurso (font.fnt, Title.png) devuelve SU length correcto para SÍ MISMO --
+> el bug no está en el registro. Es la llamada a `MMappedFile::Open` INMEDIATAMENTE SIGUIENTE la que sale
+> mal: usa el `path` de MainMenu.png (id=1) pero el `length` del recurso que se acaba de registrar (id=2 o
+> id=3). Esto descarta corrupción de memoria genérica (una lectura de basura no coincidiría 3/3 veces exacto
+> con "el length del último Add()") y apunta a una de dos causas concretas: (a) `CS_knlGetResource` está
+> siendo invocado con `resourceID=1` (MainMenu) pero el struct que `FindInformation(1)` devuelve tiene su
+> propio campo `length` (`+0x214`) mutado in-place por el `Add()` de font.fnt/Title.png (aliasing real de
+> memoria/heap); o (b) se está pidiendo el id NUEVO (2 o 3) pero `FindInformation` resuelve mal ese id y
+> devuelve el struct de MainMenu (bug de lookup, no de escritura).
+>
+> **Instrumentación agregada** (`source/patch.c`): hook transparente sobre `CS_knlGetResource` (símbolo
+> exportado, no mangled) que loguea el `resourceID` que realmente recibe y, ANTES de dejar correr la función
+> real, llama él mismo a `ResourceManager::FindInformation(theResourceManager, id)` (mismos símbolos reales,
+> `theResourceManager` es un `ResourceManager*` global en `.bss`) para volcar la dirección cruda del struct
+> devuelto y sus campos `path`/`offset`/`length` (`+0x104`/`+0x210`/`+0x214`) tal como están en ESE instante,
+> antes de que `MMappedFile::Open` (ya hookeado en la Corrida 35) los use. Build compilado y verificado
+> (cross real vía VitaSDK, `build/inotia3.vpk`/`eboot.bin`/`inotia3.elf`, 2026-08-06) — sin errores nuevos.
+>
+> **Pendiente**: redeployar, reproducir, mandar el log nuevo. Buscar las líneas `[GETRES]
+> CS_knlGetResource(id=...)` para las tres llamadas que preceden a los `[MMAP]` ya vistos -- el dato
+> decisivo es el `id` logueado en cada una: si SIEMPRE es `1` (MainMenu) incluso cuando el `length` sale
+> mal, confirma la hipótesis (a) (el struct de MainMenu se mutó) y hay que buscar QUIÉN escribe
+> `+0x214` fuera de `ResourceManager::Add`'s propio branch de creación (revisar `Remove`/`RemoveAll`/algún
+> "update" no visto, o confirmar aliasing real comparando la dirección `info=%p` logueada entre la llamada
+> de MainMenu y la de font.fnt/Title.png -- si ES LA MISMA dirección, es aliasing de `operator_new`/heap, no
+> lógica); si el `id` logueado es el NUEVO (2 o 3) en vez de 1, confirma la hipótesis (b) y hay que revisar
+> `ResourceManager::FindInformation(uint)` (`_ZN15ResourceManager15FindInformationEj`, `0xfff3c`) a nivel de
+> desensamblado para ver por qué resuelve un id al struct equivocado.
+
+> **Corrida 37 (2026-08-06) — Causa raíz REAL encontrada (ninguna de las hipótesis (a)/(b) de la Corrida 36):
+> ni aliasing de heap ni bug de lookup -- son tres recursos con tres structs DISTINTOS (direcciones
+> `info=` diferentes, confirmado), cada uno con SU PROPIO `length` correcto, pero los tres con el mismo
+> `path` (el de MainMenu.png, el primer recurso jamás cargado). El bug está en nuestro propio
+> `File_GetFullPathName_hook`, no en el `.so`. Fix aplicado.** `logs/log_2026-08-06_20-38-47.txt` +
+> `Inotia3-psp2core-1786063138-...psp2dmp` (mismo crash de siempre, sin cambios de comportamiento por la
+> instrumentación de la Corrida 36, como se esperaba):
+> ```
+> [GETRES] CS_knlGetResource(id=1) info=0x836834d8 path="...MainMenu.png.jpg" offset=0 length=148229  <- OK
+> [GETRES] CS_knlGetResource(id=2) info=0x83684328 path="...MainMenu.png.jpg" offset=0 length=3960     <- BUG: id=2 (font.fnt), struct DISTINTO (0x83684328 != 0x836834d8), length correcto (3960=font.fnt), path INCORRECTO
+> [GETRES] CS_knlGetResource(id=3) info=0x83685538 path="...MainMenu.png.jpg" offset=0 length=110266   <- BUG: id=3 (Title.png), struct DISTINTO, length correcto (110266=Title.png), path INCORRECTO
+> ```
+> Direcciones de struct DISTINTAS por id (`0x836834d8`/`0x83684328`/`0x83685538`) descartan aliasing de
+> memoria/heap por completo. `resourceID` siempre es el correcto (1/2/3, no hay confusión de lookup). El
+> `length` cacheado en cada struct SIEMPRE es el correcto para ESE recurso (viene de
+> `CS_fsGetFileDescriptor_real(name,...)`, que dispara una llamada JNI `GetFileDescriptor` fresca cada vez
+> -- confirmado, aparece una vez por recurso en el log: líneas 464/625/732). El `path` cacheado en CADA
+> struct, en cambio, es SIEMPRE el de MainMenu.png.jpg -- el primer recurso resuelto -- sin importar qué
+> recurso se está registrando. Un `grep` de `"GetApkFilePath"` en el log completo lo confirma sin ambigüedad:
+> la llamada JNI `GetApkFilePath` aparece **UNA SOLA VEZ en todo el log** (línea 473, durante el registro de
+> MainMenu.png) -- nunca vuelve a dispararse para `font.fnt` ni `Title.png`, aunque `GetFileDescriptor` SÍ se
+> llama para cada uno.
+>
+> **Causa raíz**: `jGetApkFilePath()` (la función real del `.so`) cachea su valor de retorno la PRIMERA vez
+> que se llama y nunca vuelve a preguntarle a Java (mismo mecanismo ya documentado en la Corrida 21, aplicado
+> acá a un bug nuevo). `File_GetFullPathName_hook`'s rama `mode==2` (`source/patch.c`) construía el string
+> `"@offset|length|path"` llamando a `jGetApkFilePath_real()` para el campo `path` -- válido en Android real
+> (TODOS los recursos viven en el mismo `.apk`, así que reusar el mismo path para siempre es 100% correcto
+> ahí), pero **inválido en este port**, donde cada recurso suelto tiene SU PROPIO archivo físico
+> (`ux0:.../<nombre>.jpg`) -- exactamente lo que `GetFileDescriptor_stub` (`source/java.c`) ya resuelve
+> correctamente para cada `name`, cacheándolo en `g_pending_asset_path`/`g_pending_asset_is_loose` con un
+> mecanismo de "one-shot flag" pensado para ser consumido por la SIGUIENTE llamada a `GetApkFilePath_stub` --
+> mecanismo que nunca se dispara para el 2do/3er recurso en adelante, precisamente porque el `.so` ya no
+> vuelve a preguntar. `offset`/`length` sí llegan frescos cada vez porque vienen de
+> `CS_fsGetFileDescriptor_real(name,...)` (dispara `GetFileDescriptor` vía JNI, sin cache alguno en el
+> `.so`) -- de ahí que SOLO el `path` quedara pegado y `length` siempre fuera correcto, el patrón exacto
+> observado.
+>
+> **Fix aplicado**: `source/java.c` gana `java_peek_current_asset_path()`, que replica la MISMA decisión que
+> `GetApkFilePath_stub` ya toma (`g_pending_asset_is_loose ? g_pending_asset_path : INOTIA3_APK_PATH`) pero
+> SIN el consumo de un solo uso -- de forma que se puede leer el path del recurso ACTUAL en cualquier
+> momento, no solo la primera vez que alguien (el `.so`, que ya no lo hace) pregunte. `source/patch.c`'s
+> `File_GetFullPathName_hook`, rama `mode==2`, ya NO llama a `jGetApkFilePath_real()` (offset
+> `OFF_jGetApkFilePath`, eliminado por no usarse más) -- ahora llama a `java_peek_current_asset_path()`
+> inmediatamente después de `CS_fsGetFileDescriptor_real(name, values, 1)` (que es quien, vía
+> `GetFileDescriptor_stub`, acaba de dejar `g_pending_asset_path` fresco para ESTE `name` unas líneas antes,
+> en la MISMA invocación) -- el path que se cachea para siempre en el struct de cada recurso ahora es el
+> real y propio de ese recurso, no el de MainMenu.png. Build compilado y verificado (cross real vía
+> VitaSDK, `build/inotia3.vpk`/`eboot.bin`/`inotia3.elf`, 2026-08-06) — sin errores nuevos.
+>
+> **Pendiente**: redeployar, reproducir, mandar el log (+ `.psp2dmp` si vuelve a crashear). Si el fix
+> funciona, las líneas `[GETRES] CS_knlGetResource(id=2/3)` deberían mostrar `path="...font.fnt.jpg"` /
+> `path="...Title.png.jpg"` respectivamente (no más `MainMenu.png.jpg` repetido), el `[MMAP]` correspondiente
+> debería abrir el archivo correcto, y la transición Title→Menu ya no debería crashear con "IDAT: CRC error".
+
+> **Corrida 38 (2026-08-06) — CONFIRMADO: el fix de la Corrida 37 funciona.** `logs/log_2026-08-06_20-59-13.
+> txt`: `[GETRES] CS_knlGetResource(id=2) ... path="...font.fnt.jpg"` y `(id=3) ... path="...Title.png.jpg"`
+> -- cada recurso ahora cachea SU PROPIO path real, ya no el de `MainMenu.png.jpg` pegado. Sin más "IDAT: CRC
+> error" en el log. El usuario confirma que la pantalla de loading YA SE VE CORRECTAMENTE (no más pantalla
+> negra) -- el bug perseguido desde la Corrida 19 queda cerrado.
+>
+> El juego avanzó ~10 ticks de `MainProcess` más (una animación de ícono girando, visible en los vértices
+> rotando de `[GL] glDrawArrays`) y crasheó con un bug NUEVO y distinto: `Inotia3-psp2core-1786064379-
+> 0x000bf03c65-eboot.bin.psp2dmp`, Data abort, `PC=0x980e4b0c`/`LR=0x980cc16b` -- usando la base real de
+> `libgame.so` (`0x81708000`, confirmada porque resuelve varios valores de pila a símbolos reales:
+> `SGL_Device_iOS_GL11::Flush()+0x8`, `SGL_GetGLSize+0x14`, `SGL_Font_Android::Release()+0x8`), tanto `PC`
+> como `LR` caen en offsets absurdos (~377MB adentro de un `.so` que pesa 1.4MB) -- salto salvaje, no código
+> real. El log se corta sin ninguna línea `fatal`/`ERR` (crash demasiado violento para sobrevivir ni la
+> primera línea). Hipótesis a confirmar: `SGL_Font_Android::Release()` (`out_ghidra.c:160640`) hace un
+> release con conteo de referencias que, al llegar a 0, invoca una función VIRTUAL leída de `*this`/vtable+4
+> -- si `this` es un puntero colgante (use-after-free) o el vtable está corrupto, la llamada salta a basura,
+> coincidiendo con el síntoma. Investigación en curso (fork dedicado) para confirmar o refutar esta hipótesis
+> contra el desensamblado real antes de proponer un fix.
+
+> **Corrida 39 (2026-08-06) — Hipótesis de la Corrida 38 (`SGL_Font_Android::Release`/vtable corrupto)
+> REFUTADA: era un falso positivo de la propia herramienta de análisis (la base auto-detectada resolvía
+> valores de PILA vieja a símbolos reales por pura coincidencia aritmética, no era la cadena de llamadas
+> activa). Causa raíz real confirmada por desensamblado directo: un cuarto (en realidad quinto/sexto/séptimo)
+> puntero `JavaVM*` cacheado sin inicializar, del mismo tipo de bug ya conocido y parcheado a medias.** Con
+> la base REAL de `libgame.so` para este dump (`0x98000000`, confirmada porque con ella `PC`/`LR` caen
+> dentro del segmento ejecutable real y `R6` resuelve exacto, sin offset, a `INITSTATE_LoadFrameCnt`):
+> `PC = CS_ADSetGameResolution + 0x14`, `LR = startAd + 0x17`. Desensamblado de `CS_ADSetGameResolution`
+> (`0xe4af8`):
+> ```
+> e4b06: ldr r0, [r4, #8]   ; r0 = DAT_0017de40 (copia cacheada de JavaVM*)
+> e4b0c: ldr r3, [r0, #0]   ; *** CRASH: r0 == NULL ***
+> ```
+> `R0=0x00000000` en el dump confirma un NULL pointer dereference exacto -- no un salto salvaje. `startAd()`
+> (arranque del subsistema de ads Mopub/Tapjoy -- ya marcado en `CLAUDE.md` como no-op-hasta-probar-
+> necesario, pero SÍ se ejecuta en este port) llama `CS_ADSetGameResolution`, que lee su propia copia
+> cacheada de `JavaVM*` (`DAT_0017de40`) antes de que nada la haya escrito.
+>
+> Un grep completo del patrón `(**(code**)(*env + 0x36c))(env, &DAT_xxx)` (llamada a `GetJavaVM` vía la
+> vtable de `JNIEnv`, offset `0x36c`) en las 214k líneas del decompile encontró **7 copias distintas** de
+> este puntero cacheado: `0x16dda4, 0x16de24, 0x16de40, 0x16de50, 0x16de58, 0x16de64, 0x16de70` -- de las
+> cuales `source/patch.c` (fix original, commit `65190ae`) solo cubría 2 (`0x16de24`/`0x16de64`). Se
+> confirmó leyendo `JNI_OnLoad` (`out_ghidra.c:144168-144175`, `DAT_0017de70 = param_1;`) que **`0x16de70`
+> es la ÚNICA copia que el propio `JNI_OnLoad` real ya inicializa correctamente** (recibe el `JavaVM*` real
+> que el loader le pasa) -- no hay que tocarla, forzarla pisaría un valor ya válido sin necesidad. Las otras
+> 4 (`0x16dda4, 0x16de40, 0x16de50, 0x16de58`) nunca se inicializan en este port: están pensadas para
+> poblarse de forma perezosa por el propio init de cada subsistema (Hub/ActiveUser/ads/etc.) la primera vez
+> que se usan, pero este port no dispara esos init reales.
+>
+> **Fix aplicado** (`source/patch.c`): se extendió el bloque de inicialización manual de punteros
+> `JavaVM*` (ya existente para 2 direcciones) a un array con las 6 direcciones que SÍ hace falta forzar
+> (`0x16dda4, 0x16de24, 0x16de40, 0x16de50, 0x16de58, 0x16de64` -- deliberadamente sin `0x16de70`), todas
+> apuntando a `&jvm`, igual que las 2 originales. Build compilado y verificado (cross real vía VitaSDK,
+> `build/inotia3.vpk`/`eboot.bin`/`inotia3.elf`, 2026-08-06) — sin errores nuevos.
+>
+> **Pendiente**: redeployar, reproducir, mandar el log (+ `.psp2dmp` si vuelve a crashear). Si el fix
+> funciona, la animación de loading debería seguir más allá de donde cortaba antes (crash en
+> `CS_ADSetGameResolution`) sin un nuevo NULL deref en ninguna de estas 6 direcciones -- si aparece OTRO
+> crash con el mismo patrón (`ldr rX, [rY, #0]` con `rY` en `0x16dXXX`) en una dirección NO cubierta acá,
+> hay que volver a gregar el patrón `&DAT_0017dXXX` completo (puede haber más de 7 copias, o alguna en un
+> rango de direcciones distinto) en vez de asumir que estas 6 son todas.
+
+> **Corrida 40 (2026-08-06) — El fix de la Corrida 39 funcionó (sin más NULL deref en los punteros
+> `JavaVM*`), pero el juego "quedó casi en el mismo lugar" según el usuario: crash NUEVO, un poco más
+> adelante en la secuencia de arranque.** `logs/log_2026-08-06_21-28-04.txt` +
+> `Inotia3-psp2core-1786066106-...psp2dmp`: Data abort. `PC=0x8108adfe` resuelve DIRECTO contra el `.elf`
+> propio del loader (sin ambigüedad de base, es nuestro propio módulo) a `strcpy`. Con la base real de
+> `libgame.so` (`0x98000000`, mismo valor que funcionó en la Corrida 39 -- el offset de `LR` cae dentro del
+> tamaño real del archivo, 1.4MB, a diferencia de la base auto-detectada de la herramienta que seguía dando
+> offsets absurdos), `LR = Extend_RequestNotice + 0xe9`. `R1` (el argumento `src` de `strcpy` en la
+> convención AAPCS) es `0x00000000` en el dump -- **`strcpy(dst, NULL)`, un NULL pointer dereference
+> exacto, no basura de pila**.
+>
+> `Extend_RequestNotice` (`out_ghidra.c:117698-117747`) arma una URL (`http://s.com2us.net/game/inotia3/
+> notice.php?...` -- confirmado en el log, línea 1196, un servidor de Com2uS de 2013 casi seguro dado de
+> baja) y hace:
+> ```c
+> pcVar3 = (char *)jRequestNotice(auStack_72c);
+> strcpy(acStack_f2c,pcVar3);   // <- sin chequeo de NULL
+> ```
+> El log confirma la causa exacta en la línea siguiente a la URL: `GetStaticMethodID(env, ...,
+> "GetNoticeHttp", "(Ljava/lang/String;)Ljava/lang/Object;"): not found` -- el método Java real detrás de
+> `jRequestNotice` nunca estaba registrado en `source/java.c`, así que FalsoJNI le devuelve `NULL` por
+> default (tabla de la skill `so-crash-triage`: retorno `Object` sin registrar es "depende" -- acá SÍ es
+> peligroso, exactamente el patrón de "se desreferencia sin chequear `NULL`").
+>
+> **Fix aplicado** (`source/java.c`): nuevo método `{ 45, "GetNoticeHttp", METHOD_TYPE_OBJECT }` +
+> `GetNoticeHttp_stub()`, que devuelve un string VACÍO (`""`) en vez de `NULL`. Fiel, no es un parche
+> cosmético: `strcpy(buf, "")` deja `buf[0]='\0'`, y el propio `strtok(buf,"|")` que sigue devuelve `NULL`
+> de forma natural (nada que tokenizar) -- lo que hace que el chequeo `pcVar3 != NULL && strcmp(pcVar3,
+> "OK")==0` sea falso, el MISMO camino de "no hay noticia hoy" que produciría el servidor real si respondiera
+> cualquier cosa distinta de `"OK|..."`. Build compilado y verificado (cross real vía VitaSDK,
+> `build/inotia3.vpk`/`eboot.bin`/`inotia3.elf`, 2026-08-06) — sin errores nuevos.
+>
+> **Pendiente**: redeployar, reproducir, mandar el log (+ `.psp2dmp` si vuelve a crashear). Si el fix
+> funciona, el juego debería seguir avanzando más allá de la pantalla de loading hacia el Title/Menu real.
+> Si aparece un NUEVO crash de "método JNI no encontrado" seguido de un `strcpy`/deref sin chequeo similar,
+> aplicar el mismo patrón (agregar el stub con un valor por-default fiel y seguro, no necesariamente vacío --
+> depende de qué hace el caller con el resultado, ver tabla de riesgo de retorno JNI en la skill
+> `so-crash-triage`).
+
+> **Corrida 41 (2026-08-06) — El fix de la Corrida 40 funcionó (`GetNoticeHttp` ya no crashea, el boot avanza
+> más lejos), pero el usuario reporta "sigue crasheando en el mismo lugar" -- en realidad es un bug NUEVO y
+> distinto muy cerca en el tiempo/líneas de log, no el mismo.** `logs/log_2026-08-06_21-42-09.txt` +
+> `Inotia3-psp2core-1786066958-...psp2dmp` (build confirmado nuevo por tamaño de `inotia3`,
+> `0xbf794`/`0x2682b8`): el log confirma `GetStaticMethodID(..., "GetNoticeHttp", ...): 45` (ya SIN "not
+> found" -- el fix de la Corrida 40 funciona) y 1415 líneas de log (vs. 1199 antes), avanzando bien más allá
+> del punto anterior. Nuevo Data abort: `PC` cae dentro de `SceLibKernel` (código real de Sony, no del
+> `.so`) -- según la metodología `so-crash-triage`, cuando `PC` cae en un módulo de Sony hay que mirar `LR`.
+> Con la base real de `libgame.so` (`0x98000000`, mismo valor que ya funcionó en Corridas 39/40 -- el offset
+> de `LR` cae dentro del tamaño real del archivo): `LR = GRP_PutAsciiChar + 0x59`, exactamente la
+> instrucción siguiente a un `blx memcpy@plt` (confirmado por desensamblado con
+> `arm-vita-eabi-objdump -M force-thumb`).
+>
+> `GRP_PutAsciiChar` (`out_ghidra.c:20971-20999`) hace `memcpy(FONT_pFontBuffer, (void*)(FONT_pFontData +
+> 0xb10 + uVar1*0xc), 0xc)` -- si `FONT_pFontData` es `NULL`, el puntero fuente resultante es una dirección
+> chica sin mapear. **Los registros del dump lo confirman con precisión aritmética exacta**: `R1=0x00000d38`
+> y `R3=0x00000228` -- `0xb10 (2832) + 0x228 (552, =46*0xc) = 0xd38`, EXACTAMENTE el valor de `R1` -- prueba
+> que `FONT_pFontData` vale `0` y el cálculo se hizo sobre eso. `FONT_pFontData` (`.bss`, offset real
+> `0x56f4d0`, arranca en `NULL`) solo se escribe en `FONT_Load()` (`out_ghidra.c:19844-19851`,
+> `RES_LoadToPool("font.fnt",&FONT_pFontData,0)`) -- que a su vez solo escribe si `RES_LoadToHeap` tiene
+> éxito, la MISMA cadena `CS_knlGetResourceID`/`CS_knlGetResource` que las Corridas 34-40 ya confirmaron
+> funcionando para `"font.fnt"` como recurso (textura). `FONT_Load()` en sí solo se llama desde
+> `StartCletProcess()` (`out_ghidra.c:24944-24979`), que a su vez solo corre si `GRP_Initialize()`
+> (`out_ghidra.c:21212`) devuelve éxito -- un subsistema gateado por `CS_grpGetScreenFrameBuffer(0)` que NO
+> es necesariamente el mismo camino ya confirmado funcionando (CSOGL, vía `[GL]`/`[FLUSH]` en el log). No hay
+> evidencia todavía de si `FONT_Load()` corre y falla, o nunca corre -- especular más allá de esto sin datos
+> es exactamente lo que la metodología de este archivo viene evitando desde la Corrida 1.
+>
+> **Instrumentación agregada** (`source/patch.c`): hook transparente sobre `FONT_Load` (exportado,
+> `0x6c550`) que loguea su valor de retorno Y el valor resultante de `FONT_pFontData` justo después de
+> llamar a la función real -- va a decir de una sola pasada si `FONT_Load()` corre en absoluto, si
+> `RES_LoadToPool`/`RES_LoadToHeap` tienen éxito para `"font.fnt"` en este contexto (aunque ya sabemos que
+> `CS_knlGetResource` funciona para el mismo nombre en otro contexto), y si `FONT_pFontData` termina no-nulo.
+> Build compilado y verificado (cross real vía VitaSDK, `build/inotia3.vpk`/`eboot.bin`/`inotia3.elf`,
+> 2026-08-06) — sin errores nuevos.
+>
+> **Pendiente**: redeployar, reproducir, mandar el log nuevo. Buscar la línea `[FONT] FONT_Load() -> ...,
+> FONT_pFontData=...`: si NO aparece en absoluto, `StartCletProcess`/`GRP_Initialize` nunca llega a esa
+> línea -- hay que instrumentar `GRP_Initialize` (o `CS_grpGetScreenFrameBuffer`) para saber por qué; si
+> aparece con `FONT_pFontData=(nil)` (retorno `0`/falla), el problema está en `RES_LoadToHeap` para este
+> nombre específico en este momento del boot -- revisar si compite con otro registro de `"font.fnt"` bajo un
+> ID distinto; si aparece con `FONT_pFontData` no-nulo, el bug real está en OTRO lado (offset mal calculado
+> en `GRP_PutAsciiChar`, o el crash real es en una llamada DISTINTA a `memcpy` que la que asumimos).
+
+> **Corrida 42 (2026-08-06) — Causa raíz real encontrada y arreglada: un bug de signo en el propio código
+> del juego (`RES_LoadToPool`), latente en Android real y estructuralmente inevitable en este port porque
+> TODAS nuestras direcciones de heap tienen el bit de signo puesto.** El hook de la Corrida 41 confirmó
+> `FONT_Load() -> 0, FONT_pFontData=0x0` -- SÍ corre, y `RES_LoadToPool` SÍ falla, a pesar de que
+> `CS_knlGetResource` ya funciona para `"font.fnt"` en otro contexto (textura).
+>
+> Leyendo `RES_LoadToPool`/`RES_LoadToHeap` completos (`out_ghidra.c:23378-23516`): en el camino de ÉXITO,
+> `RES_LoadToHeap` devuelve literalmente lo que `CS_knlCalloc(length)` devolvió -- y `CS_knlCalloc`
+> (`out_ghidra.c:157643`, `void CS_knlCalloc(size_t) { calloc(1,param_1); }`) es un passthrough directo a
+> `calloc()` real (Ghidra perdió el tipo de retorno, pero el puntero viaja en `r0` igual, confirmado porque
+> TODOS los callers lo tratan como puntero). `CS_GETDPTR` (`out_ghidra.c:157108`, desensambla a un `bx lr`
+> puro) es un no-op vestigial de alguna plataforma anterior basada en handles -- acá NO convierte nada, solo
+> devuelve el mismo puntero.
+>
+> El chequeo de éxito de `RES_LoadToPool` es `if (-1 < iVar1)` sobre ese valor, interpretado como `int` con
+> signo. Es correcto SOLO si el bit más alto del puntero real está en `0` -- cierto en un heap de Android
+> real (bien por debajo de `0x80000000`), por eso este código de 2013 nunca disparó esto ahí. **Pero TODAS
+> las direcciones de heap que este port produjo en cualquier dump de esta conversación
+> (`0x81xxxxxx`/`0x83xxxxxx`/`0x98xxxxxx`/...) tienen ese bit puesto** -- son negativas como `int` con
+> signo -- así que el chequeo falla SIEMPRE acá, `RES_LoadToPool` devuelve eso (leído como error) sin
+> escribir nunca `*param_2`, y `FONT_Load()` ve "falla" a pesar de que el load subyacente adentro de
+> `RES_LoadToHeap` sí tuvo éxito instantes antes. **El mismo idioma `-1 < iVar1`/`iVar1 < 0` sobre el
+> resultado de `RES_LoadToHeap` aparece también en `RES_MoveToFilePack` (`:23424`) y
+> `EXCELDATA_LoadFullResource` (`:58509-58510`)** -- no confirmado crasheando todavía (ninguna de las dos
+> está probada como alcanzada en la secuencia de arranque de este port hasta ahora), pero es el MISMO patrón
+> de riesgo contra la MISMA función real -- si cualquiera de las dos llega a crashear más adelante, aplicar
+> este mismo fix en vez de re-derivarlo desde cero.
+>
+> **Fix aplicado** (`source/patch.c`): se reimplementó `RES_LoadToPool` fielmente (misma lógica que
+> `out_ghidra.c:23489-23516`) pero distinguiendo los 3 códigos de error explícitos (`-1`/`-2`/`-3`) de
+> "cualquier otro valor = un puntero real", en vez de confiar en el bit de signo. Llama directo a las
+> funciones reales `RES_LoadToHeap`/`MEM_Malloc`/`CS_knlFree` (exportadas, sin modificar) -- solo cambia el
+> chequeo de éxito/fracaso. `RES_LoadToPool` tiene EXACTAMENTE un solo call site en las 214k líneas del
+> decompile (`FONT_Load` en sí), así que no puede afectar ningún otro camino de código. Build compilado y
+> verificado (cross real vía VitaSDK, `build/inotia3.vpk`/`eboot.bin`/`inotia3.elf`, 2026-08-06) — sin
+> errores nuevos.
+>
+> **Pendiente**: redeployar, reproducir, mandar el log (+ `.psp2dmp` si vuelve a crashear). Si el fix
+> funciona, debería aparecer `[FONT] FONT_Load() -> 1, FONT_pFontData=<dirección no-nula>` en el log, y ya no
+> debería crashear en `GRP_PutAsciiChar`/`memcpy`. Si aparece un crash nuevo con el mismo patrón (`-1 <
+> iVarX` o `iVarX < 0` sobre un resultado de `RES_LoadToHeap`) en `RES_MoveToFilePack` o
+> `EXCELDATA_LoadFullResource`, aplicar el mismo fix (reimplementar fielmente, distinguir los códigos de
+> error explícitos del resto).
+
+> **Corrida 43 (2026-08-06) — El fix de la Corrida 42 funciona (elimina el falso positivo del bit de signo),
+> pero expone una falla REAL y distinta: `RES_LoadToHeap("font.fnt")` ahora falla con el código de error
+> genuino `-2` (`CS_knlGetResource` devolvió no-cero). Además, se encontró y arregló un bug real en nuestra
+> PROPIA instrumentación que pudo estar enmascarando/corrompiendo este dato desde la Corrida 36.**
+> `logs/log_2026-08-06_23-29-23.txt` + `Inotia3-psp2core-1786073388-...psp2dmp` (mismo crash de siempre en
+> `GRP_PutAsciiChar`, sin cambios -- esperado, ya que el 42 solo arregla el falso positivo, no la falla
+> real): `Corrida 42: RES_LoadToHeap("font.fnt") failed with real error code -2` seguido de `[FONT]
+> FONT_Load() -> 0, FONT_pFontData=0x0` -- confirma que el código de error YA NO es el resultado de leer mal
+> el bit de signo (el 42 filtra explícitamente -1/-2/-3), sino un -2 genuino: `CS_knlGetResource` devolvió
+> no-cero para esta llamada específica, a pesar de que el `[MMAP] MMappedFile::Open(...)` inmediatamente
+> anterior (mismo path/offset/length ya usados con éxito para este mismo recurso en corridas anteriores como
+> textura) se ve normal en el log, con `mmap(...)`/`close(...)` completando sin error aparente a nivel de
+> syscall.
+>
+> Antes de confiar en ese "-2" como dato limpio, se encontró un problema en la propia instrumentación: el
+> hook de `CS_knlGetResource` (Corrida 36, `source/patch.c`) usaba `SO_CONTINUE_VOID` -- pero
+> `CS_knlGetResource` (`out_ghidra.c:157400`) SÍ devuelve un valor real en `r0` (Ghidra lo tipó `void` por
+> error; `RES_LoadToHeap` lo usa explícitamente: `iVar1 = CS_knlGetResource(...); if (iVar1 == 0)`). Un hook
+> `void` no tiene ninguna garantía del lenguaje C de que `r0` siga conteniendo el valor de la llamada real
+> para cuando el hook retorna -- funcionaba por accidente de codegen, no por diseño. Se cambió a
+> `SO_CONTINUE(int, ...)` con retorno explícito, eliminando ese riesgo (confirmado que no era la causa raíz
+> de ESTE bug puntual, pero es una corrección real y necesaria de todos modos -- cualquier otro caller que
+> dependa del valor de retorno de `CS_knlGetResource` ahora lo recibe garantizado).
+>
+> **Instrumentación agregada** (`source/patch.c`): además del fix de retorno de `CS_knlGetResource_hook`
+> (ahora también loguea `-> %d`), se extendió `MMappedFile_Open_hook` (Corrida 35) para loguear su propio
+> valor de retorno Y los dos campos crudos que `MMappedFile::Open` (`out_ghidra.c:175060`) escribe al
+> mapear (`this+0x108`, el puntero crudo de `mmap()`, nuleado si `mmap()` devolvió literalmente `(void*)-1`;
+> `this+0x110`, el puntero ajustado que `GetPointer()` lee después) -- esto va a decir en una sola pasada si
+> el `mmap()` real de este port devuelve algo que `MMappedFile::Open` interpreta como fallo, o si el fallo
+> está en otro lado todavía no instrumentado dentro de `CS_knlGetResource` (la rama `PackageDecoder::Decode`
+> si `type==1`, aunque no debería aplicar acá con `type=0`). Build compilado y verificado (cross real vía
+> VitaSDK, `build/inotia3.vpk`/`eboot.bin`/`inotia3.elf`, 2026-08-06) — sin errores nuevos.
+>
+> **Pendiente**: redeployar, reproducir, mandar el log nuevo. Buscar las líneas `[MMAP]
+> MMappedFile::Open(...) -> ...` y `[GETRES] CS_knlGetResource(id=2) -> ...` para la carga de `"font.fnt"`
+> que precede al `[FONT] FONT_Load()` -- si `MMappedFile::Open` ya devuelve `0` (fallo) ahí, el problema está
+> en el `mmap()`/`File::Open` reales para ESTE call site específico (revisar `source/reimpl/mem.c`); si
+> `MMappedFile::Open` devuelve éxito pero `CS_knlGetResource` sigue devolviendo no-cero, el problema está en
+> la rama `PackageDecoder::Decode`/`type` u otra condición del `if` compuesto de `CS_knlGetResource`
+> (`out_ghidra.c:157417-157418`) que todavía no se instrumentó directamente.
+
+> **Corrida 44 (2026-08-06/07) — El fix de la Corrida 43 funcionó del todo: `FONT_Load() -> 1,
+> FONT_pFontData=0x9858a264` (éxito real), sin más crash en `GRP_PutAsciiChar`. Pero aparece un bloqueo
+> nuevo, distinto: un método JNI sin registrar que hace que el propio wrap de texto nativo del juego gire
+> cientos de veces sin converger -- no es técnicamente un loop infinito (termina, eventualmente, en un
+> tiempo N² absurdo para textos largos), pero en la práctica se percibe como colgado en la pantalla de
+> loading.** `logs/log_2026-08-06_23-49-26.txt` (11171 líneas, ~600KB, sin crash ni dump -- el juego sigue
+> "vivo", solo sin progresar): confirma `[FONT] FONT_Load() -> 1, FONT_pFontData=0x9858a264` y `[GETRES]
+> CS_knlGetResource(id=2) -> 0` (éxito genuino, ya no `-2`) -- cierra la Corrida 43 sin ambigüedad. Pero el
+> log muestra `GetStaticMethodID(..., "GetStringWidthHeightInRect", "(Ljava/lang/String;IIII[I)I"): not
+> found` repetido **766 veces** en una sola tanda, sin que el estado del juego avance (`MAINPROC` solo tiquetea
+> 20 veces en las 11171 líneas -- comparado con las corridas previas donde cada tick trae progreso real).
+>
+> Leyendo la implementación Java real (`decompiled_apk/sources/com/com2us/wrapper/WrapperJinterface.java:
+> 996-1110`): `GetStringWidthHeightInRect(String, fontSize, fontStyle, rectWidth, isBreak, int[] value)` usa
+> `Paint.measureText` de Android para envolver texto línea por línea dentro de `rectWidth`, con una búsqueda
+> binaria interna por línea, escribe `value[0]`=ancho máximo/`value[1]`=alto total acumulado, y devuelve
+> `value[0]`. Sin registrar, FalsoJNI devuelve `0` siempre ("todo entra") -- lo que hace que el algoritmo de
+> word-wrap NATIVO que llama a esto repetidamente (para textos largos como `memorytext_en.dat`, ~109KB de
+> texto de lore, confirmado cargándose bien un poco antes en el mismo log) nunca encuentre un corte de línea
+> real, reintentando cientos de veces sin converger a nada útil.
+>
+> **Fix aplicado** (`source/java.c`): se registró `GetStringWidthHeightInRect_stub` con un word-wrap
+> greedy propio, O(n) en un solo pase (no busca binaria repetida, que sería O(n²) e inviable para un texto
+> de 109KB) -- usa la MISMA tabla de costo por-byte que el sistema de fuente bitmap PROPIO del juego ya usa
+> en otro lado, `FONT_GetSubStringWidth` (`out_ghidra.c:19780-19828`, confirmado por desensamblado:
+> espacio=4px, byte con bit alto/multibyte=9px consumiendo 2 bytes, cualquier otro byte=6px) -- replicada
+> directamente en C (no se llama al `.so`) porque es una tabla trivial y autocontenida, sin dependencia de
+> `FONT_pFontData` ni de ningún estado interno del `.so`. Prefiere cortar en el último espacio visto en la
+> línea actual (igual que el criterio de límite de palabra de la implementación Java real) cuando hay uno
+> disponible. `fontSize`/`fontStyle`/`isBreak` se ignoran -- la fuente bitmap de este port tiene una métrica
+> fija por byte, no escalable, y ambos modos reales de `isBreak` terminan envolviendo por ancho con
+> preferencia de espacio en blanco de todos modos. Build compilado y verificado (cross real vía VitaSDK,
+> `build/inotia3.vpk`/`eboot.bin`/`inotia3.elf`, 2026-08-07) — sin errores nuevos.
+>
+> **Pendiente**: redeployar, reproducir, mandar el log (+ `.psp2dmp` si crashea). Si el fix funciona, ya no
+> debería aparecer un número absurdo de `GetStringWidthHeightInRect` seguidas sin progreso, y el juego
+> debería seguir avanzando más allá de la pantalla de loading. Nota aparte: `WrapperJinterface.
+> DrawTextInRect` (`([BIIIII)I`) también aparece sin registrar en el mismo log (una sola vez, no en loop) --
+> es lo que dibuja de verdad el texto envuelto; si el juego avanza pero el texto no se VE en pantalla, esa
+> es la próxima función a implementar (no debería trabar nada, solo faltaría el render visual).
+
+> **Corrida 45 (2026-08-07) — El fix de la Corrida 44 funciona (`GetStringWidthHeightInRect` ya resuelve por
+> id, no repite "not found" 766 veces), pero el usuario reporta un síntoma nuevo: el juego cae a ~1 FPS y no
+> llega a Title/Menu. Antes de asumir que es lentitud genuina o un loop real, se agregó instrumentación
+> precisa (tiempo real entre ticks + estado interno de la máquina de sub-estados de Init) en vez de seguir
+> especulando.** `logs/log_2026-08-07_00-29-10.txt` (3074 líneas, mucho más chico que el runaway de la
+> Corrida 44 -- `MAINPROC` solo aparece 20 veces por el propio cap del logging, `[FLUSH] GRP_Flush` 14 veces
+> real -- sin capear --, `GetStringWidthHeightInRect` (id=46) se llama 115 veces en total, ~5-6 por tick):
+> mucho más moderado que el runaway anterior, pero sigue sin llegar a Title.
+>
+> Leyendo `STATE_ProcessInit` completo (`out_ghidra.c:111798-111906`, el process-callback del estado 0/Init
+> que corre cada tick mientras `STATE_nState` sigue en 0): tiene su PROPIA sub-máquina de estados,
+> `INITSTATE_nState` (0/1/2/3) + `INITSTATE_LoadFrameCnt` (contador de frames dentro del sub-estado 0, que
+> dispara un paso de init distinto por frame -- `IMGSYS_UnitLoad`, `Extend_FlurryStart`, `GRPX_Init`,
+> `EXCELDATA_Create`, `startAd`, `Extend_RequestNotice` en el frame 10 -- hasta el frame 11, donde llama
+> `GAMELOADER_ProcessPreLoad()`; si eso falla, salta a `INITSTATE_nState=3`). **`INITSTATE_nState==3` es un
+> estado TERMINAL de error** (`out_ghidra.c:111879-111906`): dibuja "Memory error!" o, si
+> `GAMELOADER_pText` es no-nulo, `UI_DrawTextOnCenter(GAMELOADER_pText,...)` -- y no tiene NINGUNA transición
+> de salida en todo el decompile. Si estamos ahí, explicaría TODO lo observado: `GetStringWidthHeightInRect`/
+> `DrawTextInRect` (medir+dibujar el mismo texto de error) corriendo cada tick para siempre, sin avanzar
+> nunca a Title. `GAMELOADER_ProcessPreLoad()` (`:60309-60314`) hace `GAMELOADER_pText = MEM_Malloc(0x100);
+> return GAMELOADER_pText != 0;` -- si falla, es porque `MEM_Malloc` (el allocator PROPIO del motor, un pool
+> fijo de `MEM_nTotalPoolSize = 0x7d0000` = 8MB, `out_ghidra.c:22312-22331`, separado del heap general de C
+> que ya se agrandó en la Corrida 13) está agotado en ese momento.
+>
+> Esto es hipótesis todavía sin confirmar con datos reales -- podría en cambio ser simplemente lentitud
+> genuina (logging muy verboso en un build Debug, cada llamada JNI/GL logueada individualmente) sin estar
+> realmente atascado en el estado de error. **Instrumentación agregada** (`source/patch.c`): el hook de
+> `MainProcess` (ya existente desde la Corrida 32) sube su cap de log de 20 a 200 ticks, y ahora también
+> loguea el tiempo real transcurrido desde el tick anterior (`sceKernelGetProcessTimeWide()`,
+> microsegundos) junto con `INITSTATE_nState`/`INITSTATE_LoadFrameCnt`/`MEM_nUsedPoolSize`/
+> `MEM_nTotalPoolSize`/`GAMELOADER_pText` crudos -- va a mostrar en una sola pasada si (a) está genuinamente
+> atascado en `INITSTATE_nState=3` para siempre (confirma la hipótesis de arriba, revisar por qué
+> `MEM_Malloc` falla), (b) avanza normalmente por los sub-estados pero cada tick tarda mucho tiempo real
+> (confirma que es un problema de rendimiento/logging, no de lógica), o (c) algo completamente distinto que
+> ninguna de las dos hipótesis anteriores cubre. Build compilado y verificado (cross real vía VitaSDK,
+> `build/inotia3.vpk`/`eboot.bin`/`inotia3.elf`, 2026-08-07) — sin errores nuevos.
+>
+> **Pendiente**: redeployar, reproducir, dejar correr un rato (ya que el cap subió a 200 ticks, hace falta
+> más tiempo para llenarlo), mandar el log nuevo. Buscar las líneas `[MAINPROC] MainProcess() called (#...)
+> ... delta_us=... INITSTATE_nState=... INITSTATE_LoadFrameCnt=... MEM_pool=.../ ... GAMELOADER_pText=...`.
+
+> **Corrida 46 (2026-08-07) — Confirmado con datos reales: SÍ está atascado en el estado terminal de error
+> (`INITSTATE_nState=3`), no es lentitud de logging. El pool de 8MB NO está agotado (solo ~2.1MB usados) --
+> se descarta esa hipótesis. Falta leer el mensaje de error real para saber cuál paso de instalación
+> falló.** `logs/log_2026-08-07_00-52-36.txt`: la secuencia de ticks lo muestra sin ambigüedad --
+> ```
+> #12  INITSTATE_nState=0  LoadFrameCnt=11  MEM_pool=2110328/8192000  GAMELOADER_pText=0x0
+> #13  INITSTATE_nState=1  LoadFrameCnt=1   MEM_pool=2110584/8192000  GAMELOADER_pText=0x9878b1dc   <- GAMELOADER_ProcessPreLoad() tuvo éxito (MEM_Malloc(0x100) no falló)
+> #14  INITSTATE_nState=3  LoadFrameCnt=1   MEM_pool=2110584/8192000  GAMELOADER_pText=0x9878b1dc   <- GAMELOADER_ProcessInstall() falló, salta al estado de error
+> #15..#30  INITSTATE_nState=3 para siempre, MEM_pool sin cambios
+> ```
+> Confirma la hipótesis de la Corrida 45 al pie de la letra: `GAMELOADER_ProcessPreLoad()` (`:60309-60314`)
+> corrió con éxito (si hubiera fallado, `nState` habría saltado directo a `3` en la MISMA transición, no a
+> `1`) -- descarta el agotamiento del pool de 8MB como causa (`MEM_pool=2110584/8192000`, apenas 25% usado,
+> consistente en los 16+ ticks siguientes). El fallo real está en `GAMELOADER_ProcessInstall()`
+> (`:60241-60305`), que itera `INSTALLBASE_nRecordCount` registros llamando `GAMELOADER_Install`/
+> `FILEPACK_Install` por cada uno -- si CUALQUIERA devuelve 0, formatea un mensaje real con
+> `CS_knlSprintk(GAMELOADER_pText, MEMORYTEXT_GetText(), iVar6)` (`:60278-60281`) y retorna 0 -- eso es
+> justamente lo que empuja a `STATE_ProcessInit` a `INITSTATE_nState=3`, el estado terminal sin salida que
+> dibuja ESE mensaje para siempre.
+>
+> **Instrumentación agregada** (`source/patch.c`): el hook de `MainProcess` ahora también lee y loguea el
+> CONTENIDO de texto real de `GAMELOADER_pText` (no solo su dirección) cuando `INITSTATE_nState==3` -- va a
+> revelar el mensaje de error EXACTO que el juego está tratando de mostrar, que a su vez dice qué paso de
+> instalación falló (probablemente relacionado con `GAMELOADER_Install`/`FILEPACK_Install` intentando copiar/
+> instalar algo que este port, con assets sueltos en vez de un `.apk` real, no tiene en el lugar esperado).
+> Build compilado y verificado (cross real vía VitaSDK, `build/inotia3.vpk`/`eboot.bin`/`inotia3.elf`,
+> 2026-08-07) — sin errores nuevos.
+>
+> **Pendiente**: redeployar, reproducir, mandar el log nuevo. Buscar la línea `[MAINPROC] ...
+> GAMELOADER_pText=0x... "<mensaje real>"` en el primer tick donde `INITSTATE_nState=3` -- el texto entre
+> comillas es la pista decisiva para el próximo fix (casi seguro en `GAMELOADER_Install`/`FILEPACK_Install`,
+> `out_ghidra.c` cerca de `:60241`).
+
+> **Corrida 47 (2026-08-07) — Causa raíz real confirmada: es exactamente la hermana del bug de signo de la
+> Corrida 42 que se había dejado documentada como riesgo NO confirmado -- ahora sí lo está, y ya está
+> arreglada.** `logs/log_2026-08-07_01-16-10.txt`: el mensaje de error real resultó vacío (`GAMELOADER_pText
+> ""`) -- no daba una pista directa por texto, así que se rastreó la cadena de llamadas hacia atrás en el
+> decompile en cambio. `GAMELOADER_Install` (`out_ghidra.c:60216-60237`) falla INMEDIATAMENTE si
+> `RES_MoveToFileEx()` devuelve `0`, sin mirar siquiera sus propios parámetros. `RES_MoveToFileEx`
+> (`:23471-23485`) llama directo a `RES_MoveToFilePack` (`:23411-23467`) -- **la MISMA función que la
+> Corrida 42 ya había señalado como sospechosa** ("no confirmado crasheando todavía... si cualquiera de las
+> dos llega a crashear más adelante, aplicar este mismo fix") -- y su chequeo de éxito es literalmente
+> `if (-1 < iVar1)` sobre el valor de retorno de `RES_LoadToHeap`, el MISMO bug de signo ya arreglado en
+> `RES_LoadToPool` (un puntero real de `CS_knlCalloc`/`calloc()` con el bit más alto puesto, siempre
+> negativo como `int` con signo en este port, así que el chequeo falla siempre acá también).
+>
+> **Fix aplicado** (`source/patch.c`): se reimplementó `RES_MoveToFilePack` fielmente (misma lógica que
+> `out_ghidra.c:23411-23467`, incluyendo la rama de descompresión LZMA y el manejo de los dos punteros
+> distintos que hay que liberar -- el handle de `RES_LoadToHeap` vía `CS_knlFree` y, si hubo descompresión,
+> el buffer decodificado vía `MEM_Free`) pero distinguiendo los 3 códigos de error explícitos de
+> `RES_LoadToHeap` (`-1`/`-2`/`-3`) de "cualquier otro valor = un puntero real", igual que en la Corrida 42.
+> Llama directo a las funciones reales `RES_LoadToHeap`/`LZMA_Decode`/`FILE_Seek`/`FILE_WriteAll`/
+> `CS_knlFree`/`MEM_Free` (todas exportadas, sin modificar) -- solo cambia el chequeo de éxito/fracaso. Build
+> compilado y verificado (cross real vía VitaSDK, `build/inotia3.vpk`/`eboot.bin`/`inotia3.elf`,
+> 2026-08-07) — sin errores nuevos.
+>
+> **Pendiente**: redeployar, reproducir, mandar el log (+ `.psp2dmp` si crashea). Si el fix funciona, ya no
+> debería aparecer `INITSTATE_nState=3` en las líneas `[MAINPROC]` -- debería seguir avanzando por
+> `INITSTATE_nState=1`/`2` hasta `STATE_Set(4)` (Title) en `out_ghidra.c:111875`. `EXCELDATA_LoadFullResource`
+> (`:58509-58510`) sigue siendo la ÚLTIMA función conocida con este mismo patrón de riesgo todavía sin
+> confirmar -- si aparece un nuevo bloqueo, revisarla primero antes de investigar desde cero.
 
 ## 3. Riesgos genéricos heredados de la arquitectura SoLoader (aplican igual que en cualquier port)
 - Rutas con espacio en `PSVITA Develop` → build en `/tmp` (`porting_tools/build/build_and_install.sh` ya lo

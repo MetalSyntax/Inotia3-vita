@@ -43,6 +43,11 @@
 .global setjmp_soloader
 .thumb_func
 setjmp_soloader:
+    mov r1, sp          // caller's own sp, captured before we touch the stack
+                         // at all -- Corrida 18 (PORTING_PLAN.md): lets
+                         // jmp_shim_log_setjmp peek at the caller's would-be
+                         // stack-canary slot (sp+132) at this exact call site,
+                         // without needing any invasive hook on the .so itself.
     push {r0, lr}
     bl jmp_shim_log_setjmp
     pop {r0, lr}
@@ -56,6 +61,7 @@ setjmp_soloader:
 .global longjmp_soloader
 .thumb_func
 longjmp_soloader:
+    mov r2, sp          // caller's own sp -- see setjmp_soloader above
     push {r0, r1}
     bl jmp_shim_log_longjmp
     pop {r0, r1}

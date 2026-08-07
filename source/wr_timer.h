@@ -50,4 +50,34 @@ void wr_unset_timer(int timerID);
 // `render` is the nativeRender(timerID) dispatch.
 void wr_run_timers(int64_t (*update_time)(void), void (*render)(int timerID));
 
+// --- Present-request plumbing (Corrida 31) ----------------------------------
+//
+// Inotia 3's MainActivity instantiates WrapperDirtyRenderer (NOT the base
+// WrapperRenderer every earlier Corrida analyzed), which overrides
+// onDrawFrame() to be completely empty and sets the GLSurfaceView to
+// RENDERMODE_WHEN_DIRTY. Under that mode, Android never clears or swaps the
+// framebuffer on its own each tick -- process()/nativeRender() (driven by
+// WrapperDirtyRenderer's own background timer thread) draws directly into the
+// EGL back buffer, and the buffer is only actually presented to the screen
+// when the .so itself calls WrapperJinterface.Flush() -> wrapperRenderer.
+// Flush() -> GLSurfaceView.requestRender() (WrapperDirtyRenderer.java), which
+// schedules exactly one (empty) onDrawFrame + the implicit EGL swap that
+// follows it. Between Flush() calls the screen is expected to just sit there
+// unchanged -- nothing clears it.
+//
+// This port's main loop previously called glClear()+gl_swap() unconditionally
+// every iteration, which wiped out whatever the .so had just drawn before the
+// .so itself ever asked for it to be shown -- the real root cause behind the
+// persistent black screen (device log confirmed the .so's GRP_Flush/Flush()
+// path fires exactly once, during the loading screen, then never again in
+// steady state; that's normal under this model, not a stall). java.c's
+// Flush_stub (WrapperJinterface method id 41) now calls wr_request_present()
+// when the .so asks for a present; main.c's loop only swaps when
+// wr_take_present_request() reports one is pending.
+void wr_request_present(void);
+
+// Returns 1 and clears the pending flag if a present was requested since the
+// last call, 0 otherwise.
+int wr_take_present_request(void);
+
 #endif // INOTIA3_WR_TIMER_H

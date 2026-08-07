@@ -23,6 +23,7 @@ extern "C" {
 #include <sys/dirent.h>
 #include <sys/syslimits.h>
 #include <sys/fcntl.h>
+#include <sys/types.h>
 
 #ifndef PATH_MAX
 #define PATH_MAX 1024
@@ -93,6 +94,8 @@ int fcntl_soloader(int fd, int cmd, ...);
 int ioctl_soloader(int fd, int request, ... /* arg */);
 
 int fsync_soloader(int fd);
+
+ssize_t read_soloader(int fd, void *buf, size_t count);
 
 #ifdef __cplusplus
 };

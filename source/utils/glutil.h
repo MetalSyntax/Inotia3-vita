@@ -70,6 +70,33 @@ void glTexCoordPointer_soloader(GLint size, GLenum type, GLsizei stride, const G
 void glDrawArrays_soloader(GLenum mode, GLint first, GLsizei count);
 void glDrawElements_soloader(GLenum mode, GLsizei count, GLenum type, const GLvoid *indices);
 
+void glAlphaFuncx_soloader(GLenum func, GLfixed ref);
+void glClearDepthx_soloader(GLfixed depth);
+void glClipPlanex_soloader(GLenum plane, const GLfixed *equation);
+void glColor4x_soloader(GLfixed red, GLfixed green, GLfixed blue, GLfixed alpha);
+void glDepthRangex_soloader(GLfixed zNear, GLfixed zFar);
+void glFogx_soloader(GLenum pname, GLfixed param);
+void glFrustumx_soloader(GLfixed left, GLfixed right, GLfixed bottom, GLfixed top, GLfixed zNear, GLfixed zFar);
+void glLineWidthx_soloader(GLfixed width);
+void glLoadMatrixx_soloader(const GLfixed *m);
+void glMaterialx_soloader(GLenum face, GLenum pname, GLfixed param);
+void glMultMatrixx_soloader(const GLfixed *m);
+void glOrthox_soloader(GLfixed left, GLfixed right, GLfixed bottom, GLfixed top, GLfixed zNear, GLfixed zFar);
+void glPointSizex_soloader(GLfixed size);
+void glPolygonOffsetx_soloader(GLfixed factor, GLfixed units);
+void glRotatex_soloader(GLfixed angle, GLfixed x, GLfixed y, GLfixed z);
+void glScalex_soloader(GLfixed x, GLfixed y, GLfixed z);
+void glTexEnvx_soloader(GLenum target, GLenum pname, GLfixed param);
+void glTranslatex_soloader(GLfixed x, GLfixed y, GLfixed z);
+
+// Corrida 25: log every enable/disable of a short list of capabilities that
+// directly affect whether a draw is visible (GL_TEXTURE_2D above all --
+// Corrida 24 showed it consistently 0 at draw time) instead of only sampling
+// state passively at draw time, so a transition (or the total absence of
+// one) is visible in the log.
+void glEnable_soloader(GLenum cap);
+void glDisable_soloader(GLenum cap);
+
 #ifdef __cplusplus
 };
 #endif

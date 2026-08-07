@@ -14,6 +14,11 @@
 #include <stdarg.h>
 #include <stdio.h>
 
+// patch.c (Corrida 33): fires the UserAgree module callback startClet()
+// registers but nothing in this port would otherwise ever invoke, which is
+// what actually kicks off the STATE_* game state machine.
+extern void patch_fire_user_agree_callback(void);
+
 int _newlib_heap_size_user = 256 * 1024 * 1024;
 
 #ifdef USE_SCELIBC_IO
@@ -118,9 +123,6 @@ int main() {
         (void *) so_symbol(&so_mod, "Java_com_com2us_wrapper_WrapperRenderer_nativePreInit");
     void (* nativeInit)(void *env, void *clazz, long long *sysTime, int *upTime, int *pixel, float *gyro, void *activity) =
         (void *) so_symbol(&so_mod, "Java_com_com2us_wrapper_WrapperRenderer_nativeInit");
-    void (* nativeReDraw)(void *env, void *clazz) =
-        (void *) so_symbol(&so_mod, "Java_com_com2us_wrapper_WrapperRenderer_nativeReDraw");
-
     // nativePreInit() writes into `parameter` (WrapperRenderer.java passes an
     // uninitialized `int[3]`) -- allocate zeroed, don't assume the .so
     // ignores it just because Java never reads it back itself.
@@ -170,6 +172,13 @@ int main() {
     nativeResume(&jni, NULL);
     nativeResumeClet(&jni, NULL);
 
+    // See patch.c (Corrida 33): must run after startClet() (inside
+    // nativeInit()) has fully finished registering everything else, not
+    // synchronously from inside CS_UserAgreeSetCallback's hook -- otherwise
+    // the state machine's first Enter callback would run before
+    // CS_ActiveUserStart()/news banner/g_MainTimer's own registration do.
+    patch_fire_user_agree_callback();
+
     l_success("nativeInit() and resume returned -- entering render loop.");
 
     jint *upTime_ptr = jni->GetIntArrayElements(&jni, appUpTime, NULL);
@@ -180,27 +189,31 @@ int main() {
 
     wr_touch_init();
 
-    // Mirror of WrapperRenderer.onDrawFrame() -> process(): drain queued
-    // touch events first (nativeEvent), then fire every due software timer
-    // (nativeRender -- which is what actually advances game state), then
-    // redraw the frame. Same order as WrapperRenderer.process() in
-    // decompiled_apk's WrapperRenderer.java.
+    // Initial buffer clear: real Android relies on the EGL context's own
+    // guarantee that a freshly created surface starts blank, since nothing
+    // in the Java call chain ever clears it explicitly (see wr_timer.h
+    // Corrida 31). One clear+swap here covers both vitaGL buffers before the
+    // .so draws anything, matching that same one-time guarantee.
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    gl_swap();
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    gl_swap();
+
+    // Mirror of WrapperDirtyRenderer's actual execution model (Corrida 31,
+    // see wr_timer.h) -- NOT WrapperRenderer.onDrawFrame(), which every
+    // earlier Corrida assumed applies here but does not: Inotia 3's
+    // MainActivity instantiates WrapperDirtyRenderer, whose onDrawFrame() is
+    // empty and whose GLSurfaceView runs RENDERMODE_WHEN_DIRTY. Every tick
+    // just drains touch events and fires due timers (nativeRender -- where
+    // the .so does its own drawing AND its own clearing, if any); the buffer
+    // is only ever presented when the .so itself calls Flush() (java.c's
+    // Flush_stub -> wr_request_present()), exactly like requestRender().
     while (1) {
         wr_process_touch(wr_dispatch_event);
         wr_run_timers(wr_update_time, wr_render);
-
-        // Defensive reset before our own clear: if the .so's own rendering
-        // left GL_SCISSOR_TEST enabled on a small rect from the previous
-        // frame (common with UI clipping), our glClear() below would only
-        // touch that rect too, leaving the rest of the panel showing
-        // whatever was last in VRAM there forever -- see PORTING_PLAN.md
-        // Fase 4 (same "reduced screen + border" symptom class already
-        // fixed once for glViewport in glutil.c's glViewport_soloader).
-        glDisable(GL_SCISSOR_TEST);
-        glViewport(0, 0, SCREEN_W, SCREEN_H);
-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-        nativeReDraw(&jni, NULL);
-        gl_swap();
+        if (wr_take_present_request()) {
+            gl_swap();
+        }
     }
 
     sceKernelExitDeleteThread(0);
