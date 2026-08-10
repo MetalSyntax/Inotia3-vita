@@ -834,6 +834,531 @@ static int RES_MoveToFilePack_hook(uint32_t file_handle, const char *name, int c
     return wrote != 0;
 }
 
+// --- Corrida 48: which GAMELOADER_ProcessInstall record actually fails? ----
+//
+// Corrida 47's sign-bug fix did NOT clear the boot stall: log_2026-08-07_
+// 01-42-41.txt still lands on INITSTATE_nState==3 on the very FIRST
+// LoadFrameCnt tick of nState==1 -- i.e. GAMELOADER_ProcessInstall()
+// (out_ghidra.c:60241-60305) fails on its first call. That function's
+// install loop (over every INSTALLBASE_nRecordCount record, calling either
+// GAMELOADER_Install() for a plain file or FILEPACK_Install() for a packed
+// one, both of which funnel through RES_MoveToFileEx() ->
+// RES_MoveToFilePack()) runs entirely synchronously inside that ONE call --
+// the outer MAINPROC-level nState/LoadFrameCnt log can't say which record
+// failed or through which path. It also showed GAMELOADER_pText as an empty
+// string even though the failure path unconditionally CS_knlSprintk()s an
+// error message into it (out_ghidra.c:60276-60283) -- a second symptom of
+// the same failure (its format string, looked up via MEMORYTEXT_GetText(),
+// was itself empty), not a separate bug. All four functions here are
+// exported (confirmed via `nm -D`); hook them transparently -- calls
+// through unchanged -- to log every record's name/index and real return
+// value, plus GAMELOADER_pText's actual content right when
+// GAMELOADER_ProcessInstall returns, so the next log capture shows exactly
+// which record/file/pack fails and how.
+static so_hook h_GAMELOADER_Install, h_FILEPACK_Install, h_RES_MoveToFileEx,
+    h_GAMELOADER_ProcessInstall;
+static uint32_t *g_ptr_GAMELOADER_pText = NULL;
+static int g_install_log_count = 0;
+#define INSTALL_LOG_MAX 200
+
+static uint32_t GAMELOADER_Install_hook(uint32_t name_ptr, uint32_t compressed) {
+    uint32_t result = SO_CONTINUE(uint32_t, h_GAMELOADER_Install, name_ptr, compressed);
+    if (g_install_log_count < INSTALL_LOG_MAX) {
+        l_debug("Corrida 48: GAMELOADER_Install(name=\"%s\", compressed=%u) -> %u",
+                name_ptr ? (const char *)(uintptr_t) name_ptr : "(null)", compressed, result);
+        g_install_log_count++;
+    }
+    return result;
+}
+
+static uint32_t FILEPACK_Install_hook(int index) {
+    uint32_t result = SO_CONTINUE(uint32_t, h_FILEPACK_Install, index);
+    if (g_install_log_count < INSTALL_LOG_MAX) {
+        l_debug("Corrida 48: FILEPACK_Install(index=%d) -> %u", index, result);
+        g_install_log_count++;
+    }
+    return result;
+}
+
+static uint32_t RES_MoveToFileEx_hook(uint32_t name_ptr, uint32_t compressed, uint32_t param_3,
+                                       uint32_t param_4) {
+    uint32_t result = SO_CONTINUE(uint32_t, h_RES_MoveToFileEx, name_ptr, compressed, param_3, param_4);
+    if (g_install_log_count < INSTALL_LOG_MAX) {
+        l_debug("Corrida 48: RES_MoveToFileEx(name=\"%s\", compressed=%u, %u, %u) -> %u",
+                name_ptr ? (const char *)(uintptr_t) name_ptr : "(null)", compressed, param_3, param_4,
+                result);
+        g_install_log_count++;
+    }
+    return result;
+}
+
+static uint32_t GAMELOADER_ProcessInstall_hook(void) {
+    uint32_t result = SO_CONTINUE(uint32_t, h_GAMELOADER_ProcessInstall);
+    uint32_t ptext = g_ptr_GAMELOADER_pText ? *g_ptr_GAMELOADER_pText : 0;
+    l_debug("Corrida 48: GAMELOADER_ProcessInstall() -> %u, GAMELOADER_pText=0x%x \"%s\"",
+            result, ptext, ptext ? (const char *)(uintptr_t) ptext : "");
+    return result;
+}
+
+// --- Corrida 49: EXCELDATA_LoadFullResource has the same sign-bit bug as
+// Corridas 42/47 -- and it's the one loading INSTALLBASE/SYMBOLBASE/
+// MEMORYTEXT off a packaged (non-loose-file) resource -----------------------
+//
+// Corrida 42 already flagged EXCELDATA_LoadFullResource (out_ghidra.c:
+// 58498-58537) as an unconfirmed sibling risk. Reading it now: its OWN
+// check on RES_LoadToHeap's return is `if (iVar1 < 0) { ...fail... }`
+// (:58510) -- logically the exact same test as the already-fixed call
+// sites' `if (-1 < iVar1) { ...success... }`, just written negated. A real
+// heap pointer from CS_knlCalloc always has its top bit set on this port's
+// memory layout (confirmed in Corridas 42/47), always negative as a signed
+// int, so `iVar1 < 0` is true for EVERY successful load too -- this
+// function fails unconditionally whenever RES_LoadToHeap actually succeeds.
+// EXCELDATA_LoadGameData()/EXCELDATA_LoadMemoryText()/
+// EXCELDATA_LoadResourceDataTable() (:58614-58559) all call straight into
+// it whenever FILE_IsExist() says the resource ISN'T a loose file on disk --
+// exactly the packaged-resource path CLAUDE.md already flags as this port's
+// likely asset layout, and exactly the path EXCELDATA_Create() (run at boot,
+// INITSTATE_LoadFrameCnt==5, out_ghidra.c:111833) uses to populate
+// INSTALLBASE/SYMBOLBASE/MEMORYTEXT before GAMELOADER_ProcessInstall() ever
+// runs. This lines up with BOTH observed symptoms in log_2026-08-07_
+// 01-42-41.txt: GAMELOADER_ProcessInstall() failing on record 0 (whichever
+// table silently loaded empty/stale instead of erroring loudly), and
+// GAMELOADER_pText coming back empty (MEMORYTEXT_GetText()'s format-string
+// table failing the same way). Fix before waiting on another hardware round
+// trip, same technique as Corridas 42/47: reimplement faithfully
+// (out_ghidra.c:58498-58537) distinguishing RES_LoadToHeap's three explicit
+// error codes from "any other value is a real pointer" instead of trusting
+// the sign bit. Calls straight through to the real RES_LoadToHeap/
+// LZMA_Decode/MEM_Malloc/CS_knlFree (all exported, all left completely
+// unmodified, all already resolved via Corrida 42/47's OFF_* offsets) --
+// only the success/failure test changes. Exported (confirmed via `nm -D`),
+// so this replaces the whole function directly like Corridas 42/47 do,
+// rather than chaining through SO_CONTINUE.
+static uint32_t EXCELDATA_LoadFullResource_hook(const char *name, void **out_ptr) {
+    fn_res_load_to_heap_t RES_LoadToHeap_real = (fn_res_load_to_heap_t)(so_mod.text_base + OFF_RES_LoadToHeap);
+    fn_lzma_decode_t LZMA_Decode_real = (fn_lzma_decode_t)(so_mod.text_base + OFF_LZMA_Decode);
+    fn_mem_malloc_t MEM_Malloc_real = (fn_mem_malloc_t)(so_mod.text_base + OFF_MEM_Malloc);
+    fn_cs_knlfree_t CS_knlFree_real = (fn_cs_knlfree_t)(so_mod.text_base + OFF_CS_knlFree);
+
+    unsigned long length = 0;
+    int handle = RES_LoadToHeap_real(name, &length);
+    if (handle == -1 || handle == -2 || handle == -3) {
+        l_debug("Corrida 49: EXCELDATA_LoadFullResource(\"%s\"): RES_LoadToHeap failed with real "
+                "error code %d", name, handle);
+        return 0xffffffff;
+    }
+
+    unsigned char *data = (unsigned char *) (uintptr_t) handle; // CS_GETDPTR is identity
+    void *out_buf;
+    uint32_t out_len;
+
+    if (data[0] == 1) {
+        int ok = LZMA_Decode_real(data + 1, (int) length - 1, &out_buf, (int *) &out_len);
+        if (!ok) {
+            CS_knlFree_real(handle);
+            l_debug("Corrida 49: EXCELDATA_LoadFullResource(\"%s\"): LZMA_Decode failed", name);
+            return 0xffffffff;
+        }
+    } else {
+        out_len = (uint32_t) length - 1;
+        out_buf = MEM_Malloc_real(out_len);
+        if (!out_buf) {
+            CS_knlFree_real(handle);
+            return 0xffffffff;
+        }
+        memcpy(out_buf, data + 1, out_len);
+    }
+
+    CS_knlFree_real(handle);
+    *out_ptr = out_buf;
+    l_debug("Corrida 49: EXCELDATA_LoadFullResource(\"%s\") recovered a valid pointer (%p) the real "
+            ".so's own sign check would have discarded -> length=%u", name,
+            (void *)(uintptr_t) handle, out_len);
+    return out_len;
+}
+
+// --- Corrida 54: __udivsi3 is the .so's own PRIVATE, statically-linked
+// division primitive -- not an import Corridas 51-53 could ever reach ------
+//
+// Corrida 53's raise() wrapper finally caught the recurring SIGFPE crash
+// (same crash every run since Corrida 50's Hub fix let the boot get this
+// far) and logged its caller: 0x9811e114. Resolving that against the REAL
+// .so at its actual fixed load address (source/utils/init.c's
+// `LOAD_ADDRESS 0x98000000`, confirmed via `nm -D`/`objdump -d`, NOT the
+// crash-dump tool's own auto-detected guess -- that guess has been wrong
+// or misleading in every dump analyzed so far in this port, see the
+// TILESYSTEM_Create/PLAYER_ProcessHate false leads earlier in this file's
+// history) lands exactly on `__udivsi3+0xa4` (offset 0x11ce64, right after
+// `bl __div0` at 0x11ce60) -- `__udivsi3` (aliased as `__aeabi_uidiv`, and
+// also the routine `__aeabi_uidivmod` itself calls internally for the
+// actual division) is a COMPLETE, self-contained division routine that
+// this .so's own build statically linked in from libgcc, not a dynamic
+// import -- so wrapping the .so's *imported* __aeabi_uidiv/__aeabi_uidivmod
+// (Corridas 51/52) could never have caught this: the .so never calls out to
+// the environment for unsigned division, it has its own private copy.
+// __udivsi3 IS exported in .dynsym though (confirmed via `nm -D`) despite
+// being for-internal-use-only, so it can be hooked directly like any other
+// .so function this file already hooks -- this will finally show the real
+// game function that divided by zero, not just the runtime helper it fell
+// through on the way to raise().
+static so_hook h_udivsi3;
+
+static uint32_t udivsi3_hook(uint32_t numerator, uint32_t denominator) {
+    if (denominator == 0) {
+        l_fatal("Corrida 54: __udivsi3(%u, 0) -- divide by zero, .so caller return address=%p",
+                numerator, __builtin_return_address(0));
+    }
+    return SO_CONTINUE(uint32_t, h_udivsi3, numerator, denominator);
+}
+
+// --- Corrida 55: found and fixed -- SGL_Util::GetGLSize() overflows to 0 --
+//
+// Corrida 54's hook caught the real crash: `Corrida 54: __udivsi3(1508900864,
+// 0)`, called from .so return address 0x9811e114. Resolving 0x9811e114
+// against the .so's real fixed load address (0x98000000, same as Corrida 54's
+// comment) lands on `_ZN11SGL_Texture6CreateEjjjjhPv+0xd7` (confirmed via
+// `objdump -d` on the real .so, not the decompile alone) -- specifically the
+// FIRST of two fixed-point ratio divisions in SGL_Texture::Create
+// (out_ghidra.c:161354-161395): `__aeabi_uidiv(param_3 << 0x10,
+// SGL_Util::GetGLSize(param_3))`, called from SGL_Font_Android::
+// RenderToTextureInRect (out_ghidra.c:161897, itself confirmed sitting on
+// the same crash's stack) while rendering the Hub screen's Title/Message
+// text (HUB_InitString, fixed for its own NULL-strcpy crash in Corrida 50).
+// SGL_Util::GetGLSize(uint) (out_ghidra.c:160656, real code at 0xf8e50) is
+// meant to round its input UP to the next power of two for GL texture
+// sizing -- but its doubling loop (`uVar1 = uVar1 * 2` each iteration until
+// `uVar1 >= param_1`) has no overflow guard: for any input with bit 31 set
+// (a plainly-invalid "width", but the loop doesn't validate that), the
+// required next power of two is 2^32, which wraps a 32-bit register to
+// exactly 0 -- precisely the crash logged (1508900864 = 0x59F00000 is
+// `param_3 << 16`, i.e. param_3's low 16 bits are 0x59F0 with garbage above
+// bit 15, wide enough to trigger the wraparound). `__utilGetGLSize`
+// (0xf1510) is a byte-for-byte identical implementation, same risk, same
+// fix, no confirmed crash yet -- fixed alongside per Corrida 47's
+// established precedent (same pattern, same real function shape, fix both
+// once one is confirmed rather than re-deriving this later). Both symbols
+// are exported (confirmed via `nm -D`); replace them outright (like
+// Corridas 42/47/49) with a version that clamps at the largest
+// representable power of two instead of wrapping -- identical output for
+// every legitimate input, and turns the "garbage width" case into a
+// large-but-valid texture size instead of a divide-by-zero. (The garbage
+// width itself -- why RenderToTextureInRect ends up asking for one -- is a
+// separate, cosmetic-at-worst question for a follow-up Corrida once the
+// game no longer crashes outright.)
+static uint32_t gl_size_fixed(uint32_t input) {
+    if (input == 0 || input == 1) return 1;
+    uint32_t result = 1;
+    while (result < input) {
+        if (result >= 0x80000000u) return 0x80000000u; // next step would overflow to 0 -- clamp instead
+        result <<= 1;
+    }
+    return result;
+}
+
+static uint32_t sgl_util_getglsize_hook(uint32_t input) {
+    return gl_size_fixed(input);
+}
+
+static uint32_t util_getglsize_hook(uint32_t input) {
+    return gl_size_fixed(input);
+}
+
+// --- Corrida 56: picking a save slot/character crashes in MEM_ReadUint16 --
+// with a NULL pointer -- MAP_LoadAllToHeap has the same RES_LoadToHeap
+// sign-bit bug as Corridas 42/47/49, and MAP_LoadFromHeap/MAP_DestroyFromHeap
+// carry their own copies of the same idiom on the resulting handle ----------
+//
+// This port's newest crash dump (Data Abort, PC at MEM_ReadUint16's very
+// first instruction `ldrb r2,[r0]`, R0==0) has LR sitting inside
+// MEM_ReadUint16_S right after its `bl MEM_ReadUint16`, and the crash's own
+// R5 register holds 0x9815de2c -- resolving that against the .so's real
+// fixed load address (0x98000000, same correction as Corrida 54/55; the
+// crash-dump tool's own auto-detected base is unreliable) lands EXACTLY on
+// the global MAP_nHeapID (real addr 0x15de2c, confirmed via `nm -D`). The
+// crash's own stack additionally contains STATEMAINMENU_EnterSelectClass
+// and MAP_Load/MAP_LoadFromHeap as live return addresses -- confirming the
+// reported repro (picking a character / starting a slot) goes through
+// MAP_Load -> MAP_LoadFromHeap -> MEM_ReadUint16_S -> MEM_ReadUint16.
+//
+// MAP_LoadFromHeap (out_ghidra.c:68515) reads: `if ((-1 < MAP_nHeapID) ||
+// (MAP_nHeapID = MAP_LoadAllToHeap(), -1 < MAP_nHeapID)) { local_1c[0] =
+// CS_GETDPTR(MAP_nHeapID); MEM_ReadUint16_S(local_1c); ... }`. A raw hex
+// dump of the .so's real .data section confirms MAP_nHeapID's initializer
+// really is -1, so the very first call correctly falls through to
+// MAP_LoadAllToHeap() -- that function (out_ghidra.c:68483) is where the bug
+// actually lives: `iVar1 = RES_LoadToHeap("map.dat",&local_c); iVar2 = 0; if
+// (-1 < iVar1) { ...real success path, returns the LZMA-decoded heap
+// handle... }` -- the EXACT same `-1 < iVar1`-on-RES_LoadToHeap idiom
+// already fixed three times over (Corridas 42/47/49): a genuine heap handle
+// on this port's memory layout always has its top bit set, always negative
+// as a signed int, so `-1 < iVar1` is false even on success, and the
+// function falls through to its pre-set `iVar2 = 0` default -- silently
+// discarding a valid "map.dat" handle and returning 0 instead of a real
+// handle or a real error code. That 0 becomes the new MAP_nHeapID, and
+// MAP_LoadFromHeap's OWN `-1 < MAP_nHeapID` check reads 0 (0 > -1) as a
+// VALID handle, proceeds to `CS_GETDPTR(0)` == NULL, and hands that NULL
+// straight into MEM_ReadUint16_S/MEM_ReadUint16 -- the crash.
+//
+// Fixing MAP_LoadAllToHeap alone is not enough: once it correctly returns a
+// real (sign-bit-set, so still "negative") success handle, MAP_LoadFromHeap's
+// OWN `-1 < MAP_nHeapID` check would then reject that GENUINE success the
+// same way (a real handle is more negative than -1), permanently breaking
+// map loading (no crash, but nothing ever loads). MAP_DestroyFromHeap
+// (out_ghidra.c:68386) has the identical `-1 < MAP_nHeapID` idiom guarding
+// its cleanup and would likewise never free/reset a real handle -- flagged
+// and fixed alongside per Corrida 47's established precedent (same pattern,
+// same real global, fix all confirmed call sites in one pass instead of
+// waiting for a separate hardware round trip per site).
+//
+// Fix: reimplement all three functions faithfully (out_ghidra.c:68386-68540)
+// but replace every `-1 < X` heap-handle-validity test with `X != -1` --
+// -1 is this port's own confirmed "not loaded" sentinel (MAP_DestroyFromHeap
+// itself writes exactly that value), so this is the correct validity check
+// regardless of which way a real handle's sign bit falls. Calls straight
+// through to the real RES_LoadToHeap/LZMA_DecodeToHeap/MEM_ReadUint16_S/
+// MEM_ReadUint24/MEM_Malloc/CS_knlFree (all exported, all left completely
+// unmodified) -- only the success/failure tests change. All three symbols
+// are exported (confirmed via `nm -D`); replaced outright like
+// Corridas 42/47/49, rather than chained through SO_CONTINUE.
+#define OFF_LZMA_DecodeToHeap 0x0006eb91
+#define OFF_MEM_ReadUint16_S  0x0006f21d
+#define OFF_MEM_ReadUint24    0x0006f231
+
+typedef int (*fn_lzma_decode_to_heap_t)(void *, int, int *, int *);
+typedef int (*fn_mem_read_uint16_s_t)(void *);
+typedef int (*fn_mem_read_uint24_t)(void *);
+
+static int *g_ptr_MAP_nHeapID = NULL;
+
+static int MAP_LoadAllToHeap_hook(void) {
+    fn_res_load_to_heap_t RES_LoadToHeap_real = (fn_res_load_to_heap_t)(so_mod.text_base + OFF_RES_LoadToHeap);
+    fn_lzma_decode_to_heap_t LZMA_DecodeToHeap_real =
+        (fn_lzma_decode_to_heap_t)(so_mod.text_base + OFF_LZMA_DecodeToHeap);
+    fn_cs_knlfree_t CS_knlFree_real = (fn_cs_knlfree_t)(so_mod.text_base + OFF_CS_knlFree);
+
+    unsigned long length = 0;
+    int handle = RES_LoadToHeap_real("map.dat", &length);
+    if (handle == -1 || handle == -2 || handle == -3) {
+        l_debug("Corrida 56: MAP_LoadAllToHeap: RES_LoadToHeap(\"map.dat\") failed with real error "
+                "code %d", handle);
+        return -1;
+    }
+
+    unsigned char *data = (unsigned char *) (uintptr_t) handle; // CS_GETDPTR is identity
+    if (data[8] == 1) {
+        int decoded_handle = -1, decoded_len = 0;
+        int ok = LZMA_DecodeToHeap_real(data + 9, (int) (length - 9), &decoded_handle, &decoded_len);
+        CS_knlFree_real(handle);
+        if (ok) {
+            l_debug("Corrida 56: MAP_LoadAllToHeap(\"map.dat\") recovered a valid decoded handle (%d) "
+                    "the real .so's own sign check would have discarded", decoded_handle);
+            return decoded_handle;
+        }
+        l_debug("Corrida 56: MAP_LoadAllToHeap: LZMA_DecodeToHeap(\"map.dat\") failed");
+        return -1;
+    }
+
+    CS_knlFree_real(handle);
+    l_debug("Corrida 56: MAP_LoadAllToHeap: \"map.dat\" not marked compressed -- unexpected format");
+    return -1;
+}
+
+static uint32_t MAP_LoadFromHeap_hook(int map_id, void **out_ptr) {
+    fn_mem_read_uint16_s_t MEM_ReadUint16_S_real =
+        (fn_mem_read_uint16_s_t)(so_mod.text_base + OFF_MEM_ReadUint16_S);
+    fn_mem_read_uint24_t MEM_ReadUint24_real = (fn_mem_read_uint24_t)(so_mod.text_base + OFF_MEM_ReadUint24);
+    fn_mem_malloc_t MEM_Malloc_real = (fn_mem_malloc_t)(so_mod.text_base + OFF_MEM_Malloc);
+
+    if (*g_ptr_MAP_nHeapID == -1) {
+        *g_ptr_MAP_nHeapID = MAP_LoadAllToHeap_hook();
+    }
+    if (*g_ptr_MAP_nHeapID == -1) {
+        return 0;
+    }
+
+    void *cursor = (void *) (uintptr_t) *g_ptr_MAP_nHeapID; // CS_GETDPTR is identity
+    int count = MEM_ReadUint16_S_real(&cursor); // advances `cursor` by 2, returns the uint16 read
+    if (map_id >= count) {
+        return 0;
+    }
+
+    int off_a = MEM_ReadUint24_real((void *) ((uintptr_t) cursor + (unsigned) map_id * 3));
+    int off_b = MEM_ReadUint24_real((void *) ((uintptr_t) cursor + (unsigned) (map_id + 1) * 3));
+    void *record_ptr = (void *) ((uintptr_t) cursor + off_a + (count + 1) * 3);
+    void *dest = MEM_Malloc_real((unsigned long) (off_b - off_a));
+    if (!dest) {
+        return 0;
+    }
+    memcpy(dest, record_ptr, (size_t) (off_b - off_a));
+    *out_ptr = dest;
+    return 1;
+}
+
+static void MAP_DestroyFromHeap_hook(void) {
+    fn_cs_knlfree_t CS_knlFree_real = (fn_cs_knlfree_t)(so_mod.text_base + OFF_CS_knlFree);
+    if (*g_ptr_MAP_nHeapID != -1) {
+        CS_knlFree_real(*g_ptr_MAP_nHeapID);
+        *g_ptr_MAP_nHeapID = -1;
+    }
+}
+
+// --- Corrida 57: Data abort in UI_DrawNumber entering combat after picking a
+// character -- UTIL_LoadSpriteListFromResource has the same RES_LoadToHeap
+// sign-bit bug as Corridas 42/47/49/56, this time leaving IMGFONT_pSprite
+// permanently NULL --------------------------------------------------------
+//
+// This port's newest crash dump (Data Abort) has PC/LR both landing inside
+// UI_DrawNumber (real .so offsets 0xb2012/0xb200a against the confirmed
+// fixed load address 0x98000000 -- the crash-dump tool's own auto-detected
+// base, as in every previous Corrida, resolves this to the wrong function).
+// Disassembly at the fault (`5a73  ldrh r3, [r6, r1]`, out_ghidra.c:92129's
+// `param_5[(extraout_r1 & 0xff) * 0xc]`) reads a digit-width table through
+// `r1` -- and the dump's own R1/R8 = 0x000008d0. That is not a wild pointer:
+// it is EXACTLY the constant `IMGFONT_GetCombatNumberSR()` returns
+// (out_ghidra.c:96225-96229, `return IMGFONT_pSprite + 0x8d0;`) when the
+// global `IMGFONT_pSprite` is 0. The call chain confirms it end to end --
+// GAMESTATE_Draw -> GAMESTATE_DrawPlay -> EFFECTSYSTEM_DrawDamage ->
+// EFFECTDAMAGE_Draw (out_ghidra.c:51062-51102, cVar1 in {3,4} selects the SR
+// combat-number variant) -> UI_DrawNumber(..., IMGFONT_GetCombatNumberSR())
+// -- i.e. the very first damage-number popup drawn once real gameplay
+// starts, matching the reported repro exactly (character select -> start
+// game -> crash).
+//
+// `IMGFONT_pSprite` is only ever written by IMGFONT_Create()
+// (out_ghidra.c:96435-96445), called unconditionally from
+// GAMELOADER_ProcessLoad() at INITSTATE_LoadFrameCnt==3 (:60009-60011) with
+// its bool return value silently discarded -- so a failure here produces no
+// visible error, no crash, nothing until the first combat-number draw much
+// later. IMGFONT_Create calls UTIL_LoadSpriteListFromResource("i_imgfont.dat",
+// &IMGFONT_pSprite, 0, 0x72) (out_ghidra.c:104072-104088):
+//   iVar1 = RES_LoadToHeap(param_1, 0);
+//   uVar2 = 0;
+//   if (-1 < iVar1) { uVar2 = SNASYS_LoadSpriteListFromMemory(CS_GETDPTR(iVar1), param_2, param_3, param_4); CS_knlFree(iVar1); }
+//   return uVar2;
+// -- the exact same `-1 < iVar1`-on-RES_LoadToHeap idiom already fixed four
+// times over: a genuine heap handle from CS_knlCalloc's calloc() always has
+// its top bit set on this port's memory layout, always negative as a signed
+// int, so the check is false even on success, `SNASYS_LoadSpriteListFromMemory`
+// is never called, `IMGFONT_pSprite` (passed by reference) is never written,
+// and it stays at its static-initializer value of 0 forever.
+//
+// Fix: reimplement UTIL_LoadSpriteListFromResource faithfully
+// (out_ghidra.c:104072-104088), distinguishing RES_LoadToHeap's three
+// explicit error codes (-1/-2/-3) from "any other value = a real pointer",
+// same as Corridas 42/47/49/56. Calls straight through to the real
+// RES_LoadToHeap/SNASYS_LoadSpriteListFromMemory/CS_knlFree (all exported,
+// all left completely unmodified) -- only the success/failure test changes.
+// UTIL_LoadSpriteListFromResource is exported (confirmed via `nm -D`) with
+// exactly one call site in the whole decompile (IMGFONT_Create), so this
+// can't affect any other code path.
+//
+// (First attempt at this fix regressed the boot sequence -- it now crashed
+// during loading, before ever reaching Title/Menu, with an Undefined
+// Instruction exception 4 bytes into SNASYS_LoadSpriteListFromMemory. Every
+// other OFF_* constant in this file is deliberately ODD -- the system `nm -D`/
+// `objdump -T` used to look these up reports the even, Thumb-bit-stripped
+// address, and calling through it directly makes the CPU decode genuine
+// Thumb-2 instructions as ARM, which reliably hits an illegal encoding
+// almost immediately. This offset was copy-pasted from a plain `nm -D`
+// lookup without the `+1` every other OFF_* here already carries -- fixed.)
+#define OFF_SNASYS_LoadSpriteListFromMemory 0x000b0c11
+
+typedef uint32_t (*fn_snasys_load_sprite_list_from_memory_t)(void *, void *, uint32_t, uint32_t);
+
+static int UTIL_LoadSpriteListFromResource_hook(const char *name, void *out_ptr,
+                                                 uint32_t param_3, uint32_t param_4) {
+    fn_res_load_to_heap_t RES_LoadToHeap_real = (fn_res_load_to_heap_t)(so_mod.text_base + OFF_RES_LoadToHeap);
+    fn_cs_knlfree_t CS_knlFree_real = (fn_cs_knlfree_t)(so_mod.text_base + OFF_CS_knlFree);
+    fn_snasys_load_sprite_list_from_memory_t SNASYS_LoadSpriteListFromMemory_real =
+        (fn_snasys_load_sprite_list_from_memory_t)(so_mod.text_base + OFF_SNASYS_LoadSpriteListFromMemory);
+
+    int handle = RES_LoadToHeap_real(name, NULL);
+    if (handle == -1 || handle == -2 || handle == -3) {
+        l_debug("Corrida 57: UTIL_LoadSpriteListFromResource: RES_LoadToHeap(\"%s\") failed with real "
+                "error code %d", name, handle);
+        return 0;
+    }
+
+    void *data = (void *) (uintptr_t) handle; // CS_GETDPTR is identity
+    uint32_t result = SNASYS_LoadSpriteListFromMemory_real(data, out_ptr, param_3, param_4);
+    CS_knlFree_real(handle);
+    l_debug("Corrida 57: UTIL_LoadSpriteListFromResource(\"%s\") recovered a valid pointer (%p) the real "
+            ".so's own sign check would have discarded -> %u", name, data, result);
+    return (int) result;
+}
+
+// --- Corrida 58: does GRP_PutAsciiChar/GRP_DrawPixel (the CSFB software text
+// renderer) actually run, and if it does, is it writing into the SAME buffer
+// SGL_FrameBufferToScreen uploads to the screen? ----------------------------
+//
+// The user reports ALL dynamically-drawn text is invisible (menus, HP, item
+// names, dialogues) while sprite-baked "image text" renders fine. Every one
+// of those goes through GRP_PutAsciiChar/GRP_PutHanChar (out_ghidra.c:20971/
+// 21003) -> GRP_DrawPixel (out_ghidra.c:20948), a per-pixel software
+// rasterizer that writes directly into whatever
+// CS_GRP_GET_FRAME_BUFFER_POINTER(GRP_MainFrameBuffer) resolves to -- a
+// completely different code path from the SPR_Draw/GL sprite rendering
+// already confirmed working. Corrida 30 established that this "CSFB"
+// abstraction's own flush function (CS_grpFlushLcd) has zero call sites
+// anywhere in the .so, and that what actually presents frames is
+// GRP_Flush -> ... -> SGL_FrameBufferToScreen (glTexSubImage2D from
+// g_pSGLFrameBuffer/g_pSGLFrameBufferImage, out_ghidra.c:107251) -- but it
+// was never confirmed whether CSFB's software buffer and SGL's uploaded
+// buffer are the SAME memory (text should already show if so) or two
+// unrelated allocations (in which case GRP_PutAsciiChar's output is written
+// somewhere that's simply never displayed).
+//
+// Rather than guess further across two only-partially-decompiled graphics
+// abstractions, this hooks GRP_PutAsciiChar (confirms text drawing is even
+// reached, with which glyph/position) and GRP_DrawPixel (resolves and logs
+// the real destination pointer via the SAME CS_GRP_GET_FRAME_BUFFER_POINTER
+// call the .so itself uses, plus the active clip rect/color) for the first
+// few calls, alongside g_pSGLFrameBuffer/g_pSGLFrameBufferImage's raw values
+// at that same moment -- directly answering whether they're the same buffer.
+// All symbols are exported (confirmed via `nm -D`); transparent hooks, call
+// through unchanged.
+typedef void *(*fn_get_frame_buffer_ptr_t)(int);
+
+static so_hook h_GRP_PutAsciiChar, h_GRP_DrawPixel;
+static int *g_ptr_GRP_MainFrameBuffer = NULL;
+static int *g_ptr_GRP_nColor = NULL;
+static int *g_ptr_GRP_nClipBX = NULL, *g_ptr_GRP_nClipBY = NULL,
+        *g_ptr_GRP_nClipEX = NULL, *g_ptr_GRP_nClipEY = NULL;
+static void **g_ptr_g_pSGLFrameBuffer = NULL, **g_ptr_g_pSGLFrameBufferImage = NULL;
+static int g_text_log_count = 0;
+#define TEXT_LOG_MAX 20
+
+static int g_ascii_log_count = 0;
+
+static void GRP_PutAsciiChar_hook(int x, int y, int ch) {
+    if (g_ascii_log_count < TEXT_LOG_MAX) {
+        l_debug("Corrida 58: GRP_PutAsciiChar(x=%d, y=%d, ch=%d '%c')", x, y, ch,
+                (ch >= 0x20 && ch < 0x7f) ? ch : '?');
+        g_ascii_log_count++;
+    }
+    SO_CONTINUE_VOID(h_GRP_PutAsciiChar, x, y, ch);
+}
+
+static void GRP_DrawPixel_hook(int x, int y) {
+    if (g_text_log_count < TEXT_LOG_MAX) {
+        fn_get_frame_buffer_ptr_t CS_GRP_GET_FRAME_BUFFER_POINTER_real =
+            (fn_get_frame_buffer_ptr_t) so_symbol(&so_mod, "CS_GRP_GET_FRAME_BUFFER_POINTER");
+        void *fb_ptr = (CS_GRP_GET_FRAME_BUFFER_POINTER_real && g_ptr_GRP_MainFrameBuffer)
+            ? CS_GRP_GET_FRAME_BUFFER_POINTER_real(*g_ptr_GRP_MainFrameBuffer) : NULL;
+        l_debug("Corrida 58: GRP_DrawPixel(x=%d, y=%d) CSFB_fb=%p color=%08x "
+                "clip=[%d,%d,%d,%d] sgl_fb=%p sgl_fb_image=%p", x, y, fb_ptr,
+                g_ptr_GRP_nColor ? *g_ptr_GRP_nColor : -1,
+                g_ptr_GRP_nClipBX ? *g_ptr_GRP_nClipBX : -1,
+                g_ptr_GRP_nClipBY ? *g_ptr_GRP_nClipBY : -1,
+                g_ptr_GRP_nClipEX ? *g_ptr_GRP_nClipEX : -1,
+                g_ptr_GRP_nClipEY ? *g_ptr_GRP_nClipEY : -1,
+                g_ptr_g_pSGLFrameBuffer ? *g_ptr_g_pSGLFrameBuffer : NULL,
+                g_ptr_g_pSGLFrameBufferImage ? *g_ptr_g_pSGLFrameBufferImage : NULL);
+        g_text_log_count++;
+    }
+    SO_CONTINUE_VOID(h_GRP_DrawPixel, x, y);
+}
+
 void so_patch(void) {
     hook_addr(so_mod.text_base + OFF_excuteDirectly, (uintptr_t)&excuteDirectly_bypass);
     hook_addr(so_mod.text_base + OFF_jIsCracked, (uintptr_t)&jIsCracked_bypass);
@@ -924,6 +1449,118 @@ void so_patch(void) {
         hook_addr(addr_RES_MoveToFilePack, (uintptr_t)&RES_MoveToFilePack_hook);
     } else {
         l_warn("Corrida 47: RES_MoveToFilePack not found in .dynsym -- hook skipped");
+    }
+
+    g_ptr_GAMELOADER_pText = (uint32_t *) so_symbol(&so_mod, "GAMELOADER_pText");
+
+    uintptr_t addr_GAMELOADER_Install = so_symbol(&so_mod, "GAMELOADER_Install");
+    if (addr_GAMELOADER_Install) {
+        h_GAMELOADER_Install = hook_addr(addr_GAMELOADER_Install, (uintptr_t)&GAMELOADER_Install_hook);
+    } else {
+        l_warn("Corrida 48: GAMELOADER_Install not found in .dynsym -- hook skipped");
+    }
+
+    uintptr_t addr_FILEPACK_Install = so_symbol(&so_mod, "FILEPACK_Install");
+    if (addr_FILEPACK_Install) {
+        h_FILEPACK_Install = hook_addr(addr_FILEPACK_Install, (uintptr_t)&FILEPACK_Install_hook);
+    } else {
+        l_warn("Corrida 48: FILEPACK_Install not found in .dynsym -- hook skipped");
+    }
+
+    uintptr_t addr_RES_MoveToFileEx = so_symbol(&so_mod, "RES_MoveToFileEx");
+    if (addr_RES_MoveToFileEx) {
+        h_RES_MoveToFileEx = hook_addr(addr_RES_MoveToFileEx, (uintptr_t)&RES_MoveToFileEx_hook);
+    } else {
+        l_warn("Corrida 48: RES_MoveToFileEx not found in .dynsym -- hook skipped");
+    }
+
+    uintptr_t addr_GAMELOADER_ProcessInstall = so_symbol(&so_mod, "GAMELOADER_ProcessInstall");
+    if (addr_GAMELOADER_ProcessInstall) {
+        h_GAMELOADER_ProcessInstall = hook_addr(addr_GAMELOADER_ProcessInstall,
+                                                 (uintptr_t)&GAMELOADER_ProcessInstall_hook);
+    } else {
+        l_warn("Corrida 48: GAMELOADER_ProcessInstall not found in .dynsym -- hook skipped");
+    }
+
+    uintptr_t addr_EXCELDATA_LoadFullResource = so_symbol(&so_mod, "EXCELDATA_LoadFullResource");
+    if (addr_EXCELDATA_LoadFullResource) {
+        hook_addr(addr_EXCELDATA_LoadFullResource, (uintptr_t)&EXCELDATA_LoadFullResource_hook);
+    } else {
+        l_warn("Corrida 49: EXCELDATA_LoadFullResource not found in .dynsym -- hook skipped");
+    }
+
+    uintptr_t addr_udivsi3 = so_symbol(&so_mod, "__udivsi3");
+    if (addr_udivsi3) {
+        h_udivsi3 = hook_addr(addr_udivsi3, (uintptr_t)&udivsi3_hook);
+    } else {
+        l_warn("Corrida 54: __udivsi3 not found in .dynsym -- hook skipped");
+    }
+
+    uintptr_t addr_sgl_util_getglsize = so_symbol(&so_mod, "_ZN8SGL_Util9GetGLSizeEj");
+    if (addr_sgl_util_getglsize) {
+        hook_addr(addr_sgl_util_getglsize, (uintptr_t)&sgl_util_getglsize_hook);
+    } else {
+        l_warn("Corrida 55: SGL_Util::GetGLSize not found in .dynsym -- hook skipped");
+    }
+
+    uintptr_t addr_util_getglsize = so_symbol(&so_mod, "__utilGetGLSize");
+    if (addr_util_getglsize) {
+        hook_addr(addr_util_getglsize, (uintptr_t)&util_getglsize_hook);
+    } else {
+        l_warn("Corrida 55: __utilGetGLSize not found in .dynsym -- hook skipped");
+    }
+
+    g_ptr_MAP_nHeapID = (int *) so_symbol(&so_mod, "MAP_nHeapID");
+
+    uintptr_t addr_MAP_LoadAllToHeap = so_symbol(&so_mod, "MAP_LoadAllToHeap");
+    if (addr_MAP_LoadAllToHeap && g_ptr_MAP_nHeapID) {
+        hook_addr(addr_MAP_LoadAllToHeap, (uintptr_t)&MAP_LoadAllToHeap_hook);
+    } else {
+        l_warn("Corrida 56: MAP_LoadAllToHeap or MAP_nHeapID not found in .dynsym -- hook skipped");
+    }
+
+    uintptr_t addr_MAP_LoadFromHeap = so_symbol(&so_mod, "MAP_LoadFromHeap");
+    if (addr_MAP_LoadFromHeap && g_ptr_MAP_nHeapID) {
+        hook_addr(addr_MAP_LoadFromHeap, (uintptr_t)&MAP_LoadFromHeap_hook);
+    } else {
+        l_warn("Corrida 56: MAP_LoadFromHeap or MAP_nHeapID not found in .dynsym -- hook skipped");
+    }
+
+    uintptr_t addr_MAP_DestroyFromHeap = so_symbol(&so_mod, "MAP_DestroyFromHeap");
+    if (addr_MAP_DestroyFromHeap && g_ptr_MAP_nHeapID) {
+        hook_addr(addr_MAP_DestroyFromHeap, (uintptr_t)&MAP_DestroyFromHeap_hook);
+    } else {
+        l_warn("Corrida 56: MAP_DestroyFromHeap or MAP_nHeapID not found in .dynsym -- hook skipped");
+    }
+
+    uintptr_t addr_UTIL_LoadSpriteListFromResource = so_symbol(&so_mod, "UTIL_LoadSpriteListFromResource");
+    if (addr_UTIL_LoadSpriteListFromResource) {
+        hook_addr(addr_UTIL_LoadSpriteListFromResource, (uintptr_t)&UTIL_LoadSpriteListFromResource_hook);
+    } else {
+        l_warn("Corrida 57: UTIL_LoadSpriteListFromResource not found in .dynsym -- hook skipped");
+    }
+
+    g_ptr_GRP_MainFrameBuffer = (int *) so_symbol(&so_mod, "GRP_MainFrameBuffer");
+    g_ptr_GRP_nColor = (int *) so_symbol(&so_mod, "GRP_nColor");
+    g_ptr_GRP_nClipBX = (int *) so_symbol(&so_mod, "GRP_nClipBX");
+    g_ptr_GRP_nClipBY = (int *) so_symbol(&so_mod, "GRP_nClipBY");
+    g_ptr_GRP_nClipEX = (int *) so_symbol(&so_mod, "GRP_nClipEX");
+    g_ptr_GRP_nClipEY = (int *) so_symbol(&so_mod, "GRP_nClipEY");
+    g_ptr_g_pSGLFrameBuffer = (void **) so_symbol(&so_mod, "g_pSGLFrameBuffer");
+    g_ptr_g_pSGLFrameBufferImage = (void **) so_symbol(&so_mod, "g_pSGLFrameBufferImage");
+
+    uintptr_t addr_GRP_PutAsciiChar = so_symbol(&so_mod, "GRP_PutAsciiChar");
+    if (addr_GRP_PutAsciiChar) {
+        h_GRP_PutAsciiChar = hook_addr(addr_GRP_PutAsciiChar, (uintptr_t)&GRP_PutAsciiChar_hook);
+    } else {
+        l_warn("Corrida 58: GRP_PutAsciiChar not found in .dynsym -- hook skipped");
+    }
+
+    uintptr_t addr_GRP_DrawPixel = so_symbol(&so_mod, "GRP_DrawPixel");
+    if (addr_GRP_DrawPixel) {
+        h_GRP_DrawPixel = hook_addr(addr_GRP_DrawPixel, (uintptr_t)&GRP_DrawPixel_hook);
+    } else {
+        l_warn("Corrida 58: GRP_DrawPixel not found in .dynsym -- hook skipped");
     }
 
     // The Com2uS library in this game relies on multiple static JavaVM pointers.

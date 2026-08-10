@@ -87,6 +87,15 @@ void game_log(const char *fmt, ...) {
 static jlong *g_sysTime_ptr = NULL;   // == the .so's CS_knlCurrentTime() source
 static jint  *g_upTime_ptr = NULL;    // == the .so's CS_knlUpTime() source
 static uint64_t g_start_time = 0;
+
+// DrawTextInRect_stub (java.c) renders glyphs directly into this SAME buffer:
+// the .so caches ONE raw pointer to it (via jGetPixelBufferPointer(), fed by
+// nativeInit()'s GetIntArrayElements(pixel) call below) and reads it back
+// row-major after every DrawTextInRect call (SGL_RenderFontToAlphaImageInRect,
+// out_ghidra.c:162636) -- writing here IS the render, no separate JNI needed.
+jint *g_textview_pixel_buffer = NULL;
+const int g_textview_width = TEXTVIEW_WIDTH;
+const int g_textview_height = TEXTVIEW_HEIGHT;
 static void (*g_nativeRender)(void *env, void *clazz, int timerID) = NULL;
 
 // WrapperRenderer.UpdateCurTime(): refresh the shared clock arrays and return
@@ -145,6 +154,7 @@ int main() {
     // stack, and it must stay alive for the lifetime of the .so (native code
     // keeps writing/reading it every frame via the pointer handed here once).
     jintArray pixel = jni->NewIntArray(&jni, TEXTVIEW_WIDTH * TEXTVIEW_HEIGHT);
+    g_textview_pixel_buffer = jni->GetIntArrayElements(&jni, pixel, NULL);
 
     // GyroManager.gyro is a real `float[3]` (x/y/z) -- confirmed in
     // decompiled_apk's GyroManager.java. The Vita has no Android-style gyro

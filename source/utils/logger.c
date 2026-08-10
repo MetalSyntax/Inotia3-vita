@@ -11,7 +11,6 @@
 #include <psp2/kernel/threadmgr.h>
 #include <psp2/io/fcntl.h>
 #include <psp2/io/stat.h>
-#include <psp2/rtc.h>
 
 #include <stdbool.h>
 #include <stdatomic.h>
@@ -38,6 +37,46 @@ static char buffer_a[2048];
 // Buffer B is used to compile the final log using the updated format string.
 static char buffer_b[2048];
 
+// Corrida 60: implementing real text rendering (Corrida 59) multiplied this
+// port's JNI log volume several times over (every on-screen string now walks
+// GetByteArrayElements/GetArrayLength/ReleaseByteArrayElements plus the
+// existing GetStringWidthHeightInRect calls, every single frame, for every
+// label on screen) -- and every LT_DEBUG/LT_INFO line below used to pay for
+// its own sceIoOpen+sceIoWrite+sceIoClose, a full filesystem round trip PER
+// LINE (10000+ lines in a normal play session, confirmed against log_005.txt).
+// That per-line open/close was deliberate (so-crash-triage, 2026-07-21): a
+// single long-lived fd written via sceIoWrite lost data on a real hard crash,
+// even with an explicit sceIoSyncByFd() after every write -- only closing the
+// fd was a reliable flush boundary on this device/storage combo. Batching
+// keeps that same guarantee for anything crash-relevant while cutting the
+// I/O cost for the bulk, high-frequency traffic that doesn't need it:
+// LT_DEBUG/LT_INFO lines accumulate in this small in-memory ring instead of
+// hitting the filesystem individually, flushed (one single open/write/close
+// for the whole batch) whenever it's about to overflow -- roughly an
+// order-of-magnitude fewer filesystem round trips for the exact same log
+// content. LT_WARN/LT_ERROR/LT_FATAL (rare, and the whole reason the log
+// exists during a crash-triage session) flush the ring FIRST (so the debug
+// context leading up to them isn't silently dropped) and then still write
+// immediately with the original open+write+close, unchanged -- the crash-time
+// guarantee this project has relied on all session is not weakened. Sized
+// small on purpose (not "as big as possible") to bound how many lines a
+// genuine hard crash (which bypasses this logger entirely, caught by the
+// system exception handler instead) could still lose unflushed -- at most
+// the handful of lines that fit in one ring, not an arbitrary batch.
+#define LOG_RING_CAPACITY 4096
+static char log_ring[LOG_RING_CAPACITY];
+static size_t log_ring_len = 0;
+
+static void log_flush_ring(void) {
+    if (log_ring_len == 0) return;
+    SceUID fd = sceIoOpen(log_path, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0777);
+    if (fd >= 0) {
+        sceIoWrite(fd, log_ring, log_ring_len);
+        sceIoClose(fd);
+    }
+    log_ring_len = 0;
+}
+
 void _log_print(int t, const char* fmt, ...) {
     if (!atomic_load_explicit(&_log_mutex_ready, memory_order_relaxed)) {
         int ret = sceKernelCreateLwMutex(&_log_mutex, "log_lock", 0, 0, NULL);
@@ -53,10 +92,33 @@ void _log_print(int t, const char* fmt, ...) {
         sceIoMkdir("ux0:data/inotia3", 0777);
         sceIoMkdir("ux0:data/inotia3/logs", 0777);
 
-        SceDateTime time;
-        sceRtcGetCurrentClockLocalTime(&time);
-        sceClibSnprintf(log_path, sizeof(log_path), "ux0:data/inotia3/logs/log_%04d-%02d-%02d_%02d-%02d-%02d.txt",
-                        time.year, time.month, time.day, time.hour, time.minute, time.second);
+        // so-crash-triage (2026-08-07): this console's RTC resets to the
+        // same fixed value on every boot (no battery-backed clock), so a
+        // timestamp-based filename collided across sessions -- a fresh run
+        // silently appended onto a previous, already-analyzed log instead of
+        // starting a new file, making it look like no new log was ever
+        // captured. An incremental counter has no such dependency: scan for
+        // the first log_NNN.txt that doesn't exist yet so every run gets its
+        // own file regardless of the clock. Once all 999 slots are taken,
+        // wrap back to 001 and truncate it (oldest log gets overwritten)
+        // rather than silently stop logging.
+        int slot = 1;
+        for (; slot <= 999; slot++) {
+            sceClibSnprintf(log_path, sizeof(log_path), "ux0:data/inotia3/logs/log_%03d.txt", slot);
+            SceUID probe = sceIoOpen(log_path, SCE_O_RDONLY, 0);
+            if (probe < 0) {
+                break; // doesn't exist yet -- this is our slot
+            }
+            sceIoClose(probe);
+        }
+        if (slot > 999) {
+            slot = 1;
+            sceClibSnprintf(log_path, sizeof(log_path), "ux0:data/inotia3/logs/log_%03d.txt", slot);
+            SceUID trunc = sceIoOpen(log_path, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
+            if (trunc >= 0) {
+                sceIoClose(trunc);
+            }
+        }
         atomic_store_explicit(&_log_path_ready, true, memory_order_relaxed);
     }
 
@@ -95,20 +157,33 @@ void _log_print(int t, const char* fmt, ...) {
     va_end(list);
     
     sceClibPrintf(buffer_b);
-    // so-crash-triage (2026-07-21): keeping a single log_fd open for the
-    // whole process and writing to it via sceIoWrite() lost data on a real
-    // hard crash -- confirmed empirically (one run captured all 475 lines,
-    // others came back truncated to just the final fatal line, same code
-    // path every time) and NOT fixed by adding sceIoSyncByFd() after each
-    // write either. Opening, writing, and closing the file fresh on every
-    // single line is slower but makes each line's durability independent of
-    // whatever OS-level write-back caching this device/storage combo does --
-    // a close() is a far more universally-honored flush boundary than an
-    // explicit sync call.
-    SceUID fd = sceIoOpen(log_path, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0777);
-    if (fd >= 0) {
-        sceIoWrite(fd, buffer_b, strlen(buffer_b));
-        sceIoClose(fd);
+
+    size_t line_len = strlen(buffer_b);
+    if (t == LT_WARN || t == LT_ERROR || t == LT_FATAL) {
+        // Flush whatever debug/info context is already buffered first, so
+        // the lines leading up to this warning/error/fatal aren't dropped --
+        // then write THIS line the original, immediately-durable way.
+        log_flush_ring();
+        SceUID fd = sceIoOpen(log_path, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0777);
+        if (fd >= 0) {
+            sceIoWrite(fd, buffer_b, line_len);
+            sceIoClose(fd);
+        }
+    } else if (line_len >= LOG_RING_CAPACITY) {
+        // Longer than the whole ring -- flush what's pending and write this
+        // one line directly rather than trying to fit it in pieces.
+        log_flush_ring();
+        SceUID fd = sceIoOpen(log_path, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0777);
+        if (fd >= 0) {
+            sceIoWrite(fd, buffer_b, line_len);
+            sceIoClose(fd);
+        }
+    } else {
+        if (log_ring_len + line_len > LOG_RING_CAPACITY) {
+            log_flush_ring();
+        }
+        memcpy(log_ring + log_ring_len, buffer_b, line_len);
+        log_ring_len += line_len;
     }
 
     if (atomic_load_explicit(&_log_mutex_ready, memory_order_relaxed)) {

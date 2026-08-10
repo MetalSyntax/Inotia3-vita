@@ -20,7 +20,29 @@
 #include <malloc.h>
 #include <pthread.h>
 
-JavaDynArray* javaDynArrays = NULL;
+// so-crash-triage (2026-08-07): javaDynArrays used to be a `JavaDynArray*`
+// (array OF structs), grown via realloc() in jda_extend() every 16 slots.
+// jda_alloc() returns `&javaDynArrays[index]` as the opaque handle callers
+// cache long-term (e.g. libgame.so's jGetFileDescriptorEx caches a
+// NewIntArray(2) handle once and reuses it for the rest of the process --
+// a completely standard, common Android JNI performance idiom, not a bug
+// in the .so). realloc() is free to MOVE the block when growing it -- the
+// instant that happens, every previously-issued handle silently becomes a
+// dangling pointer into freed memory, and jda_find() (which just compares
+// `arr == &javaDynArrays[i]` against the NEW array's base) can never match
+// it again, even though the underlying array data is perfectly intact.
+// Confirmed as a real crash: GetFileDescriptor_stub (java.c) worked
+// correctly through boot/menu (few enough JNI array allocations that the
+// registry never needed to grow past its first block), then null-derefed
+// writing through a suddenly-NULL GetIntArrayElements() result the moment
+// gameplay started allocating enough OTHER arrays to trigger a realloc.
+// Fix: make javaDynArrays an array OF POINTERS to individually-malloc'd,
+// address-stable JavaDynArray structs instead. Growing the INDEX (this
+// array of pointers) via realloc is fine -- only the pointers themselves
+// move, never the structs they point to, so every previously-issued handle
+// (a pointer to one of those individually-malloc'd structs) stays valid
+// for its entire lifetime regardless of how many later allocations happen.
+JavaDynArray** javaDynArrays = NULL;
 pthread_mutex_t* javaDynArrays_mutex = NULL;
 size_t javaDynArrays_free = 0;
 size_t javaDynArrays_taken = 0;
@@ -300,14 +322,12 @@ void jda_unlock() {
 
 jboolean jda_tryinit() {
     if (javaDynArrays == NULL) {
-        javaDynArrays = malloc(16 * sizeof(JavaDynArray));
+        javaDynArrays = malloc(16 * sizeof(JavaDynArray *));
         if (!javaDynArrays)
             return JNI_FALSE;
 
         for (int i = 0; i < 16; ++i) {
-            javaDynArrays[i].array = NULL;
-            javaDynArrays[i].len = -1;
-            javaDynArrays[i].type = FIELD_TYPE_UNKNOWN;
+            javaDynArrays[i] = NULL;
         }
 
         javaDynArrays_free = 16;
@@ -325,15 +345,17 @@ jboolean jda_extend() {
         if (javaDynArrays == NULL)
             return JNI_FALSE;
 
-        javaDynArrays = realloc(javaDynArrays, (sizeof(JavaDynArray) * (javaDynArrays_taken+16)));
+        // Only the index (this array of POINTERS) ever moves here -- the
+        // individually-malloc'd JavaDynArray structs it points to (below,
+        // in jda_alloc) never do, so handles already handed out to callers
+        // stay valid across this realloc.
+        javaDynArrays = realloc(javaDynArrays, (sizeof(JavaDynArray *) * (javaDynArrays_taken+16)));
 
         if (javaDynArrays == NULL)
             return JNI_FALSE;
 
         for (int i = javaDynArrays_taken; i < javaDynArrays_taken+16; ++i) {
-            javaDynArrays[i].array = NULL;
-            javaDynArrays[i].len = -1;
-            javaDynArrays[i].type = FIELD_TYPE_UNKNOWN;
+            javaDynArrays[i] = NULL;
         }
 
         javaDynArrays_free = 16;
@@ -358,7 +380,7 @@ JavaDynArray * jda_alloc(jsize len, FIELD_TYPE type) {
 
     int index = -1;
     for (int i = 0; i < (javaDynArrays_taken+javaDynArrays_free); ++i) {
-        if (javaDynArrays[i].array == NULL) {
+        if (javaDynArrays[i] == NULL) {
             index = i;
         }
     }
@@ -369,16 +391,26 @@ JavaDynArray * jda_alloc(jsize len, FIELD_TYPE type) {
         return NULL;
     }
 
-    javaDynArrays[index].array = array;
-    javaDynArrays[index].len = len;
-    javaDynArrays[index].type = type;
+    // Individually malloc'd so its address is stable for its entire
+    // lifetime, regardless of how many times the index above gets
+    // realloc'd afterward -- this IS the handle callers cache long-term.
+    JavaDynArray * jda = malloc(sizeof(JavaDynArray));
+    if (!jda) {
+        jda_unlock();
+        free(array);
+        return NULL;
+    }
+
+    jda->array = array;
+    jda->len = len;
+    jda->type = type;
+    javaDynArrays[index] = jda;
 
     javaDynArrays_taken++;
     javaDynArrays_free--;
 
-    JavaDynArray * ret = &javaDynArrays[index];
     jda_unlock();
-    return ret;
+    return jda;
 }
 
 jsize jda_sizeof(JavaDynArray * jda) {
@@ -392,12 +424,8 @@ jsize jda_sizeof(JavaDynArray * jda) {
     }
 
     for (int i = 0; i < (javaDynArrays_taken+javaDynArrays_free); i++) {
-        if (jda == &javaDynArrays[i]) {
-            if (javaDynArrays[i].array == NULL) {
-                jda_unlock();
-                return -1;
-            }
-            jsize ret = javaDynArrays[i].len;
+        if (jda == javaDynArrays[i]) {
+            jsize ret = javaDynArrays[i]->len;
             jda_unlock();
             return ret;
         }
@@ -419,7 +447,7 @@ jboolean jda_free(JavaDynArray * jda) {
 
     int index = -1;
     for (int i = 0; i < (javaDynArrays_taken+javaDynArrays_free); ++i) {
-        if (jda == &javaDynArrays[i]) {
+        if (jda == javaDynArrays[i]) {
             index = i;
         }
     }
@@ -429,10 +457,9 @@ jboolean jda_free(JavaDynArray * jda) {
         return JNI_FALSE;
     }
 
-    free(javaDynArrays[index].array);
-    javaDynArrays[index].array = NULL;
-    javaDynArrays[index].type = FIELD_TYPE_UNKNOWN;
-    javaDynArrays[index].len = 0;
+    free(javaDynArrays[index]->array);
+    free(javaDynArrays[index]);
+    javaDynArrays[index] = NULL;
 
     javaDynArrays_taken--;
     javaDynArrays_free++;
@@ -451,12 +478,8 @@ JavaDynArray * jda_find(void * arr) {
     }
 
     for (int i = 0; i < (javaDynArrays_taken+javaDynArrays_free); ++i) {
-        if (arr == &javaDynArrays[i]) {
-            if (javaDynArrays[i].array == NULL) {
-                jda_unlock();
-                return NULL;
-            }
-            JavaDynArray * ret = &javaDynArrays[i];
+        if (arr == javaDynArrays[i]) {
+            JavaDynArray * ret = javaDynArrays[i];
             jda_unlock();
             return ret;
         }

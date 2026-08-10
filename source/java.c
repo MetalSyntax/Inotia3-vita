@@ -29,14 +29,25 @@
 
 #include <falso_jni/FalsoJNI.h>
 #include <falso_jni/FalsoJNI_Impl.h>
+#include <so_util/so_util.h>
 
 #include "utils/logger.h"
 #include "wr_timer.h"
 #include "reimpl/apk_zip.h"
 
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+
+extern so_module so_mod;
+
+// main.c: the SAME buffer nativeInit() handed the .so as its `pixel[]`
+// scratch array -- DrawTextInRect_stub (Corrida 59, below) renders glyphs
+// straight into it instead of going through a second JNI round trip.
+extern jint *g_textview_pixel_buffer;
+extern const int g_textview_width;
+extern const int g_textview_height;
 
 // WrapperData.java: getApkFilePath()/GAME_ASSETS_PATH/RES_NAME_APPEND.
 // GetFileDescriptor_stub below prefers a pre-extracted LOOSE copy of the
@@ -164,6 +175,41 @@ NameToMethodID nameToMethodId[] = {
     // console's log buffer was cut short). Must return a real width so the
     // caller's wrap loop actually terminates.
     { 46, "GetStringWidthHeightInRect", METHOD_TYPE_INT },
+
+    // Corrida 50: game now reaches Title but crashes entering the Hub screen
+    // (STATE_EnterHub -> HUB_InitString, out_ghidra.c:111434-111466) with a
+    // Data Abort in our own loader's strcpy, R1 (source) == 0 -- same crash
+    // shape as Corrida 40, different call site. HUB_InitString does
+    // `pcVar2 = GetCharStringFromPlist(&DAT_001340b0,"Title",lang);
+    // strcpy(acStack_42c, pcVar2);` (and again for "Message") with no NULL
+    // check. GetCharStringFromPlist (out_ghidra.c:117575) is a thin wrapper
+    // over jGetStringFromXmlEx (out_ghidra.c:2882) -- which, UNLIKE the
+    // GetStaticMethodID-by-id methods above, resolves via
+    // `GetMethodID(g_userDefinedClass, "GetStringFromXmlEx",
+    // "(Ljava/lang/String;Ljava/lang/String;I)Ljava/lang/Object;")` -- an
+    // INSTANCE method. FalsoJNI's GetMethodID matches by name through this
+    // same nameToMethodId[] table (see FalsoJNI.c's GetMethodID ->
+    // getMethodIdByName), so it was simply never registered and always
+    // returned NULL -- jGetStringFromXmlEx itself already null-checks that
+    // (out_ghidra.c:2901-2903), but NONE of its ~15 call sites in the .so
+    // (out_ghidra.c:16444/26539/26541/26556/26558/111451/111456/111687/
+    // 112076/112078, all feeding straight into strcpy/strtok) check the
+    // result before using it. Registering it to always return a real
+    // (non-NULL, empty) string fixes every one of those call sites at once --
+    // the same "faithful no-op, never crashes, never fabricates" fix as
+    // Corrida 40, just at the root instead of per call site.
+    { 47, "GetStringFromXmlEx", METHOD_TYPE_OBJECT },
+
+    // Same risk, same fix, no confirmed call site yet (jGetStringFromXml,
+    // out_ghidra.c:2917-2948, the 2-arg sibling of GetStringFromXmlEx above)
+    // -- registered defensively since it shares the exact same
+    // GetMethodID-returns-NULL-unchecked-by-caller shape.
+    { 48, "GetStringFromXml", METHOD_TYPE_OBJECT },
+
+    // Corrida 59: see DrawTextInRect_stub's own comment -- this is the
+    // engine's universal text-draw entry point (every menu/HP/item/dialogue
+    // string in the game funnels through it), left unregistered until now.
+    { 49, "DrawTextInRect", METHOD_TYPE_INT },
 };
 
 MethodsBoolean methodsBoolean[] = {};
@@ -224,34 +270,21 @@ static int inotia3_char_width(const unsigned char *s, size_t i, size_t len, size
     return 6;
 }
 
-// WrapperJinterface.GetStringWidthHeightInRect(String, int, int, int, int,
-// int[]): int -- see the NameToMethodID comment (Corrida 44) for why this
-// needs a real implementation, not just a safe default. Greedy word-wrap,
-// O(n) single pass, preferring to break at the last whitespace seen on the
-// current line (mirrors the real Java implementation's own word-boundary
-// preference) when one is available. fontSize/fontStyle/isBreak are ignored
-// -- this port's bitmap font has one fixed per-byte metric, not a scalable
-// one, and both of the real isBreak modes end up wrapping on width with a
-// whitespace preference anyway.
-jint GetStringWidthHeightInRect_stub(jmethodID id, va_list args) {
-    jstring str_obj = va_arg(args, jstring);
-    va_arg(args, jint); // fontSize
-    va_arg(args, jint); // fontStyle
-    jint rectWidth = va_arg(args, jint);
-    va_arg(args, jint); // isBreak
-    jintArray value_arr = va_arg(args, jintArray);
+// Corrida 44/59: shared greedy word-wrap, O(n) single pass, preferring to
+// break at the last whitespace seen on the current line (mirrors the real
+// Java implementation's own word-boundary preference) when one is available.
+// Originally private to GetStringWidthHeightInRect_stub; factored out in
+// Corrida 59 so DrawTextInRect_stub's actual glyph rendering walks EXACTLY
+// the same lines GetStringWidthHeightInRect_stub already measured -- the
+// engine calls the two back to back and assumes they agree (SGL_Font_Android
+// ::RenderToTextureInRect sizes its texture from the first call's result,
+// then hands that same rect to the second).
+static const int INOTIA3_LINE_HEIGHT = 16;
 
-    if (!str_obj || !value_arr) return 0;
-
-    const unsigned char *str = (const unsigned char *) jni->GetStringUTFChars(&jni, str_obj, NULL);
-    jint *value = jni->GetIntArrayElements(&jni, value_arr, NULL);
-
-    size_t len = strlen((const char *) str);
+static void inotia3_wrap_lines(const unsigned char *str, size_t len, int rectWidth,
+                                void (*on_line)(void *ctx, size_t start, size_t end, int width),
+                                void *ctx) {
     if (rectWidth <= 0) rectWidth = 1;
-
-    const int line_height = 16;
-    int max_width = 0;
-    int total_height = 0;
     size_t i = 0;
     size_t line_start = 0;
     int line_width = 0;
@@ -263,8 +296,7 @@ jint GetStringWidthHeightInRect_stub(jmethodID id, va_list args) {
         int cw = inotia3_char_width(str, i, len, &advance);
 
         if (str[i] == '\n') {
-            if (line_width > max_width) max_width = line_width;
-            total_height += line_height;
+            on_line(ctx, line_start, i, line_width);
             i++;
             line_start = i;
             line_width = 0;
@@ -276,8 +308,7 @@ jint GetStringWidthHeightInRect_stub(jmethodID id, va_list args) {
             int have_space = (last_space != (size_t) -1 && last_space > line_start);
             size_t break_at = have_space ? last_space : i;
             int width_used = have_space ? width_at_last_space : line_width;
-            if (width_used > max_width) max_width = width_used;
-            total_height += line_height;
+            on_line(ctx, line_start, break_at, width_used);
             i = break_at;
             while (i < len && str[i] == ' ') i++;
             line_start = i;
@@ -294,16 +325,205 @@ jint GetStringWidthHeightInRect_stub(jmethodID id, va_list args) {
         i += advance;
     }
     if (i > line_start) {
-        if (line_width > max_width) max_width = line_width;
-        total_height += line_height;
+        on_line(ctx, line_start, i, line_width);
     }
-    if (max_width > rectWidth) max_width = rectWidth;
+}
 
+typedef struct {
+    int max_width;
+    int total_height;
+} inotia3_measure_ctx_t;
+
+static void inotia3_measure_line_cb(void *ctx_, size_t start, size_t end, int width) {
+    (void) start;
+    (void) end;
+    inotia3_measure_ctx_t *ctx = (inotia3_measure_ctx_t *) ctx_;
+    if (width > ctx->max_width) ctx->max_width = width;
+    ctx->total_height += INOTIA3_LINE_HEIGHT;
+}
+
+// WrapperJinterface.GetStringWidthHeightInRect(String, int, int, int, int,
+// int[]): int -- see the NameToMethodID comment (Corrida 44) for why this
+// needs a real implementation, not just a safe default. fontSize/fontStyle/
+// isBreak are ignored -- this port's bitmap font has one fixed per-byte
+// metric, not a scalable one, and both of the real isBreak modes end up
+// wrapping on width with a whitespace preference anyway.
+jint GetStringWidthHeightInRect_stub(jmethodID id, va_list args) {
+    jstring str_obj = va_arg(args, jstring);
+    va_arg(args, jint); // fontSize
+    va_arg(args, jint); // fontStyle
+    jint rectWidth = va_arg(args, jint);
+    va_arg(args, jint); // isBreak
+    jintArray value_arr = va_arg(args, jintArray);
+
+    if (!str_obj || !value_arr) return 0;
+
+    const unsigned char *str = (const unsigned char *) jni->GetStringUTFChars(&jni, str_obj, NULL);
+    jint *value = jni->GetIntArrayElements(&jni, value_arr, NULL);
+
+    size_t len = strlen((const char *) str);
+    if (rectWidth <= 0) rectWidth = 1;
+
+    inotia3_measure_ctx_t ctx = {0, 0};
+    inotia3_wrap_lines(str, len, rectWidth, inotia3_measure_line_cb, &ctx);
+
+    int max_width = ctx.max_width > rectWidth ? rectWidth : ctx.max_width;
     value[0] = max_width;
-    value[1] = total_height;
+    value[1] = ctx.total_height;
 
     jni->ReleaseStringUTFChars(&jni, str_obj, (char *) str);
     return max_width;
+}
+
+// Corrida 59: DrawTextInRect never being registered was the root cause of
+// EVERY piece of dynamically-drawn text in this port being invisible (menus,
+// HP, item names, save-slot text, dialogues) -- not just Hub-style rich text
+// as first suspected. Confirmed by tracing the real call chain in
+// out_ghidra.c: GRPX_DrawStringWithFont/GRPX_DrawString (the engine's ONLY
+// general-purpose text draw, used everywhere) -> SGL_grpDrawStringWithFont/
+// SGL_grpDrawStringInRectWithFontEx -> SGL_grpCreateStringImageInRect ->
+// SGL_Texture_Text::SetTextInRect -> SGL_Font_Android::RenderToTextureInRect
+// (:161897) -> SGL_RenderFontToAlphaImageInRect (:162636), which does:
+//   jDrawTextInRect(text, len, fontSize, 0, align, rectWidth, isBreak);
+//   puVar2 = jGetPixelBufferPointer();  // == DAT_0017dea4, cached ONCE
+//   for each row/col: *(alpha_dest) = (byte)(*puVar2++ >> 24);  // ARGB->A
+// jGetPixelBufferPointer() (out_ghidra.c:144072) is NOT a JNI call -- it just
+// returns a raw pointer the .so cached during nativeInit() from
+// GetIntArrayElements() on the `pixel[]` array main.c passes in (confirmed:
+// nativeInit's 3rd array arg lands in that exact global). That means
+// DrawTextInRect doesn't need to hand back a Bitmap/int[] through any new
+// JNI plumbing at all -- writing glyphs directly into
+// g_textview_pixel_buffer (main.c's own live pointer to that SAME array) IS
+// the render; the .so reads it back moments later through the pointer it
+// already has.
+//
+// Renders with THIS port's own bitmap font (FONT_pFontData, already loaded
+// by FONT_Load -- see Corrida 42) rather than a real TrueType rasterizer:
+// same glyph lookup GRP_PutAsciiChar uses (out_ghidra.c:20971-20999) -- 94
+// printable ASCII glyphs (0x21-0x7E) at `FONT_pFontData + 0xb10 +
+// (ch-0x21)*0xc`, 12 bytes/glyph, rows 1-9 of each record (row 0 and 10/11
+// are metrics this port doesn't need -- GRP_PutAsciiChar itself never reads
+// them either), 5 columns per row in bits 7-3, bit CLEAR ("0") means ink
+// (confirmed: the default/space glyph is memset to 0xFF, all bits set, and
+// draws nothing). Writes full-white ARGB (0xFFFFFFFF) for ink pixels --
+// SGL_RenderFontToAlphaImageInRect only ever reads the alpha byte (bits
+// 31-24), and the engine's real Paint-based renderer draws pure white too
+// (WrapperJinterface.DrawTextInRect's real Java sets ARGB 255/255/255/255
+// before drawing) -- the actual on-screen color comes from GRPX_SetFontColor/
+// SGL_Texture_Text's OWN tinting downstream, unaffected by this change.
+// Multi-byte/high-bit bytes are skipped (this font has no glyphs for them,
+// same as the real GRP_PutAsciiChar) rather than guessed at.
+//
+// The write stride is `rectWidth` (this call's own parameter), NOT
+// g_textview_width -- confirmed from the read side: SGL_RenderFontToAlphaImageInRect
+// advances its read pointer by exactly the width it was given
+// (`puVar2 = puVar2 + param_6`), and that width is the SAME value
+// SGL_Font_Android::RenderToTextureInRect computed (measured text width, or
+// the original rect width if isBreak) and threaded through unchanged as
+// jDrawTextInRect's own rectWidth argument -- so writing with any other
+// stride would desync from what gets read back. Bounds-checked against the
+// buffer's real capacity (g_textview_width * g_textview_height ints)
+// regardless, since nothing enforces that assumption from our side.
+typedef struct {
+    const unsigned char *str;
+    size_t len;
+    int rect_width;
+    int align; // 0 = left, 1 = center, 2 = right
+    int y;
+} inotia3_draw_ctx_t;
+
+static void inotia3_draw_glyph(unsigned char ch, int x, int y, int stride) {
+    if (!g_textview_pixel_buffer) return;
+    if (ch < 0x21 || ch > 0x7E) return; // space and non-ASCII: no glyph, draw nothing
+    unsigned glyph_idx = (unsigned) (ch - 0x21);
+    if (glyph_idx >= 0x5E) return;
+
+    static uintptr_t font_data_slot = 0;
+    if (!font_data_slot) font_data_slot = so_symbol(&so_mod, "FONT_pFontData");
+    if (!font_data_slot) return;
+    uint32_t font_base = *(uint32_t *) font_data_slot;
+    if (!font_base) return;
+
+    const uint8_t *glyph = (const uint8_t *) (uintptr_t) font_base + 0xb10 + glyph_idx * 0xc;
+    long buffer_capacity = (long) g_textview_width * (long) g_textview_height;
+
+    for (int row = 0; row < 9; row++) {
+        int py = y + row;
+        if (py < 0) continue;
+        uint8_t bits = glyph[1 + row];
+        for (int col = 0; col < 5; col++) {
+            if (((bits >> (7 - col)) & 1) != 0) continue; // bit set = background
+            int px = x + col;
+            if (px < 0 || px >= stride) continue;
+            long idx = (long) py * (long) stride + (long) px;
+            if (idx < 0 || idx >= buffer_capacity) continue;
+            g_textview_pixel_buffer[idx] = (jint) 0xFFFFFFFFu;
+        }
+    }
+}
+
+static void inotia3_draw_line_cb(void *ctx_, size_t start, size_t end, int width) {
+    inotia3_draw_ctx_t *ctx = (inotia3_draw_ctx_t *) ctx_;
+
+    int x0 = 0;
+    if (ctx->align == 1) x0 = (ctx->rect_width - width) / 2;
+    else if (ctx->align == 2) x0 = ctx->rect_width - width;
+    if (x0 < 0) x0 = 0;
+
+    int x = x0;
+    for (size_t i = start; i < end;) {
+        size_t advance;
+        int cw = inotia3_char_width(ctx->str, i, end, &advance);
+        inotia3_draw_glyph(ctx->str[i], x, ctx->y + 3, ctx->rect_width);
+        x += cw;
+        i += advance;
+    }
+    ctx->y += INOTIA3_LINE_HEIGHT;
+}
+
+jint DrawTextInRect_stub(jmethodID id, va_list args) {
+    jbyteArray s_obj = va_arg(args, jbyteArray);
+    va_arg(args, jint); // fontSize
+    va_arg(args, jint); // fontStyle
+    jint align = va_arg(args, jint);
+    jint rectWidth = va_arg(args, jint);
+    va_arg(args, jint); // isBreak
+
+    if (!s_obj || !g_textview_pixel_buffer) return 0;
+    if (rectWidth <= 0) rectWidth = 1;
+
+    jsize len = jni->GetArrayLength(&jni, s_obj);
+    jbyte *bytes = jni->GetByteArrayElements(&jni, s_obj, NULL);
+    if (!bytes) return 0;
+
+    // g_textview_pixel_buffer is one shared, reused-every-call scratch area
+    // (always written starting at index 0, row-major) -- without clearing
+    // it first, ink pixels left behind by a PREVIOUS, longer/taller string
+    // would bleed into whatever the caller reads back for THIS shorter one,
+    // since both draws start at the same buffer offsets. The real Android
+    // Canvas has the same shared-bitmap shape but starts fully transparent
+    // each time implicitly (a fresh region of an ARGB_8888 bitmap Android
+    // never explicitly repaints outside of drawText's own glyph coverage) --
+    // measure first (same wrap, so the cleared region always matches what
+    // this call is about to draw) to know how tall a region to zero.
+    inotia3_measure_ctx_t measure_ctx = {0, 0};
+    inotia3_wrap_lines((const unsigned char *) bytes, (size_t) len, rectWidth, inotia3_measure_line_cb,
+                        &measure_ctx);
+    long clear_pixels = (long) rectWidth * (long) measure_ctx.total_height;
+    long buffer_capacity = (long) g_textview_width * (long) g_textview_height;
+    if (clear_pixels > buffer_capacity) clear_pixels = buffer_capacity;
+    if (clear_pixels > 0) memset(g_textview_pixel_buffer, 0, (size_t) clear_pixels * sizeof(jint));
+
+    inotia3_draw_ctx_t ctx;
+    ctx.str = (const unsigned char *) bytes;
+    ctx.len = (size_t) len;
+    ctx.rect_width = rectWidth;
+    ctx.align = align;
+    ctx.y = 0;
+    inotia3_wrap_lines((const unsigned char *) bytes, (size_t) len, rectWidth, inotia3_draw_line_cb, &ctx);
+
+    jni->ReleaseByteArrayElements(&jni, s_obj, bytes, 0);
+    return 0;
 }
 
 // WrapperJinterface.Flush() -> wrapperRenderer.Flush() -> GLSurfaceView.
@@ -358,6 +578,7 @@ MethodsInt methodsInt[] = {
     { 36, GetScreenWidth_stub },
     { 37, GetScreenHeight_stub },
     { 46, GetStringWidthHeightInRect_stub },
+    { 49, DrawTextInRect_stub },
 };
 MethodsLong methodsLong[] = {
     { 38, GetMaxMemory_stub },
@@ -528,6 +749,18 @@ jobject GetNoticeHttp_stub(jmethodID id, va_list args) {
     return jni->NewStringUTF(&jni, "");
 }
 
+// Corrida 50: see nameToMethodId[]'s entries 47/48 above -- HUB_InitString
+// and its ~15 sibling call sites strcpy/strtok this result with no NULL
+// check, so it must never be NULL. An empty string renders as blank
+// Title/Message text on the Hub screen -- faithful no-op, not a guess.
+jobject GetStringFromXmlEx_stub(jmethodID id, va_list args) {
+    return jni->NewStringUTF(&jni, "");
+}
+
+jobject GetStringFromXml_stub(jmethodID id, va_list args) {
+    return jni->NewStringUTF(&jni, "");
+}
+
 MethodsObject methodsObject[] = {
     { 7, GetUserDir_stub },
     { 8, GetUserDir_stub },
@@ -547,6 +780,8 @@ MethodsObject methodsObject[] = {
     { 43, GetUDID_stub },
     { 44, GetPhoneNumber_stub },
     { 45, GetNoticeHttp_stub },
+    { 47, GetStringFromXmlEx_stub },
+    { 48, GetStringFromXml_stub },
 };
 MethodsShort methodsShort[] = {};
 

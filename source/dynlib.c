@@ -21,6 +21,7 @@
 #include <math.h>
 #include <netdb.h>
 #include <arpa/inet.h>
+#include <signal.h>
 #include <string.h>
 #include <wchar.h>
 #include <wctype.h>
@@ -134,6 +135,146 @@ void *dlsym_soloader(void * handle, const char * symbol) {
     return NULL;
 }
 
+// Corrida 51: log_2026-08-07's next crash after the Corrida 50 JNI fix is a
+// DIFFERENT failure -- Undefined Instruction, PC/LR both inside our OWN
+// _kill_r (VitaSDK newlib), R4 (the `sig` argument) == 8 == SIGFPE. Reading
+// _kill_r's disassembly: any signal other than SIGINT/SIGTERM/19/20 falls
+// through to a deliberate `udf #255` -- this is newlib's normal "can't
+// really deliver a signal, so trap" behavior for raise(SIGFPE), not memory
+// corruption. SIGFPE on ARM almost always means integer divide-by-zero
+// caught by the ARM RTABI's software division helpers. __aeabi_idiv/
+// __aeabi_uidiv are dynamic imports the .so calls into OUR statically-linked
+// copies (see default_dynlib[] below) -- so a division-by-zero anywhere in
+// libgame.so's own compiled code runs OUR division routine, which raises
+// SIGFPE exactly like this. The .psp2dmp's PC/LR are both several frames
+// too deep (inside _kill_r itself) to say WHICH .so function divided by
+// zero, and no fresh log survived this run to fill the gap. Rather than
+// guess, wrap __aeabi_idiv/__aeabi_uidiv (the two whose C ABI is a plain
+// `T foo(T, T)` returning just the quotient in r0 -- safe to wrap portably;
+// __aeabi_*divmod's multi-register r0+r1 return isn't expressible in C
+// without risking silently corrupting currently-working division elsewhere,
+// so those are intentionally left unwrapped for this pass) to log the
+// numerator/denominator and the .so's own return address
+// (__builtin_return_address(0), reliable here since these wrappers ARE the
+// direct import target the .so calls, not a deeper frame) whenever the
+// denominator is zero, then call straight through to the real
+// implementation -- unchanged behavior, just visible now. The next crash
+// dump/log will show exactly which .so offset divided by zero and with what
+// operands.
+typedef int (*fn_aeabi_idiv_t)(int, int);
+typedef unsigned int (*fn_aeabi_uidiv_t)(unsigned int, unsigned int);
+
+static int aeabi_idiv_checked(int numerator, int denominator) {
+    if (denominator == 0) {
+        l_fatal("Corrida 51: __aeabi_idiv(%d, 0) -- divide by zero, .so return address=%p",
+                numerator, __builtin_return_address(0));
+    }
+    return ((fn_aeabi_idiv_t) &__aeabi_idiv)(numerator, denominator);
+}
+
+static unsigned int aeabi_uidiv_checked(unsigned int numerator, unsigned int denominator) {
+    if (denominator == 0) {
+        l_fatal("Corrida 51: __aeabi_uidiv(%u, 0) -- divide by zero, .so return address=%p",
+                numerator, __builtin_return_address(0));
+    }
+    return ((fn_aeabi_uidiv_t) &__aeabi_uidiv)(numerator, denominator);
+}
+
+// Corrida 52: Corrida 51's wrappers never fired -- no log line, no matter
+// how many times the same SIGFPE crash (identical PC/LR/registers every
+// time) got reproduced. __aeabi_idiv/__aeabi_uidiv were the safe half of
+// that fix; __aeabi_idivmod/__aeabi_uidivmod (used instead whenever the
+// .so's original source computes BOTH a/b and a%b from the same division,
+// letting the compiler fold them into one call) were deliberately left
+// unwrapped since their ABI returns two values (quotient in r0, remainder
+// in r1) -- not a plain `T foo(T,T)`. A first attempt wrapped them as a
+// plain C function returning a 2-int struct, on the assumption AAPCS
+// returns such a small all-integer struct directly in r0:r1 (the technique
+// libgcc/compiler-rt/musl use to implement these very functions) -- but
+// checking the ACTUAL compiled output (`objdump -d` on the resulting
+// aeabi_idivmod_checked) showed arm-vita-eabi-gcc instead using the
+// generic "return via hidden pointer, shift real args to r1/r2" convention
+// for this call shape, which would have silently corrupted every working
+// __aeabi_idivmod call in the game the moment this shipped. Caught before
+// building/shipping it -- verify the disassembly, don't trust the ABI on
+// faith. A naked function with a hand-written asm trampoline sidesteps the
+// whole question: check r1 (denominator) for zero, and if so, preserve
+// r0/r1 across a normal call to a small logging helper (which only needs
+// plain scalar args, no struct-return ambiguity), then restore r0/r1 and
+// tail-branch into the real __aeabi_idivmod/__aeabi_uidivmod with the
+// exact same register state the .so's caller originally set up -- r0/r1
+// are never reinterpreted by anything except the real implementation.
+// __attribute__((used)): only referenced by name from inline asm below, which
+// the compiler can't see into -- without this it looks unused and the
+// optimizer strips it before the linker ever gets a chance to resolve the
+// asm's `bl log_divzero_idivmod` (confirmed: that's exactly what happened,
+// undefined reference at link time, on the first attempt without this).
+__attribute__((used)) static void log_divzero_idivmod(int numerator, void *caller) {
+    l_fatal("Corrida 52: __aeabi_idivmod(%d, 0) -- divide by zero, .so return address=%p",
+            numerator, caller);
+}
+
+__attribute__((used)) static void log_divzero_uidivmod(unsigned int numerator, void *caller) {
+    l_fatal("Corrida 52: __aeabi_uidivmod(%u, 0) -- divide by zero, .so return address=%p",
+            numerator, caller);
+}
+
+__attribute__((naked)) static void aeabi_idivmod_checked(void) {
+    __asm__ volatile (
+        "cmp r1, #0\n"
+        "bne 1f\n"
+        "push {r0, r1, lr}\n"
+        "mov r1, lr\n"
+        "bl log_divzero_idivmod\n"
+        "pop {r0, r1, lr}\n"
+        "1:\n"
+        "b __aeabi_idivmod\n"
+    );
+}
+
+__attribute__((naked)) static void aeabi_uidivmod_checked(void) {
+    __asm__ volatile (
+        "cmp r1, #0\n"
+        "bne 1f\n"
+        "push {r0, r1, lr}\n"
+        "mov r1, lr\n"
+        "bl log_divzero_uidivmod\n"
+        "pop {r0, r1, lr}\n"
+        "1:\n"
+        "b __aeabi_uidivmod\n"
+    );
+}
+
+// Corrida 53: Corridas 51/52 covered every *aeabi_i/uidiv(mod) entry point
+// the .so imports -- if the crash still isn't logged next run, the
+// division routine causing it isn't one of those four at all. Two
+// remaining possibilities: (a) __aeabi_ldivmod/__aeabi_uldivmod (64-bit
+// long long division -- RTABI mandates a non-standard quad-register
+// return, r0:r1=quotient r2:r3=remainder, not expressible as a same-sized
+// C struct like idivmod's r0:r1-only case, and rare enough in game code
+// that it's a lower-probability guess not worth the naked-asm complexity
+// yet), or (b) the .so was compiled with a private, statically-linked copy
+// of the division helper instead of importing one (some NDK toolchain/
+// version combos do this) -- so_util's dynlib table would never see it at
+// all, no matter how many *aeabi_* symbols get wrapped. Either way,
+// `raise()` (also a dynamic import already wired below -- see _kill_r's
+// own disassembly, confirmed calling straight into this same imported
+// symbol via newlib's _raise_r) is the ONE choke point every one of those
+// paths funnels through before the fatal `udf`. `raise(int)` is a plain
+// scalar-in/scalar-out signature -- no ABI risk wrapping it directly in C,
+// unlike the division helpers. Log every signal except the two _kill_r
+// itself treats as a clean exit (SIGINT=2/SIGTERM=15) together with the
+// caller's return address, then call straight through -- this catches the
+// crash regardless of which division routine (or something else raising a
+// signal entirely) is actually responsible.
+static int raise_checked(int sig) {
+    if (sig != 2 && sig != 15) {
+        l_fatal("Corrida 53: raise(%d) -- about to trap/exit, .so return address=%p",
+                sig, __builtin_return_address(0));
+    }
+    return raise(sig);
+}
+
 so_default_dynlib default_dynlib[] = {
         // Common C/C++ internals
         { "_ZNSt8bad_castD1Ev", (uintptr_t)&_ZNSt8bad_castD1Ev },
@@ -160,8 +301,8 @@ so_default_dynlib default_dynlib[] = {
         { "__aeabi_f2lz", (uintptr_t)&__aeabi_f2lz },
         { "__aeabi_f2ulz", (uintptr_t)&__aeabi_f2ulz },
         { "__aeabi_i2d", (uintptr_t)&__aeabi_i2d },
-        { "__aeabi_idiv", (uintptr_t)&__aeabi_idiv },
-        { "__aeabi_idivmod", (uintptr_t)&__aeabi_idivmod },
+        { "__aeabi_idiv", (uintptr_t)&aeabi_idiv_checked },
+        { "__aeabi_idivmod", (uintptr_t)&aeabi_idivmod_checked },
         { "__aeabi_l2d", (uintptr_t)&__aeabi_l2d },
         { "__aeabi_l2f", (uintptr_t)&__aeabi_l2f },
         { "__aeabi_ldivmod", (uintptr_t)&__aeabi_ldivmod },
@@ -178,8 +319,8 @@ so_default_dynlib default_dynlib[] = {
         { "__aeabi_memset4",  (uintptr_t)&__aeabi_memset4 },
         { "__aeabi_memset8", (uintptr_t)&__aeabi_memset8 },
         { "__aeabi_ui2d", (uintptr_t)&__aeabi_ui2d },
-        { "__aeabi_uidiv", (uintptr_t)&__aeabi_uidiv },
-        { "__aeabi_uidivmod", (uintptr_t)&__aeabi_uidivmod },
+        { "__aeabi_uidiv", (uintptr_t)&aeabi_uidiv_checked },
+        { "__aeabi_uidivmod", (uintptr_t)&aeabi_uidivmod_checked },
         { "__aeabi_ul2d", (uintptr_t)&__aeabi_ul2d },
         { "__aeabi_ul2f", (uintptr_t)&__aeabi_ul2f },
         { "__aeabi_uldivmod", (uintptr_t)&__aeabi_uldivmod },
@@ -984,7 +1125,7 @@ so_default_dynlib default_dynlib[] = {
 
         // Signals
         { "bsd_signal", (uintptr_t)&signal },
-        { "raise", (uintptr_t)&raise },
+        { "raise", (uintptr_t)&raise_checked },
         { "sigaction", (uintptr_t)&sigaction },
 
 

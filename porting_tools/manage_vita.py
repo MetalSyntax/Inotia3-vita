@@ -281,34 +281,42 @@ def download_latest_debug_files():
     else:
         print("[*] Omitiendo la descarga del crash dump.")
 
-    print("[*] Buscando el último log de Inotia 3 en ux0:/data/inotia3/logs...")
     latest_log = None
-    latest_log_time = 0
     try:
         ftp.cwd(VITA_LOGS_DIR)
+        valid_logs = []
         try:
             files = list(ftp.mlsd())
             for name, facts in files:
                 if name.endswith(".txt") or "log" in name.lower():
                     mtime = facts.get("modify", "0")
-                    if mtime > str(latest_log_time):
-                        latest_log_time = int(mtime) if mtime.isdigit() else mtime
-                        latest_log = name
+                    valid_logs.append((name, str(mtime)))
         except all_errors:
             file_list = []
             ftp.retrlines("LIST", file_list.append)
-            valid_logs = []
             for line in file_list:
                 parts = line.split()
                 if len(parts) >= 9:
                     name = " ".join(parts[8:])
                     if name.endswith(".txt") or "log" in name.lower():
-                        valid_logs.append(name)
-            if valid_logs:
-                valid_logs.sort()
-                latest_log = valid_logs[-1]
+                        valid_logs.append((name, "0"))
+                        
+        if valid_logs:
+            def log_sort_key(item):
+                filename, mtime = item
+                # Extraer número incremental (ej: log_001.txt -> 1)
+                match = re.search(r'log_(\d+)\.txt$', filename, re.IGNORECASE)
+                if match:
+                    # Priorizar archivos numéricos incrementales ordenados por su número entero
+                    return (1, int(match.group(1)))
+                # Para logs con timestamp u otro formato, usar (0, mtime/filename)
+                return (0, mtime if mtime != "0" else filename)
+
+            valid_logs.sort(key=log_sort_key)
+            latest_log = valid_logs[-1][0]
                         
         if latest_log:
+
             project_root = os.path.dirname(BASE_DIR)
             logs_folder = os.path.join(project_root, "logs")
             if not os.path.exists(logs_folder):
