@@ -1,57 +1,100 @@
-<h1 align="center">Inotia 3: Children of Carnia — PS Vita Port</h1>
+<h1 align="center">
+  <img src="extras/livearea/Pic0.png" alt="Inotia 3 PS Vita Startup Banner" width="700"><br>
+  Inotia 3: Children of Carnia · PS Vita Port
+</h1>
 
 <p align="center">
-  <img src="extras/livearea/Pic0.png" alt="Inotia 3 PS Vita Startup Banner" width="700">
+  <a href="#status--playability">Status & Playability</a> •
+  <a href="#setup-instructions-for-players">How to install</a> •
+  <a href="#controls">Controls</a> •
+  <a href="#known-issues">Known Issues</a> •
+  <a href="#build-instructions-for-developers">How to compile</a> •
+  <a href="#credits">Credits</a>
 </p>
 
-<p align="center">
-  <b>An unofficial Android-to-PS Vita wrapper port</b> of <i>Inotia 3: Children of Carnia</i> (originally by Com2uS) utilizing <b>so-loader</b> technology, <b>FalsoJNI</b>, and <b>vitaGL</b>.
-</p>
+An unofficial, native **Android-to-PS Vita wrapper port** of *Inotia 3: Children of Carnia* (originally developed by Com2uS). This port utilizes **so-loader** technology, **FalsoJNI**, and **vitaGL** to load the official ARMv6 shared library (`libgame.so`) directly in native PS Vita RAM.
 
 ---
 
-## 📖 Project Overview
+## 🎮 Status & Playability
 
-This repository contains a native wrapper port for the **PlayStation Vita** of the classic ARPG **Inotia 3: Children of Carnia** (Com2uS).
+**Status: FULLY PLAYABLE** (Offline Campaign)
 
-Instead of re-implementing the game engine or relying on heavy Java/Android emulation, this project uses **so-loader** (pioneered by TheOfficialFloW) to load the ARMv6 shared library (`libgame.so`) directly into PS Vita RAM. It bridges system calls, Android JNI calls, graphics, and audio through **FalsoJNI**, **vitaGL**, and custom C/C++ shims.
+The game has been thoroughly reverse-engineered and debugged across 77+ porting iterations on physical PS Vita hardware.
 
----
-
-## 📊 Current Port Progress & Status
-
-The port has progressed through extensive reverse-engineering of Com2uS's proprietary engine (`com.com2us.wrapper.*`) and hardware debugging on both physical Vita hardware and Vita3K.
-
-### Completed Milestones
-
-- [x] **Phase 1: Engine Analysis & Reverse-Engineering**  
-      Decompiled `.so` binary using Ghidra/angr. Mapped all 44 exported JNI symbols, dynamic dependencies, and understood the custom Com2uS 3-step native lifecycle (`nativePreInit` → `nativeInit` → native loop).
-- [x] **Phase 2: Loader & Bootstrap**  
-      Implemented `so_loader` memory relocation and JNI initialization. Configured full build system for VitaSDK (supporting GCC 15 toolchain).
-- [x] **Phase 3: Anti-Tamper Bypass & Initialization**  
-      Successfully bypassed internal anti-tamper security routines (`isCracked`, `excuteDirectly`, protection checks) via memory patching.
-- [x] **Phase 4: Graphics & Renderer (OpenGL ES 1.1 / vitaGL)**  
-      Mapped coordinates to Vita's native **960x544** panel. Implemented deferred `GL_FIXED` to `GL_FLOAT` array conversions (`glVertexPointer`, `glColorPointer`, `glTexCoordPointer`, `glClearColorx`, `glTexParameterx`) required for `vitaGL`. Enforced `GL_LINEAR` texture filtering for smooth visual output.
-- [x] **Phase 5: Input System**  
-      Wired PS Vita hardware touch interface (`sceTouchPeek`) to `nativeEvent()` with multi-touch slot tracking (supporting 0–4 active touch slots), matching `WrapperEventHandler.MultiTouchListener`.
-- [x] **Phase 6: Asset Pipeline & File I/O**  
-      Hooked path resolution (`GetFullPathName`, `GetUserDir`, `GetPackageName`) to load extracted assets directly from `ux0:data/inotia3/` as loose files (or fallback to `.apk` offset parsing). Fixed memory-mapping issues for resource packages.
-- [x] **Phase 7: Memory & Memory-Allocator Fixes**  
-      Resolved critical `__stack_chk_fail` canary triggers and Out-Of-Memory crashes by tuning `sceLibcHeapSize` (16MB), `_newlib_heap_size_user` (256MB), and main thread stack size (4MB), as well as fixing signedness pointer checks (`RES_LoadToHeap` / `RES_MoveToFilePack`).
-- [x] **Phase 8: Text Wrapping & String Metrics**  
-      Implemented native C fallback for JNI string dimension checks (`GetStringWidthHeightInRect`), resolving lore text wrapping and font loading bottlenecks (`FONT_Load`).
-- [x] **Phase 9: Audio Pipeline**  
-      Implemented native OGG audio decoding (`libogg` / `Tremor` portlibs) mapped directly to `sceAudioOut`.
+- [x] **Full Campaign Playable**: Story progression, party management, skills, combat, and map transitions are 100% functional.
+- [x] **Native 960x544 Visuals**: Fullscreen rendering via `vitaGL` (GLES 1.1 fixed-function pipeline with `GL_FIXED` to `GL_FLOAT` conversion and `GL_LINEAR` texture filtering).
+- [x] **Touch & Physical Controls**: Complete dual-input support (D-Pad, Analog Stick, and Action Buttons mapped to on-screen controls, alongside full front touchscreen multi-touch support).
+- [x] **Native Audio**: BGM and sound effects decoded via `Tremor` / `libogg` portlibs.
+- [x] **Save System**: Saved games persist directly as loose `.dat` files (`ux0:data/inotia3/save<N>.dat`).
+- [x] **Offline Bypasses**: Anti-tamper/protection routines (`excuteDirectly`, `jIsCracked`) and online ad/hub loops (`Extend_CheckAdvDisplay`, `HubInitialize`) are safely bypassed.
 
 ---
 
-## 🛠️ Building from Source
+## Disclaimer
+
+**Inotia 3: Children of Carnia** is a registered trademark of **Com2uS**. The work presented in this repository is unofficial and is not produced, endorsed, or sanctioned by Com2uS or any affiliated entities.
+
+This software does NOT contain original game source code, compiled binaries (`libgame.so`), copyrighted graphics, or game assets. The authors do not promote or condone piracy in any way. To launch and play the game on your PS Vita, you must provide your own legally obtained copy of the Android `.apk`.
+
+---
+
+## Setup Instructions (For Players)
+
+To install and run the game on your PS Vita:
+
+1. **CFW & Plugins**: Ensure your PS Vita is running Custom Firmware (**Enso 3.60 / 3.65** recommended). Install the required kernel plugins in your `ur0:tai/config.txt` under `*KERNEL`:
+   ```ini
+   *KERNEL
+   ur0:tai/kubridge.skprx
+   ur0:tai/fd_fix.skprx
+   ```
+2. **Shader Compiler**: Verify that `libshacccg.suprx` is present in `ur0:data/`. If missing, extract it using **ShaRKBR33D**.
+3. **Obtain Game Files**: Legally obtain a copy of the **Inotia 3: Children of Carnia** Android APK (tested version: `inotia3-1-3-2.apk`).
+4. **Extract Assets & Native Library**:
+   - Open the `.apk` using any ZIP archive tool (e.g., 7-Zip).
+   - Copy `lib/armeabi/libgame.so` to:
+     `ux0:data/inotia3/libgame.so`
+   - Copy the extracted `assets/` folder contents to:
+     `ux0:data/inotia3/assets/`  
+     *(Alternatively, place extracted game resources under `ux0:data/inotia3/assets/common/game_res/`)*
+5. **Install VPK**: Download and install `inotia3.vpk` on your console via VitaShell.
+
+---
+
+## Controls
+
+The port supports both hardware buttons (mapped directly to on-screen UI positions) and direct touchscreen interaction:
+
+| Button | Action |
+| :---: | :--- |
+| **D-Pad / Left Analog** | Character Movement (Up / Down / Left / Right) |
+| **Cross (`✕`)** | Attack / Confirm / Action |
+| **Circle (`◯`)** | Secondary Skill / Cancel |
+| **Square (`▢`)** | Skill / Quick Slot |
+| **Triangle (`Δ`)** | Special Skill / Quick Slot |
+| **L / R Triggers** | Quick Slots / Target Toggle |
+| **Start** | Pause Menu / System |
+| **Select** | Map / Character Info |
+| **Front Touchscreen** | Full Touch UI Navigation & Direct Movement |
+
+---
+
+## Known Issues
+
+- **Online Hub / Store Disabled**: Online networking functions (Com2uS Hub, In-App Purchases, and News Banners) are disabled by design for offline stability.
+- **Save File Placement**: Save files are written directly to `ux0:data/inotia3/save<N>.dat` rather than subdirectories to ensure reliable persistence across sessions.
+
+---
+
+## Build Instructions (For Developers)
 
 ### Prerequisites
 
-- [VitaSDK](https://vitasdk.org/) installed and set up in your system environment (`$VITASDK`).
+- [VitaSDK](https://vitasdk.org/) with `softfp` support configured in your system environment (`$VITASDK`).
+- CMake 3.10+ and GCC 15 toolchain (or `vdpm` softfp environment).
 
-### Compilation Instructions
+### Compilation Commands
 
 ```bash
 # Clone the repository
@@ -66,30 +109,15 @@ cmake ..
 make
 ```
 
-> **GCC 15 Compatibility Note**: `CMakeLists.txt` automatically applies `-fpermissive`, `-Wl,--no-warn-mismatch`, and `-Wl,--allow-multiple-definition` flags to handle strictness and ABI compatibility in modern VitaSDK toolchains.
+> **GCC 15 / VitaSDK Note**: `CMakeLists.txt` automatically includes flags (`-fpermissive`, `-Wl,--no-warn-mismatch`, `-Wl,--allow-multiple-definition`) required for ABI compatibility and softfp interop.
 
 ---
 
-## ⚙️ Installation & Setup (Legal Notice)
-
-> **IMPORTANT**: This repository **does NOT contain any copyrighted game assets or the proprietary `libgame.so` binary file**. You must provide your own legally acquired copy of the Android APK.
-
-### Setup Instructions
-
-1. Obtain a legally purchased copy of **Inotia 3: Children of Carnia** Android APK (tested version: `inotia3-1-3-2.apk`).
-2. Extract `libgame.so` from `lib/armeabi/libgame.so` within the APK and copy it to your PS Vita at:  
-   `ux0:data/inotia3/libgame.so`
-3. Extract the `assets/` directory from the APK and place its contents into:  
-   `ux0:data/inotia3/assets/`  
-   _(Or place extracted assets under `ux0:data/inotia3/assets/common/game_res/`)_
-4. Build or download `inotia3.vpk` and install it on your PS Vita using VitaShell (or load it in Vita3K).
-
----
-
-## 📜 Credits & Acknowledgments
+## Credits & Acknowledgments
 
 - **Inotia 3: Children of Carnia** is intellectual property of **Com2uS**.
-- **so_loader** framework by [TheOfficialFloW](https://github.com/TheOfficialFloW/so_loader).
+- **Android SO Loader** framework by [TheOfficialFloW](https://github.com/TheOfficialFloW/so_loader).
 - **vitaGL** graphics library by [Rinnegatamante](https://github.com/Rinnegatamante/vitaGL).
 - **FalsoJNI** library by [Rinnegatamante](https://github.com/Rinnegatamante/FalsoJNI).
-- Special thanks to the PS Vita homebrew and porting community for tools, guides, and testing support.
+- **kubridge** plugin by [Bythos](https://github.com/bythos14/kubridge).
+- Special thanks to the PS Vita homebrew and porting community.
