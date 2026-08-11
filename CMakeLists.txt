@@ -74,6 +74,7 @@ add_executable(${CMAKE_PROJECT_NAME}
                source/patch.c
                source/wr_timer.c
                source/wr_touch.c
+               source/audio.c
                source/reimpl/apk_zip.c
                source/reimpl/jmp_shim.S
                source/reimpl/jmp_shim_log.c
@@ -119,6 +120,8 @@ target_link_libraries(${CMAKE_PROJECT_NAME}
                       SceShaccCgExt
                       taihen_stub
                       SceShaccCg_stub
+                      vorbisidec
+                      ogg
                       z
                       m
                       ScePgf_stub

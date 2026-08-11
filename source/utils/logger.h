@@ -45,6 +45,13 @@ extern "C" {
 void _log_print(int t, const char* fmt, ...)
                 __attribute__ ((format (printf, 2, 3)));
 
+// Corrida 67: spawns a low-priority background thread that force-flushes the
+// in-memory log ring on a fixed cadence, independent of whether the main
+// thread ever calls _log_print() again. Call once, as early as possible in
+// main() -- see logger.c for why the Corrida 65 periodic-flush check (done
+// only inside _log_print() itself) can't survive a true main-thread hang.
+void logger_start_watchdog(void);
+
 #ifdef __cplusplus
 };
 #endif

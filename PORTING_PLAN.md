@@ -2552,6 +2552,874 @@ decompilado ante cualquier crash con `.psp2dmp`.
 > (`:58509-58510`) sigue siendo la ÚLTIMA función conocida con este mismo patrón de riesgo todavía sin
 > confirmar -- si aparece un nuevo bloqueo, revisarla primero antes de investigar desde cero.
 
+> **Corrida 61 (2026-08-10) — Nuevo reporte del usuario: el touch deja de funcionar y el personaje se
+> detiene al llegar a otro stage después de terminar el tutorial, pero el juego sigue corriendo (no crashea,
+> no se congela el render). Auditoría estática completa del patrón de bug de signo ya conocido más las
+> transiciones de stage/evento; se arregló una instancia confirmada pero no relacionada, y se agregó
+> instrumentación dirigida para el bug real porque el análisis estático solo no alcanza para confirmarlo.**
+> Nota primero: `source/patch.c` ya tenía, sin que este archivo lo documentara, fixes hasta la Corrida 58
+> (`GAMELOADER_Install`/`FILEPACK_Install`/`RES_MoveToFileEx`/`GAMELOADER_ProcessInstall` en la 48,
+> `EXCELDATA_LoadFullResource` en la 49, `__udivsi3`/SIGFPE en la 54, `SGL_Util::GetGLSize` en la 55,
+> `MAP_LoadAllToHeap`/`MAP_LoadFromHeap`/`MAP_DestroyFromHeap` en la 56, `UTIL_LoadSpriteListFromResource` en
+> la 57, `GRP_PutAsciiChar`/`GRP_DrawPixel` en la 58) -- este documento se había quedado atrás desde la
+> Corrida 47. No se reconstruyen esas entradas retroactivamente acá (no es el objetivo de esta corrida), pero
+> quede constancia de que la numeración salta de 47 a 61 porque el código, no la documentación, es la fuente
+> de verdad real del progreso.
+>
+> Re-audité los 6 call sites de `RES_LoadToHeap` en todo el decompile (`out_ghidra.c`, 214k líneas):
+> `RES_LoadToPool` (`:23497`, Corrida 42), `RES_MoveToFilePack` (`:23423`, Corrida 47),
+> `EXCELDATA_LoadFullResource` (`:58509`, Corrida 49), `MAP_LoadAllToHeap` (`:68493`, Corrida 56) y
+> `UTIL_LoadSpriteListFromResource` (`:104080`, Corrida 57) ya estaban arreglados y los volví a verificar
+> línea por línea contra el fix real -- todos fieles, sin bugs nuevos introducidos por los fixes mismos. El
+> sexto call site, `SOUND_Create` (`:91479-91491`, carga un `.mmf` desde `SOUNDSYSTEM_PlayEx`), NO estaba
+> cubierto por ninguna Corrida anterior y tiene el mismo idiom exacto (`if (-1 < iVar1)` sobre el retorno de
+> `RES_LoadToHeap`). Arreglado en esta misma corrida siguiendo el precedente de la Corrida 56 ("arreglar
+> todos los call sites confirmados de una pasada"), pero esto es SOLO audio -- no tiene ningún camino de
+> vuelta hacia `GAMESTATE_nState`, `MAP_nID` ni el despacho de input, así que no se cree que sea el bug
+> reportado.
+>
+> Para el bug real, rastreé cada candidato estático plausible para que una transición de stage bloquee el
+> input mientras el render sigue vivo:
+> - `GAMESTATE_SetState` (`out_ghidra.c:110912-111157`), el dispatcher detrás de
+>   `GAMESTATE_fpProcess`/`fpPressKey`/`fpDraw` que `STATE_ProcessGame` llama cada tick
+>   (`:111249-111280`) -- cada `case` del switch pone su propio trío de punteros; ningún case alcanzable
+>   durante gameplay deja los tres en NULL para siempre como el bug de `STATE_fpProcess` de la Corrida 33.
+> - `SURFACE_nType`/`SURFACE_Process` (`:101949-102039`), que SÍ bloquea `GAMESTATE_fpProcess`/`fpPressKey`
+>   por completo mientras está activo (`GAMESTATE_Process`/`GAMESTATE_PressKey`, `:111235-111245`/
+>   `111161-111208`) -- pero es un simple contador de fade de ±25 por tick sin ninguna dependencia de carga
+>   de recursos, se autolimpia a 0 en como máximo 4 ticks. Descartado como riesgo de traba permanente.
+> - `MAP_Load` (`out_ghidra.c:69704-69829`), al que se llega desde `MAPSYSTEM_ChangeMap` Y directamente desde
+>   el intérprete de scripts de evento (`EVTSYSTEM_Process` opcode `0xa`, `:52724-52731` -- exactamente el
+>   tipo de comando que un evento de fin-de-tutorial usaría para mandar al jugador al siguiente stage).
+>   `MAP_Load` es `void` y no devuelve nada: si `MAP_LoadFromHeap(param_1, ...)` falla (`:69724-69728`,
+>   `if (iVar5 == 0) return;`), `MAP_Load` corta ANTES de `MAP_nID = param_1`, `MAP_SetFocus`,
+>   `CHARLOCSYSTEM_Load` o `EVTSYSTEM_CheckOnMapLoad` -- y NINGUNO de sus llamadores (`MAPSYSTEM_ChangeMap`,
+>   `EVTSYSTEM_Process`) revisa esto, así que el script de evento (y el GAMESTATE) siguen como si la carga
+>   hubiera funcionado. Esto es un gap de diseño real y confirmado por el decompile que explicaría
+>   exactamente "llegó a un stage nuevo, el juego sigue corriendo, el personaje/touch no hacen nada" si los
+>   datos del mapa de destino quedan medio inicializados. SIN EMBARGO: `MAP_LoadFromHeap`/`MAP_LoadAllToHeap`
+>   ya se re-verificaron línea por línea contra el fix de la Corrida 56 (`:68386-68540`) y son fieles -- no
+>   hay evidencia estática de POR QUÉ cargar el mapa de un stage específico fallaría. Adivinar un fix acá sin
+>   esa evidencia arriesgaría enmascarar un problema real de datos/lógica en vez de arreglarlo (la instrucción
+>   de esta tarea es explícita: no adivinar y enviar sin poder justificarlo).
+>
+> En vez de elegir una de estas hipótesis y enviar un fix no verificable, se agregó logging barato y
+> disparado por transición (no por frame) que va a mostrar EXACTAMENTE dónde queda trabado el juego en el
+> próximo log de hardware (`source/patch.c`, todo bajo el mismo estilo que el hook de `MainProcess` de las
+> Corridas 45/46 que convirtió una sospecha en una causa raíz confirmada):
+> - `GAMESTATE_SetState_hook`: loguea cada transición de gamestate solicitada junto con
+>   `GAMESTATE_nState`/`STATE_nState`/`MAP_nID`/`EVTSYSTEM_nID`/`EVTSYSTEM_nState` en ese momento (cap 200).
+> - `EVTSYSTEM_SetState_hook`: loguea cada transición del sub-estado del script de evento (0-8,
+>   `out_ghidra.c:52163-...`) -- el estado 6 es "evento completo, devolver control a
+>   `GAMESTATE_SetState(2)`" (`:52304-52323`); si el log termina antes del 6, el script de evento nunca
+>   terminó.
+> - `MAP_Load_hook`: loguea el id de mapa pedido y el valor real de `MAP_nID` justo después de que la llamada
+>   real retorna -- si no coinciden, `MAP_LoadFromHeap` falló en silencio para ese stage específico,
+>   confirmando la hipótesis de arriba con un número real en vez de un tal vez.
+> - `MAP_LoadFromHeap_hook` (ya existente desde la Corrida 56) ahora también loguea el id de mapa pedido y la
+>   cantidad de registros que leyó de `map.dat`, para detectar de inmediato un id fuera de rango.
+> Todos los hooks llaman directo a las funciones reales (`SO_CONTINUE`/`SO_CONTINUE_VOID`) sin cambiar
+> comportamiento -- es solo instrumentación. Build compilado y verificado (cross real vía VitaSDK,
+> `rsync` a `/tmp/inotia3-src`/`/tmp/inotia3-build`, `cmake -DCMAKE_BUILD_TYPE=Release` +
+> `make -j8`, 2026-08-10): `inotia3.vpk`/`eboot.bin`/`inotia3` (ELF) generados sin errores; una pasada
+> adicional con `-Wall -Wextra` solo mostró warnings de "variable no usada" idénticos en naturaleza a los
+> que YA existen en los hooks previos (Corridas 45, 35, 36, 41, 58) cuando el nivel de log está desactivado
+> -- ningún warning nuevo de una categoría distinta.
+>
+> **Pendiente**: redeployar, reproducir (terminar el tutorial y llegar al stage nuevo hasta que se repita el
+> freeze), mandar el log nuevo. Buscar, en orden de utilidad:
+> 1. La última línea `Corrida 61: GAMESTATE_SetState(...)` antes de que el input deje de responder -- el
+>    `new_state` pedido ahí es el estado en el que probablemente queda trabado el juego.
+> 2. Si esa línea pide el estado `0xd` (13, Event) o `0x2b` (43, MapChange) y no hay ninguna transición de
+>    `GAMESTATE_SetState` después: revisar las líneas `Corrida 61: EVTSYSTEM_SetState(...)` alrededor de esa
+>    marca de tiempo para ver en qué sub-estado del script de evento se quedó colgado.
+> 3. Las líneas `Corrida 61: MAP_Load(...) returned -- MAP_nID is now ... (loaded|SILENTLY FAILED...)` y
+>    `Corrida 61: MAP_LoadFromHeap(map_id=...) -- map.dat record count=... (in range|OUT OF RANGE)` cerca de
+>    la transición de stage -- si dicen `SILENTLY FAILED` u `OUT OF RANGE`, la hipótesis de `MAP_Load` de
+>    arriba queda confirmada con datos reales y el próximo paso es arreglar `MAP_Load`/sus llamadores para
+>    que propaguen el fallo en vez de tragárselo.
+> Si ninguna de las tres pistas anteriores muestra nada anómalo (transiciones normales, `MAP_nID` coincide,
+> conteo en rango), el bug está en otra parte todavía no instrumentada (posiblemente dentro de
+> `GAMESTATE_ProcessPlay`/`GAMESTATE_PressKeyPlay` mismos, o en el sistema de pathing `CHAR_SearchPathAsLocation`
+> que `EVTSYSTEM_Process` también usa) y haría falta una segunda ronda de instrumentación con ese log como
+> punto de partida.
+
+> **Corrida 62 (2026-08-10) — Reporte de usuario: "no puedo guardar el juego durante la partida, dice
+> failed". Causa raíz real encontrada por análisis estático puro (sin pista en el log:
+> `logs/log_006.txt`, 166303 líneas, búsqueda insensible a mayúsculas por "save"/"failed", cero
+> coincidencias) -- `CS_fsOpen` nunca crea el subdirectorio de guardado que el propio juego compone, y la
+> única función que sí lo haría (`HubSave_ProcessInitialize`) se autodesactiva silenciosamente en este port,
+> por diseño y no por accidente.** `SAVE_ProcessSave` (`out_ghidra.c:82727-82753`, el menú de Guardar en
+> partida) llama a `SAVE_Save()` (`:82665-82723`) y muestra el TextData `0xc` ("éxito") o `0xd` ("failed")
+> únicamente según su valor de retorno. `SAVE_Save` → `SAVE_SaveData` (`:82253-82262`) →
+> `SAVE_SaveDataAsKey` (`:82234-82249`) → `SAVE_GetSaveFileName` (`:82018-82045`), que construye el nombre
+> real como `"<MD5(HubSave_GetKey())>/save<N>.dat"` vía `HubSave_GetFolderName` (`:124328-124359`) +
+> `HubSave_MakeFullName` (`:124212-124222`) -- **siempre** con subdirectorio, nunca un archivo suelto,
+> porque `HubSave_GetFolderName` solo revisa que el puntero de la clave no sea `NULL` (nunca lo es:
+> `HubSave_key` es un buffer estático que existe siempre, aunque esté vacío). Ese path relativo llega a
+> `SAVE_SaveDataAsNameAndKey` (`:80860-80884`) → `FILE_Open(path, 4, 1)` → `CS_fsOpen` (`:154900-154967`),
+> que para un nombre relativo construye el destino real como `jGetUserDir()+jGetPackageName()+"/"+path`
+> (`"ux0:data/inotia3/<md5>/save<N>.dat"` en este port -- `GetUserDir_stub`/`GetPackageName_stub`,
+> `source/java.c`) y llama a un `open(..., O_CREAT|...)` de libc plano -- que, como cualquier `open()`
+> POSIX, **no crea los directorios padre que falten**. Si `"<md5>/"` nunca se creó, `open()` falla con
+> `ENOENT`, `FILE_Open` devuelve negativo, `SAVE_SaveDataAsNameAndKey` devuelve `0`, y ese fracaso se
+> propaga sin cambios hasta el popup "failed" de `SAVE_ProcessSave` -- coincide exactamente con el reporte.
+>
+> Lo único que crea ese subdirectorio es `HubSave_MakeFolder` (`:124226-124239`, un wrapper simple de
+> `CS_fsIsExist`/`CS_fsMkDir`), llamado desde `HubSave_ProcessInitialize` (`:124414-124470`, el arranque de
+> Hub al iniciar la app) -- pero **solo** si `HubSave_LoadKey()` (`:124296-124324`) tiene éxito.
+> `HubSave_LoadKey` llama a `CS_hlpGetAppProperty("uniqueUserId", ...)` (`:156047-156103`, reenvía a
+> `jGetAppProperty()` propio del `.so`, `:146811-146843`) y, si falla, a
+> `CS_knlGetSystemProperty("UDID", ...)` (`:157477-157559`, reenvía a `jGetUDID()`, `:145848-145877`) --
+> ambas resuelven su método Java vía `GetMethodID(cls, "GetAppProperty"/"GetUDID", ...)` a través de
+> FalsoJNI. Por la política ya documentada en el propio `source/java.c` (comentario de cabecera: "dejar el
+> nombre sin registrar es la opción segura por defecto... hasta que un log real en hardware confirme cuáles
+> se llaman de verdad y necesitan un handler real"), `"GetAppProperty"`/`"GetUDID"` **no** están registrados
+> en `methodsInt`/`methodsLong` (grep sobre `source/java.c` y `lib/falso_jni`: cero coincidencias para
+> cualquiera de los dos nombres) -- así que `GetMethodID` devuelve `NULL` correctamente para ambos,
+> `jGetAppProperty()`/`jGetUDID()` toman su rama de "método no encontrado" y devuelven `-1`/`0xffffffff`.
+> Eso hace que `HubSave_LoadKey()` falle (`HubSave_key` queda en todo ceros -- string vacío, pero puntero NO
+> nulo), así que `HubSave_ProcessInitialize` imprime su traza `"2"` y retorna **sin** llamar nunca a
+> `HubSave_MakeFolder`. Esto es Hub/login social -- ya marcado en `CLAUDE.md` como subsistema
+> no-op-hasta-que-se-demuestre-necesario para este port offline de un jugador -- quedándose dormido
+> correctamente, un resultado razonable y funcionando-según-lo-diseñado... hasta que `SAVE_GetSaveFileName`,
+> de forma totalmente independiente, sigue calculando un nombre de subdirectorio real y determinístico (MD5
+> de la clave vacía) y le pasa a `CS_fsOpen` una ruta dentro de un directorio que nadie creó nunca.
+>
+> **Fix aplicado** (`source/patch.c`, función `CS_fsOpen_hook` + hook `h_CS_fsOpen` registrado en
+> `so_patch()`): en vez de reimplementar `SAVE_Save`/`SAVE_GetSaveFileName`/`HubSave_*` (varias funciones
+> fuertemente acopladas, más la tabla de errno→código de error propia de `CS_fsOpen`, cuyos valores reales
+> viven en el `.data` del `.so` y preferimos no transcribir a mano), se hookeó `CS_fsOpen` directamente --
+> exportada (confirmado con `nm -D` sobre el `libgame.so` real de `inotia3-1-3-2`: `000f527c T CS_fsOpen`) y
+> el único punto de paso de TODAS las escrituras nativas de archivo de este `.so`
+> (`review.dat`/`hubcheck.sav`/`StoreConFirm.sav`/`langtype.dat`/`StoreState.sav`/`Com2usProtection.sav`/
+> `save<N>.dat` -- se revisó cada call site). El hook, antes de llamar a la función real sin modificar (vía
+> `SO_CONTINUE`), reconstruye el mismo path absoluto que `CS_fsOpen` compondría (usando las mismas
+> `jGetUserDir`/`jGetPackageName` reales del `.so`, ya resueltas en este archivo desde la Corrida 21) y, si
+> el modo de apertura implica creación (`2`/`4`/`8` -- confirmado leyendo cada rama,
+> `:154917/154927/154931/154946`), llama a `file_mkpath()` (`source/utils/utils.c`, ya existente en este
+> port justo para esto) sobre esa ruta antes de que la función real intente el `open()`. `file_mkpath()` es
+> idempotente (`errno==EEXIST` cuenta como éxito), así que esto no cambia nada para los archivos que ya
+> viven directamente bajo `ux0:data/inotia3/` -- solo repara los casos con subdirectorio faltante, sea el
+> guardado o cualquier otro caso no observado todavía. No se tocó ni una línea de
+> `SAVE_*`/`HubSave_*`/`CS_fsOpen` mismos, ni se implementaron `GetAppProperty`/`GetUDID` (eso seguiría
+> siendo un cambio mucho más grande y no necesario para este bug puntual). Build compilado y verificado
+> (cross real vía VitaSDK, `build/inotia3.vpk`/`eboot.bin`/`inotia3.elf`, 2026-08-10) -- sin errores ni
+> warnings nuevos.
+>
+> **Pendiente**: redeployar, reproducir (guardar durante una partida), mandar el log nuevo. Si el fix
+> funciona, el guardado debería mostrar el TextData `0xc` ("éxito") en vez de `0xd`, y el archivo
+> `ux0:data/inotia3/<hash>/save<N>.dat` debería existir después en la consola. Si TODAVÍA falla, buscar en
+> el log nuevo las líneas `Corrida 62: CS_fsOpen(...)` (agregadas en este mismo fix, nivel debug) -- dirán
+> exactamente qué ruta se intentó crear y si `file_mkpath()` tuvo éxito; si `file_mkpath()` tiene éxito pero
+> el `open()` real de todas formas falla, el problema estaría en otro punto de la cadena (p.ej.
+> `SAVE_AllocateMemory`/el pool de tamaño fijo que usa `SAVE_Save`, o el propio contenido cifrado que
+> `SAVE_SaveDataAsNameAndKey` escribe) y habría que investigar eso a continuación con el log en mano. Esta
+> es, como todo lo demás en esta sección, una corrección respaldada por el decompile pero **no verificada
+> en hardware/emulador real** -- no se puede confirmar "arreglado" hasta ese round trip.
+
+> **Corrida 63 (2026-08-10) — Reporte de usuario: "el juego no tiene sonido". Causa raíz: el subsistema de
+> audio real (Fase 7, `source/audio.c`) nunca estuvo conectado a nada -- ni el motor lo llamaba (los 9 ids
+> JNI de sonido estaban wireados a no-ops desde la Corrida ~33) ni `audio_init()` se invocaba jamás desde
+> `main.c`. Revisado el resto de la sección Fase 9 completa (incluida la Corrida 47 arriba, la entrada más
+> reciente): la razón original para desconectar audio -- descartar el mixer thread como variable mientras se
+> triageaba el crash de stack-protector en `png_create_read_struct_2` -- quedó resuelta en la Corrida 47
+> (bug de signo real en `RES_MoveToFilePack`, nada que ver con audio/threads). No hay ninguna nota posterior
+> a la Corrida 47 que reintroduzca sospecha sobre audio específicamente, así que se procedió a reconectarlo.**
+>
+> **Cambios aplicados:**
+> 1. `source/main.c` (~línea 177, antes de `wr_timer_reset()`/`nativeInit()`): se agregó `#include "audio.h"`
+>    y una llamada a `audio_init()` -- tiene que correr ANTES de `nativeInit()` porque `startClet()` (que
+>    corre DENTRO de `nativeInit()`) puede llamar a `SoundCreate`/`SoundPlay` inmediatamente, igual que ya
+>    pasa con `wr_timer_reset()` en el comentario justo debajo.
+> 2. `source/java.c`: se eliminaron `SoundCreate_stub`, `Sound_NoopOk` y `SoundGetVolume_stub` (y el contador
+>    `g_next_sound_handle`, ya sin uso) y se agregaron 9 wrappers reales (`SoundCreate_wrapper` ...
+>    `SoundPrepare_wrapper`) que desempacan el `va_list` según la firma confirmada de cada id (comentarios ya
+>    existentes junto a los ids 27-35) y llaman directo a `audio_sound_create/destroy/play/pause/resume/
+>    stop/set_volume/get_volume/prepare()` de `audio.h`. `jboolean` (parámetro `loop` de SoundCreate/
+>    SoundPlay) se desempaca con `va_arg(args, jint)`, igual que el resto de flags booleanos ya existentes en
+>    este archivo (ver `DrawTextInRect_stub`) -- en la ABI variádica de ARM32 se promueve a `int`, no hay
+>    overload de tipo `jboolean` real en ningún otro `va_arg` de este archivo. La tabla `methodsInt[]` (ids
+>    27-35) ahora apunta a los 9 wrappers reales en vez de los no-ops.
+> 3. **Segundo bloqueador encontrado y corregido**: `audio_sound_create()` hace `fopen()` directo sobre lo
+>    que se le pase -- la resolución de la ruta real tiene que pasar en el wrapper de JNI, no en `audio.c`
+>    (igual que ya hace `GetFileDescriptor_stub` para imágenes, líneas ~671-725 de este mismo archivo). Se
+>    agregó `inotia3_resolve_sound_path()`, que prueba (a) la ruta tal cual, (b) `INOTIA3_LOOSE_ASSETS_PATH +
+>    nombre`, y (c) `INOTIA3_LOOSE_ASSETS_PATH + nombre + ".jpg"` (el mismo `INOTIA3_RES_NAME_APPEND` que ya
+>    usa el camino de imágenes, confirmado funcionando desde que el port llega a la pantalla de carga).
+>    **Nota importante que contradice el propio comentario de cabecera de `audio.h`**: ese comentario dice
+>    que el sufijo `.jpg` "debe stripearse al preparar los assets en la Vita" -- pero el ÚNICO mecanismo de
+>    esta base de código que ya funciona de forma confirmada (`GetFileDescriptor_stub`, usado para las
+>    imágenes que sí llegan a cargar) hace exactamente lo CONTRARIO: deja el sufijo `.jpg` intacto en el
+>    archivo suelto en disco y lo VUELVE A AGREGAR en código al construir la ruta. Se siguió ese patrón ya
+>    probado en vez del comentario de `audio.h` (que aparenta estar desactualizado/nunca implementado). Con
+>    esto, **no hace falta tocar ningún script de `porting_tools/`** -- de hecho no existe ningún script de
+>    staging de assets de audio en `porting_tools/` (se revisó todo el árbol; solo hay un `ai_bash_commands.sh`
+>    con checks manuales puntuales de `file`/`xxd` sobre PNGs, nada reusable ni relacionado a `.ogg`).
+>    **Advertencia honesta**: no hay acceso a `decompiled_so`/`decompiled_apk` en este entorno (excluidos por
+>    `.gitignore`, como corresponde), así que la cadena exacta que `libgame.so` le pasa a `SoundCreate` no
+>    pudo confirmarse contra `out_ghidra.c` -- de ahí que el resolver pruebe 3 candidatos y loguee
+>    (`[Audio] SoundCreate("...") -> "...", handle N`) cuál usó, para poder diagnosticar desde el log real si
+>    ninguno de los 3 acierta.
+> 4. **Bloqueador de build encontrado y corregido**: `source/audio.c` NO estaba en la lista de fuentes de
+>    `CMakeLists.txt` (`add_executable`) y la librería Tremor (`vorbisidec`/`ogg`) que `audio.c` usa
+>    (`<tremor/ivorbisfile.h>`, `ov_open`/`ov_read`/`ov_clear`/etc.) tampoco estaba enlazada -- ni vendorizada
+>    en `lib/` ni en `target_link_libraries`. Confirmado que VitaSDK sí trae ambos paquetes preinstalados
+>    (`arm-vita-eabi/lib/libvorbisidec.a`, `arm-vita-eabi/lib/libogg.a`, headers bajo
+>    `arm-vita-eabi/include/tremor/`) -- se agregó `source/audio.c` a `add_executable()` y `vorbisidec`/`ogg`
+>    a `target_link_libraries()`. Sin este fix, aun con el resto de los cambios de audio, el build no habría
+>    ni compilado.
+>
+> **Build verificado (cross real vía VitaSDK)**: se armó un árbol temporal separado (`/tmp/inotia3-src-
+> audiofix`/`/tmp/inotia3-build-audiofix`, limpiado al terminar) siguiendo el mismo `rsync` + `cmake
+> -DCMAKE_BUILD_TYPE=Release` + `make -j4` que usa `porting_tools/build/build_and_install.sh`. Compiló y
+> linkeó sin errores nuevos -- `inotia3.vpk`/`eboot.bin` generados. `nm` sobre el binario final confirma que
+> `audio_init`, `audio_sound_create`, `SoundCreate_wrapper`, `ov_open`/`ov_open_callbacks` quedaron todos
+> presentes en el ejecutable (Tremor sí está linkeado, no es dead code eliminado por el linker). **Esto es
+> solo verificación de compilación/link, NO una prueba de que el sonido efectivamente se escuche** -- no hay
+> acceso a hardware/Vita3K desde este entorno.
+>
+> **Pendiente**: redeployar, reproducir, y confirmar con oídos reales que el audio se escucha (efectos y/o
+> música, según qué dispare el motor primero). Revisar el log en busca de las líneas `[Audio] SoundCreate(...)
+> -> "...", handle N` para confirmar que el resolver de rutas encontró el archivo real y no cayó al mensaje
+> de "could not resolve" -- si cae ahí sistemáticamente, es la señal de que la convención de nombre que pasa
+> `libgame.so` no es ninguna de las 3 que probé, y hay que revisar `out_ghidra.c` (SOUNDSYSTEM_*/
+> SOUNDPLAYER_*) para confirmar el string real. También vigilar cualquier síntoma parecido al viejo crash de
+> Fase 9 (`png_create_read_struct_2`) -- aunque la Corrida 47 lo resolvió por una causa no relacionada a
+> audio, el mixer thread agregado por `audio_init()` es código nuevo corriendo concurrentemente con el resto
+> del motor (thread separado, prioridad `0x10000100`, stack de 64KB) que nunca se había ejercitado en un run
+> real hasta ahora -- si aparece cualquier crash nuevo relacionado a memoria/threads después de este cambio,
+> revisar primero si desaparece con `audio_init()` comentado antes de asumir que es un problema no
+> relacionado.
+
+> **Nota sobre numeración**: el commit `36696a8` ("Save all porting changes, patches, scripts, and
+> psvita-porting skill") agregó ~640 líneas a `source/patch.c` (más cambios en `dynlib.c`/`java.c`/
+> `logger.c`) documentadas ahí mismo como Corridas 48 a 60 (instalación de assets,
+> `MAP_LoadAllToHeap`/`MAP_LoadFromHeap`/`MAP_DestroyFromHeap`, `UTIL_LoadSpriteListFromResource`, texto real
+> vía `DrawTextInRect_stub`, logging por lotes) **sin actualizar este archivo** -- por eso las Corridas 61-63
+> de arriba retoman la numeración real del código (61 en vez de un backfill de 48-60, que queda fuera del
+> alcance de esta sesión) en vez de la que este documento mostraba. La entrada de abajo usa Corrida 64 por la
+> misma razón -- la investigación que la generó corrió en paralelo a las tres de arriba sin verlas todavía.
+
+> **Corrida 64 (2026-08-10) — Investigación de un glitch visual reportado por el usuario en el retrato de
+> personaje (HUD, arriba a la izquierda); no se pudo confirmar una causa raíz por análisis estático solo, se
+> agregó instrumentación en su lugar.** Reporte del usuario (español, sin captura): "tengo un glitch en el
+> icono del personaje arriba a la izquierda", visto después del tutorial en un escenario nuevo. Sin
+> descripción de si es color, sprite equivocado, imagen faltante, parpadeo o estiramiento -- una captura del
+> usuario sigue haciendo falta para acotar esto más rápido; ver "Pendiente" abajo.
+>
+> `logs/log_007.txt` (grep -a, el archivo tiene bytes ANSI que rompen grep sin `-a`) ya mostraba la carga
+> sana de exactamente dos retratos (`portrait4.png`/`portrait4.pngi` en la línea ~39152, `portrait0.png`/
+> `portrait0.pngi` en la ~150578 -- confirmando que el personaje mostrado SÍ cambia durante la sesión, un
+> escenario donde un bug de caché sería visible), sin reintentos ni errores de I/O -- si hay un bug, está
+> río abajo de la carga del recurso, no en la lectura del archivo. (Este mismo log también confirmó, por
+> separado, que la consola todavía corría el build previo a las Corridas 61-63 de arriba -- ver esas entradas
+> -- así que esta investigación del retrato es independiente de esos tres fixes, no una consecuencia de
+> ellos.)
+>
+> **Rastreo completo de la cadena de dibujo contra `out_ghidra.c` (nada de esto fue reimplementado por este
+> port -- es código original del `.so`, se leyó tal cual corre):**
+> - `Portrait_Draw` (`:125716`) resuelve un "file id" interno (`local_88`, un byte leído de
+>   `PORTRAITBASE_pData`, no observable desde afuera sin hookear la función) y sólo llama a
+>   `GRPI_UnloadImage`/`GRPI_LoadImage` cuando difiere del `Portrait_nLoadedFileID` cacheado -- un caché
+>   legítimo, no el idiom de signo `-1 < X` ya arreglado 6 veces (Corridas 42/47/49/56/57): sus chequeos son
+>   `-1 < param_1` y `local_88 < RecordCount` sobre índices/longitudes chicas, nunca sobre un puntero crudo
+>   de `CS_knlCalloc` -- esa familia de bug específica no aplica acá.
+> - `GRPI_LoadImage` (`:124159`) pasa por `SGL_CreateTexture` (`:107303`), es decir una textura GL REAL
+>   (`SGL_Resource::FromBundle` -> `SGL_Texture::FromResource`), **no** el blit de software CSFB que usan
+>   `GRP_PutAsciiChar`/`GRP_DrawPixel` (Corrida 58) para el texto -- retratos y texto en pantalla son dos
+>   caminos de render totalmente distintos en este motor.
+> - El `.pngi` (metadata del atlas de piezas, cargado a través del fix de `EXCELDATA_LoadFullResource` de la
+>   Corrida 49) decodifica de forma internamente consistente: después del header de 6 bytes de
+>   `GRPI_LoadInfo` (4 bytes de cantidad de piezas + 2 bytes saltados), los 114 bytes descomprimidos de
+>   `portrait4.pngi` y los 126 de `portrait0.pngi` dan, cada uno, un número EXACTO de registros de 12 bytes
+>   (9 y 10 piezas respectivamente) -- sin off-by-one en la longitud descomprimida.
+> - Los dos PNG reales (`assets/common/game_res/portrait0.png.jpg`/`portrait4.png.jpg`, el sufijo `.jpg` es
+>   sólo el disfraz de extensión de este port) son 512x512, 8 bits de profundidad, color type 6
+>   (truecolor+alpha) -- mismo formato que otras texturas 512x512 RGBA que este port ya confirmó renderizando
+>   bien en otras partes del log, y bit-a-bit idénticos entre las dos versiones de APK presentes localmente
+>   (1.3.2 vs. 1.4.5, mismo MD5) -- descarta un desajuste de versión entre assets y `.so`.
+> - `SGL_CreateTexture`/`SGL_DeleteTexture` (`:107303`/`106097`) mantienen su propia tabla `s_cachedTexture`
+>   correctamente (búsqueda lineal + swap-remove al borrar) -- tampoco es un leak/overflow ahí.
+>
+> **Ninguna de estas confirmaciones descarta un bug que sólo se vea en vivo.** Dos hipótesis quedan abiertas,
+> ninguna confirmable sin hardware:
+> 1. `force_linear_filter` (`source/utils/glutil.c`, Fase 4) fuerza `GL_LINEAR` incondicional en cada subida
+>    de textura -- fix deliberado y necesario contra el blanco de "textura incompleta" de vitaGL, no algo
+>    que se pueda simplemente quitar -- pero SÍ puede sangrar unos pixeles en los bordes de las piezas del
+>    atlas si no hay padding entre ellas. Sería un artefacto sutil y sistemático (afecta a toda textura sin
+>    mipmaps de este port, no sólo al retrato), así que encaja poco con algo lo bastante notorio para que el
+>    usuario lo reporte espontáneamente, pero no se puede descartar sin verlo.
+> 2. Una falla real de creación de textura en vitaGL bajo presión de VRAM (más plausible cuanto más avanzada
+>    la sesión -- coincide con el reporte "después del tutorial, en un escenario nuevo") podría devolver una
+>    textura con contenido de VRAM sin inicializar en vez de simplemente fallar limpio -- eso sí se vería
+>    como "basura"/glitch real y sólo en ese momento, no desde el arranque.
+>
+> **Instrumentación agregada** (`source/patch.c`, hook transparente sobre `Portrait_Draw`, sin cambiar
+> comportamiento): loguea record/x/y/state/flip solicitados y, leyendo directo los globales exportados
+> `Portrait_nLoadedFileID`/`gImgPortrait`, el estado del caché ANTES y DESPUÉS de la llamada real (id
+> cargado, handle de textura, cantidad de piezas, puntero al array de piezas), marcando `[RELOADED]` cuando
+> el id cambia. El próximo log en hardware dirá si: (a) el mismo record resuelve a un id distinto en cada
+> dibujo (caché rota/desincronizada -- explicaría un parpadeo entre dos retratos), (b) una carga falla en
+> silencio (`Portrait_nLoadedFileID` se queda en -1 tras una llamada que debía cargar algo, con el handle de
+> textura en 0), o (c) ninguna de las dos pasa, en cuyo caso el glitch está a nivel de contenido/filtrado de
+> la textura GL y hace falta una captura de pantalla para seguir. Build compilado y verificado (cross real
+> vía VitaSDK, en un árbol `/tmp` aislado, `inotia3.vpk`/`eboot.bin`/`inotia3.elf` -- sin errores ni warnings
+> nuevos, 2026-08-10).
+>
+> **Pendiente**: redeployar, reproducir el glitch, y mandar el log nuevo -- buscar las líneas
+> `Corrida 64: Portrait_Draw(...)` (antes/después) alrededor del momento del cambio de escenario. **Pedirle
+> al usuario una captura de pantalla del glitch sigue siendo el paso más eficiente**: color/tinte incorrecto,
+> sprite equivocado, imagen ausente/en blanco, y estiramiento/desplazamiento son síntomas de bugs
+> completamente distintos (filtrado GL, caché de `Portrait_nLoadedFileID`, fallo de `GRPI_LoadImage`, y
+> matemática de posición/escala en `GRPX_DrawPartEx`, respectivamente) y sin verla no se puede acotar más la
+> búsqueda desde análisis estático solo.
+
+> **Corrida 60 (2026-08-10) — Investigación de un reporte de usuario ("algunos textos no tienen fondo y
+> tienen letra blanca, lo que hace difícil su lectura") sin acceso a hardware/log/screenshot. Encontrado un
+> candidato concreto, respaldado por decompile, pero NO confirmado todavía en consola/Vita3K: otro método
+> JNI sin registrar, `GetStringWidth`, distinto de `GetStringWidthHeightInRect` (ya arreglado en la Corrida
+> 44/59) — esta entrada usa el número 60 porque es el primero libre entre la Corrida 59 (ya en `source/java.c`)
+> y las Corridas 61-64 de arriba (touch/save/audio/portrait, investigadas en paralelo hoy mismo).** Se
+> investigaron las 4 hipótesis planteadas para el reporte (método JNI de fondo faltante, overflow/aliasing de
+> `g_textview_pixel_buffer`, otro método sin registrar, y el ángulo de la máscara binaria sin antialiasing)
+> contra `out_ghidra.c` y `decompiled_apk/sources/.../WrapperJinterface.java`.
+>
+> Descartado con bastante confianza: el dibujo de texto genérico (`GRPX_DrawStringWithFont`/`GRPX_DrawString`
+> → `SGL_grpDrawStringWithFont`/`SGL_grpDrawStringInRectWithFontEx` → `SGL_grpCreateStringImageInRect`) NUNCA
+> dibuja un fondo — ni en el juego real. Los fondos que sí existen (`MONEY_DrawBox`/`DrawSpeechBubble`
+> `out_ghidra.c:73513`/`96793`, la franja de `INSTANTMSG_DrawNameFrame` `:96882`) son sprites/rects NATIVOS
+> del propio `.so` (`GRPX_DrawPart`/`GRPX_FillRect` sobre atlas cargados por `IMGSYS_*`), dibujados por el
+> LLAMADOR antes de pedir el texto — sin ninguna dependencia de JNI. Esto hace muy poco probable que
+> `DrawTextInRect_stub`/`GetStringWidthHeightInRect_stub` (Corrida 59/44) sean la causa de un fondo
+> faltante: estructuralmente no pueden dibujar ni suprimir un fondo, solo la máscara de cobertura del glyph.
+>
+> **Candidato real encontrado**: `SGL_GetAsciiTextSize` (`out_ghidra.c:162608-162632`) es HERMANA de
+> `SGL_GetTextSizeInRect`/`SGL_GetTextSize` (`:162570-162604`, que sí usan correctamente el id 46 ya
+> arreglado vía `jGetStringWidthHeightInRect`) pero mide el texto con una llamada JNI TOTALMENTE DISTINTA:
+> `jGetStringWidth` (`:143919`), que resuelve `WrapperJinterface.GetStringWidth(String,int,int):int`
+> (firma literal confirmada `"(Ljava/lang/String;II)I"` en `decompiled_apk/.../WrapperJinterface.java:1112`,
+> `paint.measureText(str)` sin ninguna dependencia de fondo — solo un ancho). Este método NUNCA estuvo
+> registrado en `nameToMethodId[]`. A diferencia de los `strcpy(NULL)` que crashean de la Corrida 40/50,
+> `jGetStringWidth` no chequea si `GetMethodID` devolvió NULL antes de usarlo — llama
+> `CallIntMethod(env, obj, NULL, ...)` de todas formas. Se rastreó `methodIntCall()` en
+> `lib/falso_jni/FalsoJNI_ImplBridge.c:279-288` directamente: su rama "no encontrado" hace
+> `return -1;` (NO 0). Ese `-1` sale de `jGetStringWidth`/`SGL_GetAsciiTextSize` como "ancho medido" de
+> CUALQUIER texto que pase por este camino — y `__utilGetStringWidth` (`:151938`, detrás de
+> `CSOGL_grpGetStringWidth`/`ByUTF8`) llama a la misma función sin registrar. Cualquier elemento de UI que
+> use este ancho para dimensionar SU PROPIO rect/caja de fondo (antes de pedirle a `GRPX_DrawStringWithFont`
+> que dibuje el texto — que sí mide/dibuja bien por el camino ya arreglado del id 46/49) dibujaría ese fondo
+> con un ancho de `-1` — invisible, o descomunal si se trata como sin signo más adelante — mientras el texto
+> en sí se ve perfectamente blanco y nítido. Encaja exactamente con el síntoma reportado.
+>
+> **Fix aplicado** (`source/java.c`): registrado `{ 50, "GetStringWidth", METHOD_TYPE_INT }` en
+> `nameToMethodId[]` y añadido `GetStringWidth_stub` (registrado en `methodsInt[]`), reusando la misma tabla
+> de ancho por byte (`inotia3_char_width`) que ya usan `GetStringWidthHeightInRect_stub`/
+> `DrawTextInRect_stub` desde la Corrida 44/59 — mismo criterio de esas Corridas: esta fuente bitmap propia
+> tiene una sola métrica fija, no una escalable por `fontSize`/`fontStyle`, así que esos dos parámetros se
+> aceptan (para respetar la firma real) pero se ignoran, igual que en los otros dos stubs de texto. Sin
+> wrapping (la implementación Java real es una sola llamada a `measureText`, sin rectángulo). Build
+> compilado y verificado (cross real vía VitaSDK, en un árbol aislado bajo `/tmp`, `inotia3.vpk`/
+> `eboot.bin`/`inotia3.elf`, 2026-08-10) — sin errores nuevos.
+>
+> **Importante — esto es un candidato respaldado por decompile, NO una confirmación de hardware.** No hubo
+> acceso a consola/Vita3K real ni screenshot del bug en esta sesión (instrucción explícita del entorno). Es
+> posible que el reporte del usuario se refiera a un elemento de UI que NUNCA tuvo fondo en el juego
+> original (por diseño, ej. etiquetas flotantes) y que esto sea una lectura errónea del síntoma, o que haya
+> una SEGUNDA causa (ej. un asset de sprite de panel que falla al cargar) coexistiendo con esta. Tampoco se
+> descartó del todo la hipótesis de la máscara binaria sin antialiasing (Corrida 59's propio diseño) como
+> un factor secundario de legibilidad, aunque no explica la AUSENCIA de fondo por sí sola.
+>
+> **Pendiente**: redeployar, reproducir, mandar el log nuevo — y, sobre todo, **una screenshot del usuario
+> mostrando exactamente qué texto se ve así** (¿menú? ¿diálogo? ¿tooltip de ítem? ¿etiqueta de HP/nombre?)
+> para poder identificar el call site concreto en `out_ghidra.c` y confirmar (o descartar) este fix contra
+> el elemento real. Si el bug persiste tras este fix, instrumentar `SGL_GetAsciiTextSize`/
+> `__utilGetStringWidth` con un log del ancho devuelto sería el siguiente paso natural (mismo estilo que los
+> hooks de la Corrida 58/61/64 en otras sesiones de este mismo repo). También pendiente: esta entrada usa la
+> numeración real de `source/*.c` (60), que iba adelantada a este documento (quedado en la 47) — las
+> Corridas 48-59 existen en el código (`GetStringFromXmlEx`/`GetStringFromXml`/`DrawTextInRect`, etc.) pero
+> no tienen entrada narrativa aquí; no se reconstruyeron retroactivamente en esta sesión por estar fuera de
+> alcance de este bug.
+
+> **Corrida 65 (2026-08-10) — Reporte de usuario tras probar el build de las Corridas 60-64: "el guardado
+> dice éxito pero no persiste realmente", "el táctil se vuelve a congelar al cambiar de stage, y ahora es
+> peor que antes", y "no se generó ningún log de esa sesión". Sin log ni `.psp2dmp` de esa corrida
+> específica para confirmar con datos reales -- lo de abajo es una revisión de código que encontró un bug de
+> concurrencia real (no solo una hipótesis) y dos endurecimientos defensivos, no una causa raíz confirmada
+> en hardware.**
+>
+> La pista más importante es la ausencia total de log: en el congelamiento ORIGINAL (el de `log_006.txt`,
+> antes de estas 5 Corridas), el bucle de render/timer seguía corriendo mientras el juego quedaba trabado
+> (`log_006.txt` mostraba el mismo ciclo de `glOrthox`/`Flush`/`isUsableNetwork` repitiéndose para siempre) --
+> eso generaba líneas de log sin parar, o sea que el logger seguía vivo. Que AHORA no se genere ningún log
+> apunta a algo cualitativamente distinto: un colgado real del hilo principal completo (nada corre, ni
+> siquiera el logging), no solo la lógica de juego.
+>
+> **Bug de concurrencia real encontrado en `source/audio.c` (Corrida 63): el hilo mezclador de audio
+> (`audio_thread`) llama a `ov_read()` -- una lectura de archivo BLOQUEANTE contra el mismo storage
+> `ux0:` que usa el resto del juego -- mientras tiene tomado `audio_mutex`.** Las 6 funciones de control
+> (`audio_sound_play/pause/resume/stop/destroy/set_volume`), invocadas SIEMPRE desde el hilo principal del
+> juego vía una llamada JNI de `Sound*` síncrona, necesitan ese MISMO mutex solo para tocar unos pocos campos
+> de struct -- pero antes de este fix esperaban con `sceKernelLockMutex(audio_mutex, 1, NULL)` (`NULL` =
+> esperar para siempre). Si `ov_read()` se traba (una tarjeta lenta, o presión de I/O real -- exactamente lo
+> que un cambio de stage genera: assets nuevos cargándose en simultáneo con la música/SFX de transición
+> arrancando) mientras el mixer tiene el mutex tomado, CUALQUIER llamada `Sound*` posterior desde el hilo
+> principal (y un cambio de stage dispara varias, para frenar la música vieja y arrancar la nueva) se queda
+> esperando ESE MISMO mutex para siempre -- congelando el hilo principal COMPLETO (input, render, y logging,
+> todo corre ahí) en vez de solo la lógica de juego. Encaja exactamente con "se congela justo al cambiar de
+> stage" + "no hay ningún log de esa sesión" a la vez.
+>
+> **Fix aplicado** (`source/audio.c`): las 6 funciones de control ahora usan
+> `sceKernelLockMutex(audio_mutex, 1, &timeout)` con un timeout acotado (`AUDIO_LOCK_TIMEOUT_US`, 100ms) en
+> vez de `NULL`. Si el mixer sigue trabado más de 100ms, la función loguea una advertencia y retorna un error
+> en vez de esperar para siempre -- en el peor caso se pierde/retrasa un `Sound*` puntual, nunca el juego
+> entero. El propio hilo mezclador SIGUE esperando sin límite por el mutex en su bucle (`NULL`, sin cambios)
+> -- ahí no hay riesgo, porque cuando el mixer espera no bloquea al hilo principal.
+>
+> **Segundo cambio, defensivo/de alcance, en `source/patch.c` (Corrida 62's `CS_fsOpen_hook`)**: el fix
+> original corría su lógica de `file_mkpath()` en TODA apertura de archivo con flag de creación en TODO el
+> juego, incluidas las que nunca podían necesitarlo (archivos sueltos directamente bajo
+> `ux0:data/inotia3/`, cuyo directorio padre siempre existe). Ahora se activa solo si `name` realmente tiene
+> un componente de subdirectorio. `jGetUserDir`/`jGetPackageName` (llamadas desde este hook) resultaron
+> cachear su resultado tras la primera llamada real (`out_ghidra.c:146025`/`146056`, confirmado leyendo el
+> decompile) así que NO son responsables de round-trips de JNI repetidos como se sospechó al principio -- pero
+> acotar el hook de todas formas reduce su huella al único caso que realmente lo necesita, y elimina cualquier
+> trabajo redundante en el camino de arranque de cada archivo del juego.
+>
+> **Tercer cambio, defensivo, en `source/utils/logger.c`**: el buffer en anillo de la Corrida 60 solo se
+> vaciaba a disco cuando se llenaba o ante un WARN/ERROR/FATAL -- si el hilo principal se cuelga del todo
+> antes de que pase cualquiera de las dos cosas, lo que quedó en el anillo se pierde para siempre, sin ruta
+> de apagado limpio que lo salve. Se agregó un flush también por tiempo transcurrido (cada 500ms,
+> `sceKernelGetProcessTimeWide()`), acotando cuánto puede perderse a una ventana fija en vez de depender de
+> cuánto tarde en juntarse 4KB de líneas debug/info (que, lejos de la seguidilla de llamadas JNI del arranque,
+> puede tardar bastante más de lo que suena).
+>
+> **Nada de esto está confirmado contra la corrida real que el usuario reportó** -- no hubo log ni `.psp2dmp`
+> de ESA sesión para verificar la hipótesis del mutex de audio con datos reales; es la explicación más
+> plausible que sostiene el código en sí (un mutex esperado sin límite exactamente en el punto donde el
+> síntoma reportado ocurre), no una confirmación. Tampoco se investigó todavía por qué el guardado "dice
+> éxito pero no persiste" -- sigue siendo el riesgo ya anotado en la Corrida 62 ("si `file_mkpath()` tiene
+> éxito pero el contenido real no queda bien, el problema está más abajo en la cadena, p.ej. el pool de
+> `SAVE_AllocateMemory` o el contenido cifrado") y no se tocó en esta Corrida.
+>
+> Build compilado y verificado (cross real vía VitaSDK, en un árbol `/tmp` aislado, `inotia3.vpk`/
+> `eboot.bin`/`inotia3.elf`, 2026-08-10) -- sin errores ni warnings nuevos.
+>
+> **Pendiente**: redeployar, reproducir el cambio de stage, y esta vez SÍ mandar el log completo (incluso
+> parcial) -- con el flush por tiempo agregado arriba, debería sobrevivir algo útil aunque el juego se cuelgue
+> de nuevo. Si el mutex de audio era la causa real, el síntoma debería desaparecer (o, en el peor caso,
+> degradar a "se cortó un sonido" en vez de "se congeló todo"). Buscar además una línea `[Audio] Sound*:
+> timed out waiting for audio_mutex` si el timeout SÍ se activó -- confirmaría la hipótesis incluso sin que el
+> juego llegue a congelarse del todo. Sobre el guardado, confirmar en la próxima consola/prueba si el archivo
+> `ux0:data/inotia3/<hash>/save<N>.dat` realmente existe y tiene contenido después de guardar -- eso separa
+> "el open() ahora funciona pero el contenido está mal" de "sigue sin escribirse nada".
+
+> **Corrida 66 (2026-08-10) — Pedido de usuario: mapear los botones físicos de la PS Vita a los controles
+> táctiles del juego (imagen de referencia `inotia-3-children-of-carnia_1.jpg`, 960x640), para poder jugar
+> sin tocar la pantalla.** Coordenadas medidas a mano sobre esa captura (grillas superpuestas con PIL para
+> precisión) y convertidas al canvas fijo 960x544 de este port (`GetScreenWidth`/`GetRealScreenWidth` y el
+> par de Height están stubeados exactamente a eso en `java.c`) por anclaje a bordes, no por escalado
+> proporcional: los HUDs móviles casi universalmente se ubican con un margen fijo respecto al borde más
+> cercano (los pulgares descansan en las esquinas sin importar la altura real de pantalla), no estirados
+> por toda la altura -- así que el botón de pausa (zona superior) conserva su distancia exacta al borde
+> SUPERIOR sin escalar, mientras que el cluster de movimiento/ataque/skills/items (zona inferior) conserva
+> su distancia exacta al borde INFERIOR, corrida hacia arriba por la diferencia 640-544=96px. El ancho no
+> necesitó ningún ajuste (960=960 en ambas resoluciones). **Esto NO está verificado en hardware** -- es una
+> primera estimación; puede necesitar ajuste fino de coordenadas tras probarlo en consola/Vita3K.
+>
+> **Mapeo aplicado**:
+> | Botón físico | Control táctil |
+> |---|---|
+> | D-Pad ↑/↓/←/→ | Movimiento (las 4 flechas del d-pad táctil, izquierda de pantalla) |
+> | ✕ (Cross) | Ataque principal (círculo grande de la mira, esquina inferior derecha) |
+> | ○ (Circle) | Skill (ícono de cruz dorada) |
+> | □ (Square) | Skill (ícono oscuro/espinoso) |
+> | △ (Triangle) | Ítem/escudo (ícono de diamante) |
+> | L | Poción (primer slot de ítem, con contador) |
+> | R | Segundo slot de ítem |
+> | SELECT | Tercer slot de ítem |
+> | START | Pausa |
+>
+> **Implementación** (`source/wr_touch.c`/`.h`): nueva función `wr_process_buttons()`, llamada cada tick
+> junto a `wr_process_touch()` (`source/main.c`). Lee `sceCtrlPeekBufferPositive()`, detecta transiciones de
+> estado (press/release) contra el frame anterior, y por cada transición sintetiza un `WR_TOUCH_DOWN`/
+> `WR_TOUCH_UP` en la coordenada fija de la tabla `BUTTON_MAP`, usando el MISMO pool de 5 slots que
+> `wr_process_touch()` ya usa para el touch real (`slotHwId[]`/`slotX[]`/`slotY[]`, estáticos del archivo) --
+> así un dedo real y varios botones físicos presionados a la vez comparten el mismo límite de 5 puntos
+> simultáneos que el propio `MultiTouchListener` de Android ya impone, en vez de arriesgarse a corromper los
+> arreglos de tamaño fijo del motor pasándole un id fuera de rango (el mismo riesgo que el header de
+> `wr_touch.h` ya documentaba para el touch real). Cada botón usa un `virtual_hw_id` fijo >= 1000 (el id de
+> hardware real de `SceTouchReport` es un contador de 8 bits, así que nunca puede colisionar). No se
+> implementó press-and-drag ni los sticks analógicos -- los botones son de posición fija, no necesitan
+> arrastre, y el pedido no mencionó los sticks.
+>
+> Build compilado y verificado (cross real vía VitaSDK, en un árbol `/tmp` aislado, `inotia3.vpk`/
+> `eboot.bin`/`inotia3.elf`, 2026-08-10) -- sin errores ni warnings nuevos.
+>
+> **Pendiente**: redeployar y probar cada botón contra su control táctil real. Si alguno no dispara la
+> acción esperada (o dispara la de un botón vecino), el problema más probable es que la hipótesis de
+> anclaje a bordes no sea exacta para ese elemento puntual -- ajustar su `x`/`y` en `BUTTON_MAP`
+> (`source/wr_touch.c`) un poco hacia el centro del círculo real visto en pantalla y volver a compilar.
+
+> **Corridas 67-71 (2026-08-11) — Cuatro reportes del usuario tras probar el build de las Corridas 60-66:
+> el freeze al cambiar de stage sigue igual, sigue sin generarse ningún log nuevo, la cruceta física sólo
+> registra un toque en vez de quedar "fija" mientras se mantiene presionada, y un nuevo crash (Data Abort)
+> al cargar una partida guardada -- reportado junto con "el guardado ya persiste de verdad", confirmando
+> que el fix de guardado de la Corrida 62/65 funcionó. Investigado en paralelo por un agente dedicado por
+> bug, cada uno con alcance de archivo separado; build final cruzado (VitaSDK real, árbol `/tmp` aislado)
+> con los cinco fixes juntos, sin errores nuevos (sólo el warning preexistente de `mktemp` en `dynlib.c`,
+> no relacionado).**
+>
+> **Corrida 67 -- cruceta física se registra como un toque, no como sostenida (`source/wr_touch.c`).**
+> Causa real, no hipótesis: el loop de limpieza de fin-de-frame de `wr_process_touch()` libera cualquier
+> slot que no haya aparecido en los reportes de `sceTouchPeek()` de ESE frame -- pero los slots virtuales
+> que `wr_process_buttons()` (Corrida 66) usa para los botones físicos (`virtual_hw_id >= 1000`) nunca
+> pueden aparecer ahí, porque no son toques reales. Como `wr_process_touch()` corre ANTES que
+> `wr_process_buttons()` en el loop principal (`source/main.c`), el frame siguiente a cada botón presionado
+> ese mismo loop de limpieza lo daba por "no visto" y disparaba un `WR_TOUCH_UP` espurio, liberando el slot
+> -- aunque el botón físico siguiera abajo (`wr_process_buttons()` no volvía a mandar nada porque, para su
+> propia lógica de transición, el botón no había cambiado de estado). Resultado exacto del reporte: cada
+> botón se traducía en un DOWN inmediatamente seguido de un UP, sin importar cuánto se mantuviera
+> presionado. **Fix**: el loop de limpieza ahora ignora explícitamente los slots con
+> `slotHwId >= WR_VIRTUAL_HW_ID_BASE` (1000) -- esos son propiedad exclusiva de `wr_process_buttons()`, que
+> ya los libera correctamente en su propia transición press/release. Toque real sin cambios de
+> comportamiento.
+>
+> **Corrida 68 -- logs siguen sin generarse en un colgado real del hilo principal
+> (`source/utils/logger.c`/`.h`, `source/main.c`).** El flush periódico de la Corrida 65
+> (`LOG_FLUSH_INTERVAL_US`) sólo se evalúa DENTRO de `_log_print()` -- en un colgado real del hilo
+> principal (input, render Y logging corren ahí) nada vuelve a llamar `_log_print()`, así que ese chequeo
+> nunca se re-evalúa y lo que quedó en el ring desde el último flush se pierde para siempre; exactamente
+> el mecanismo que la Corrida 65 necesitaba y no podía dar. **Fix**: nuevo hilo watchdog de baja prioridad
+> (`logger_start_watchdog()`, arrancado como la primera línea de `main()`, antes de `soloader_init_all()`)
+> que hace `sceKernelDelayThread(250ms)` + flush del ring en loop, independiente de que el hilo principal
+> siga vivo o no. Toma `_log_mutex` con un timeout acotado (`LOG_WATCHDOG_LOCK_TIMEOUT_US`, 50ms, mismo
+> patrón que `AUDIO_LOCK_TIMEOUT_US` de la Corrida 65) -- si está contendido, se salta ese ciclo sin
+> bloquear. De paso se cerró un riesgo simétrico que este mismo cambio introducía: `_log_print()` ahora
+> podía competir por `_log_mutex` con el watchdog, así que su propio lock (antes un `sceKernelLockLwMutex`
+> con timeout `NULL`, espera infinita) también pasó a estar acotado
+> (`LOG_PRINT_LOCK_TIMEOUT_US`, 100ms) -- de lo contrario este mismo fix podría convertirse en una NUEVA
+> forma de colgar el hilo principal.
+>
+> **Corrida 69 -- crash al cargar una partida guardada (`source/patch.c`, `source/java.c`).** Auditoría de
+> dos frentes:
+> - **Causa raíz confirmada por disassembly real** (no hipótesis): la base auto-detectada por la
+>   herramienta de análisis del `.psp2dmp` (`0x9805c000`) es la misma heurística ya marcada como poco
+>   confiable en las Corridas 54/55/56. Re-derivando la base correcta de la misma forma que esas Corridas
+>   (comparando la página de memoria de 8KB guardada en el dump contra el `.so` real byte a byte) da
+>   `0x98000000` -- con esa base, PC (`0x980a8310`) es `SAVE_Load+0x44` y LR (`0x980a8305`) es
+>   `SAVE_Load+0x39` (`nm -D`/`objdump -d -M force-thumb` contra `inotia3-1-3-2/lib/armeabi/libgame.so`,
+>   instrucción por instrucción contra `out_ghidra.c:82873-82914`). La instrucción exacta en el PC es
+>   `ldrsh r0, [r3, r2]` con `r3` = `PLAYER_pActivePlayer` (confirmado, R5 del dump apunta exactamente a
+>   ese símbolo real vía `nm -D`) y `R3=0` en los registros del crash -- un NULL-deref liso de ese puntero
+>   global al construir los argumentos de `MAP_SetFocus`. `SAVE_Load` nunca chequea el valor de retorno de
+>   `SAVE_LoadCharacterAll`, que puede terminar sin haber llamado nunca a `PLAYER_SetActivePlayer` (deja
+>   `PLAYER_pActivePlayer` en NULL) si `SAVE_LoadData` falla o ningún slot de personaje carga bien -- un gap
+>   real del motor original que las Corridas 62/65 (arreglando el guardado) volvieron alcanzable por
+>   primera vez: antes, `SAVE_Save()` siempre fallaba, así que nunca existió un `save<N>.dat` real con datos
+>   de slot/personaje activo para cargar.
+> - **Fix**: `SAVE_Load_hook` reimplementa `SAVE_Load` fielmente (mismo patrón ya usado para
+>   `RES_LoadToPool`/`MAP_LoadFromHeap` en Corridas 42/47/56 -- reimplementar toda la función, arreglar sólo
+>   el chequeo que falta), pero si `PLAYER_pActivePlayer` sigue en NULL tras `SAVE_LoadCharacterAll`, cae a
+>   `PLAYER_pMainPlayer` vía `PLAYER_SetActivePlayer` real -- el mismo fallback que el motor sin tocar ya
+>   hace en la cola de `SAVE_LoadCharacterAll` (`out_ghidra.c:82852-82865`), aplicado aquí para el camino que
+>   la salta. Si ambos punteros son NULL (no sobrevivió ningún dato de personaje), se salta
+>   `MAP_SetFocus`/`PLAYER_MakeShortcut` y se loguea con `l_fatal` en vez de crashear.
+> - **Endurecimiento adicional** (`source/java.c`, `GetAppProperty_stub`): investigado en paralelo,
+>   `GetAppProperty_stub` devolvía un valor fijo no vacío para CUALQUIER clave pedida, incluyendo
+>   `uniqueUserId`/`uniqueDeviceId`/`sessionKey` (las únicas que `DownloadGameData`
+>   (`out_ghidra.c:16260`) chequea antes de decidir si hay sesión de Hub activa) -- rompiendo siempre el
+>   chequeo de "no hay Hub en este port" que el resto del port ya asume (`HubInitialize_stub`). Eso podía
+>   enrutar la acción de Cargar Partida hacia `CS_hubDownloadGameData`, una llamada real del SDK de Hub
+>   cuyo estado interno nunca se inicializa en este port headless -- un segundo camino de crash plausible,
+>   independiente del de `SAVE_Load`, aunque no se pudo confirmar byte a byte contra el dump (cae dentro de
+>   `.dynstr`, no en código). Ahora devuelve un array vacío para toda clave, restaurando la señal de "no
+>   logueado" y bloqueando ese camino por completo.
+>
+> **Corrida 70 -- freeze de stage transition SIGUE ocurriendo tras el fix de mutex de audio de la Corrida
+> 65 (`source/patch.c`, `source/audio.c`).** Auditoría estática (no hay log/dump nuevo de ESTE freeze
+> específico -- un colgado no genera `.psp2dmp`, y hasta la Corrida 68 tampoco dejaba log): se revisaron
+> `MAP_Load_hook`/`MAP_LoadFromHeap_hook`/`MAP_LoadAllToHeap_hook`/`MAP_DestroyFromHeap_hook`,
+> `GAMESTATE_SetState_hook`/`EVTSYSTEM_SetState_hook`, `CS_fsOpen_hook`, y los hooks de carga de recursos
+> (`RES_LoadToPool_hook`, `RES_MoveToFilePack_hook`, `EXCELDATA_LoadFullResource_hook`,
+> `UTIL_LoadSpriteListFromResource_hook`, `FONT_Load_hook`) buscando otra espera bloqueante sin límite --
+> ninguno mostró una señal tan clara como la del mutex de audio original. En su lugar se agregó logging de
+> entrada/salida (`l_debug`, prefijo "Corrida 68") alrededor de `GAMESTATE_SetState_hook`/
+> `EVTSYSTEM_SetState_hook`/`MAP_Load_hook` para que el PRÓXIMO freeze (que ya debería dejar log gracias a
+> la Corrida 68) señale exactamente dónde se queda trabado.
+>
+> Revisando por separado `source/audio.c` SÍ apareció una causa real y confirmable, no sólo una
+> hipótesis: `audio_sound_play()`/`audio_sound_prepare()` hacían `fopen()` + `ov_open()` -- lectura de
+> archivo bloqueante contra el mismo `ux0:` que usa el resto del juego -- COMPLETAMENTE FUERA de cualquier
+> mutex, corriendo síncronamente en el hilo principal (llamadas `Sound*` desde JNI). El timeout de la
+> Corrida 65 (`AUDIO_LOCK_TIMEOUT_US`) sólo protege la sección de mutación de struct que pasa DESPUÉS de
+> que el archivo ya está abierto -- no hace nada contra este bloqueo previo, que no tenía límite de ningún
+> tipo. Exactamente durante una transición de stage (ráfaga de I/O nueva: música/SFX de la transición
+> arrancando mientras cargan assets nuevos) esto puede colgar el hilo principal completo -- coincide
+> estructuralmente mejor que cualquier otro candidato encontrado con "se congela siempre al cambiar de
+> stage, no sobrevive ningún log". **Fix**: el `fopen`/`ov_open` real se movió al hilo mezclador
+> (`audio_thread`) que ya existía -- `audio_sound_play()` ahora sólo reserva un slot de voz bajo el mutex
+> (rápido, sin I/O) y deja un pedido pendiente; `audio_thread` hace la apertura real fuera del mutex en
+> cada iteración de su loop y la instala bajo mutex, validando con un token que el slot no haya sido
+> robado/detenido/destruido mientras la apertura estaba en curso. `audio_sound_prepare()` pasó de
+> `fopen`+`ov_open`+`ov_clear` a un simple `stat()` (la validación de decodificación real ya ocurre de
+> todas formas, de forma asíncrona, en `audio_sound_play()`).
+>
+> **Pendiente (las 5 Corridas)**: redeployar y probar cada bug puntualmente. Cruceta y logs deberían
+> confirmarse fácil (mantener un botón unos segundos; y revisar que aparezca un `log_NNN.txt` nuevo incluso
+> si el juego se cuelga). Guardado: cargar la partida que crasheaba antes y confirmar que ahora carga (o,
+> en el peor caso, que el log muestra el `l_warn`/`l_fatal` de `SAVE_Load_hook` en vez de un
+> `.psp2dmp`). Freeze de stage: si el fix de `audio.c` era la causa real, el síntoma debería desaparecer
+> del todo; si NO era la causa (o era una de varias), el log ahora debería sobrevivir el colgado gracias a
+> la Corrida 68/67 y mostrar en qué línea de `GAMESTATE_SetState_hook`/`EVTSYSTEM_SetState_hook`/
+> `MAP_Load_hook` se quedó trabado -- mandar ese log completo es el siguiente paso más útil si el freeze
+> persiste.
+
+> **Corridas 71-72 (2026-08-11) — Primer log real de una sesión de consola (`logs/log_008.txt`, gracias a
+> las Corridas 67/68) y el primer `.psp2dmp` de un freeze de stage transition (antes solo colgaba sin
+> dejar rastro). También: la partida guardada que el usuario tenía desapareció tras probar el build de las
+> Corridas 67-70, y D-Pad arriba confirmado sin efecto en el juego (las otras 3 direcciones sí funcionan).**
+>
+> **Corrida 71 -- SEGUNDO divide-by-zero distinto en una transición de stage, no atrapado por el hook de la
+> Corrida 54 (`source/patch.c`).** `log_008.txt` mostró sólo `"Corrida 53: raise(8) -- .so return
+> address=0x9811e114"` -- la misma dirección que la Corrida 54 ya había resuelto una vez, pero esa
+> resolución histórica tenía la aritmética mal (0x9811e114-0x98000000=0x11e114, no 0x11ce64 como decía el
+> texto viejo). Re-derivada con disassembly ARM real (no Thumb -- `__div0` y las primitivas de división
+> alrededor son código ARM puro): `0x11e114` es `__div0+0xc`, la instrucción justo después de `bl raise`
+> dentro de `__div0` mismo (`push {r1,lr}; mov r0,#8; bl raise; pop {r1,pc}`). `__div0` es el choque común
+> real al que TODAS las primitivas de división de este `.so` llaman (`__udivsi3`, `__divsi3`,
+> `__aeabi_idivmod`, `__aeabi_uidivmod`, `__aeabi_ldivmod`, `__aeabi_uldivmod`, `__divdi3`, `__udivdi3`,
+> confirmado disassemblando varias) -- el hook de la Corrida 54 sólo envolvía `__udivsi3` puntualmente, así
+> que cualquier división por cero a través de OTRA primitiva (esta vez, probablemente `__divsi3`/
+> `__aeabi_idivmod` con signo, dado el contexto de transición de stage) nunca pasaba por ese hook y llegaba
+> directo a `__div0` → `raise(8)` → la cadena de auto-trap deliberada de la Corrida 53. **Fix**: hookeado
+> `__div0` directamente (`div0_hook`) -- cada llamador YA sobreescribe su resultado con un `mov r0,#0`
+> fijo apenas vuelve de `bl __div0`, así que no llamar al `raise()` real y simplemente retornar es fiel a
+> como cada llamador ya maneja este caso, y neutraliza esta clase de crash completa para las 8 primitivas
+> a la vez, no sólo `__udivsi3`. Loguea con `l_warn` (ya no es fatal, es un caso manejado) la dirección de
+> retorno de quien llamó a la primitiva de división -- identifica cuál primitiva se usó, un nivel por
+> debajo de la función real del juego, suficiente para un hook puntual futuro si hace falta identificar
+> esa función exacta.
+>
+> **Corrida 72 -- la partida guardada desapareció: regresión real de la Corrida 69, revertida
+> (`source/java.c`, `source/patch.c`).** Auditoría de `SAVE_Load_hook` línea por línea contra
+> `out_ghidra.c:82873-82914`: fiel al original, no es la causa. Causa real encontrada: `HubSave_LoadKey()`
+> (`:124296`) pide la clave `"uniqueUserId"` vía el MISMO `GetAppProperty_stub` que la Corrida 69 cambió de
+> un valor fijo no vacío (`"123456789012"`) a un array vacío -- y `HubSave_GetFolderName()` (`:124328`)
+> nombra el subdirectorio del save real como `MD5(HubSave_key)`. Vaciar la clave cambió ese hash de
+> `MD5("123456789012")` a `MD5("")`: el juego ahora busca (y escribe) en una carpeta distinta a la de
+> siempre -- la partida vieja no se borró, el juego simplemente mira en otro lado. La hipótesis original
+> de la Corrida 69 (que un valor no vacío reabría un camino de crash hacia `CS_hubDownloadGameData`, un
+> Hub-download nunca inicializado) nunca se confirmó byte a byte -- la causa real y confirmada del crash de
+> guardado fue siempre `SAVE_Load`'s propio NULL-deref (Corrida 69, la mitad SÍ confirmada), independiente
+> de este valor. **Fix de dos capas**: (1) `GetAppProperty_stub` revertido al valor fijo no vacío original
+> (restaura el hash de carpeta de siempre, arregla la regresión); (2) en vez de depender de ese mismo valor
+> compartido para mantener cerrado el camino de Hub (la causa exacta de esta regresión), se hookearon
+> directamente `CS_hubDownloadGameData`/`CS_hubUploadCompleteGameData`/`CS_hubUploadGameData` como no-ops
+> que retornan error (mismo patrón que `HubInitialize_stub`, "no hay Hub real en este port") -- rastreado
+> el único llamador real de `DownloadGameData` (`C2S_HubSaveDataDownload`, `:16467`, una acción de menú de
+> sync a la nube, NO el flujo local de "Cargar Partida" que usa `SAVE_Load`) para confirmar que esto no
+> toca el camino de guardado local en absoluto.
+>
+> **D-Pad arriba, sin fix -- se necesita más investigación fuera del alcance revisado esta corrida.**
+> Remedido `inotia-3-children-of-carnia_1.jpg` por centroide de brillo (no a ojo): la coordenada de UP ya
+> es la MÁS precisa de las 4 direcciones (~2px de error vs. ~7-9px en las otras 3, que SÍ funcionan), y las
+> 4 son simétricas respecto de un centro común -- descarta un d-pad asimétrico o un error de medición. No es
+> un problema de puntería de coordenadas. Candidato más probable: el `.so` podría testear el d-pad por
+> ángulo/zona desde un centro virtual en vez de por rect fijo por flecha, y el punto de UP caería justo en
+> un borde de esa zona -- requiere revisar `out_ghidra.c` para la lógica real de touch-dispatch del d-pad,
+> no solo la imagen de referencia. Pendiente para una corrida futura.
+>
+> Build final (los 3 fixes de código de esta ronda juntos) compilado y verificado (VitaSDK real, árbol
+> `/tmp` aislado) sin errores nuevos.
+>
+> **Pendiente**: redeployar. Confirmar que el freeze/crash de stage transition ya no ocurre (Corrida 71).
+> Confirmar que la partida guardada vuelve a aparecer (Corrida 72 -- debería, dado que usa el mismo hash de
+> carpeta de siempre otra vez). D-Pad arriba sigue roto hasta la próxima corrida -- si se puede, mandar un
+> log de una sesión donde se presione específicamente arriba varias veces, útil para la investigación de
+> ángulo/zona pendiente.
+
+> **Corrida 73 (2026-08-11) — Explicación real de por qué el fix de la Corrida 71 "no funcionó": el build
+> probado era Release, no Debug, y casi todo el logging de este port es un no-op en Release
+> (`source/patch.c`).** El usuario reinstaló el VPK reconstruido con el hook de `__div0` y confirmó
+> `div0_hook` presente en el binario (`nm` sobre `build/inotia3.elf`) -- pero `logs/log_008.txt` seguía
+> mostrando la misma línea vieja `"Corrida 53: raise(8)"` sin la advertencia nueva, y sin `.psp2dmp` nuevo
+> esta vez. Investigado a fondo (mecanismo de `hook_addr`/`hook_arm` en `lib/so_util/so_util.c` re-verificado
+> línea por línea, `so_flush_caches()` confirmado corriendo justo después de `so_patch()` en
+> `source/utils/init.c`, tags ARM/Thumb de los símbolos re-confirmados vía `nm -D` fresco -- todo correcto,
+> no hay bug en el mecanismo de hooking). **La causa real**: `source/utils/logger.h` define
+> `l_debug`/`l_info`/`l_warn`/`l_success`/`l_wait` como macros vacías salvo que `DEBUG_SOLOADER` esté
+> definido, y `CMakeLists.txt` sólo lo define si `CMAKE_BUILD_TYPE=Debug` -- el prompt interactivo de
+> `build_and_install.sh` se respondió "Release" en los dos builds probados hasta ahora esta sesión. Sólo
+> `l_error`/`l_fatal` compilan siempre. Esto significa: (1) el propio `div0_hook` (un solo `l_warn`) se
+> volvía una función vacía en Release -- pero AÚN ASÍ debería seguir suprimiendo el crash correctamente,
+> porque simplemente no llamar a `raise()` y retornar ya alcanza, sin necesitar loguear nada; (2)
+> `_log_print()` sólo se llama alguna vez vía `l_error`/`l_fatal` en Release, y crea el archivo de log
+> perezosamente en su primera llamada -- una sesión sin ningún error/fatal genuino NO CREA ningún archivo
+> nuevo en absoluto; `log_008.txt` es sobrante de la corrida de crash ANTERIOR (antes del fix), y el
+> pull-de-logs simplemente agarró el archivo con el número más alto que existe en la consola, que seguía
+> siendo el 008 porque nunca se creó uno nuevo; (3) el logging de diagnóstico de la Corrida 68
+> (`GAMESTATE_SetState_hook`/`EVTSYSTEM_SetState_hook`/`MAP_Load_hook`, todo `l_debug`) tampoco generaba
+> nada en Release -- el síntoma separado de "táctil/botones muertos al cambiar de stage" sigue sin ninguna
+> evidencia de log todavía, no se debe forzar una conclusión sin datos reales.
+>
+> **Fix aplicado**: subidos `div0_hook` y las 6 llamadas `l_debug` dentro de
+> `GAMESTATE_SetState_hook`/`EVTSYSTEM_SetState_hook`/`MAP_Load_hook` a `l_error` (nunca gateado por
+> `DEBUG_SOLOADER`, siempre flushea de inmediato) -- así la próxima prueba deja evidencia real incluso si
+> se vuelve a compilar en Release por error. **Recomendación fuerte para toda prueba futura de esta
+> sesión**: compilar en Debug (responder "s"/"S" al prompt del script, NO "n") -- el build que se está
+> desplegando ahora mismo (2026-08-11, ~10:56) SÍ es Debug, confirmado por `grep DEBUG_SOLOADER
+> CMakeLists.txt` + la condición real.
+>
+> **Corrida 74 (2026-08-11) — "El guardado dice éxito, pero al cargar está en blanco": instrumentado, no
+> confirmado todavía (`source/patch.c`).** Leído `SAVE_LoadCharacterAll` completo (`out_ghidra.c:82757-
+> 82869`, no sólo `SAVE_Load`): tiene su PROPIO camino de recuperación legítimo, no un error --
+> (`:82852-82856`) si ningún miembro del grupo está vivo (flag alive==1 y HP>0), pone
+> `SAVE_nLiveMercenarySlot=0xff`, deja `PLAYER_pActivePlayer`/`PLAYER_pMainPlayer` AMBOS en NULL, y
+> retorna **1 (éxito)** -- no un fallo. El fallback de la Corrida 69 en `SAVE_Load_hook` (que dispara
+> exactamente con esa condición NULL/NULL) no puede distinguir hoy entre "el parseo del archivo realmente
+> falló" y este caso completamente distinto y no-erróneo ("todo el grupo está muerto/sin HP"). Se descartó
+> una hipótesis de asimetría de clave de encriptación entre `SAVE_SaveDataAsNameAndKey`/
+> `SAVE_LoadDataAsNameAndKey` (la firma decompilada de la de guardar le falta un argumento de
+> `ENCRYPT_Process2` que la de cargar sí tiene) -- confirmado que es un artefacto de recuperación de firma
+> de Ghidra (cada OTRO call site de `ENCRYPT_Process2` usa 4 args), no una asimetría real en el ARM
+> compilado. Ningún log existente (incluyendo `log_008.txt`) cubre una sesión de guardado/carga real -- no
+> hay datos para distinguir los dos casos todavía. **Cambio aplicado**: `SAVE_Load_hook` ahora captura el
+> valor de retorno real de `SAVE_LoadCharacterAll_real` (advierte si es 0 -- fallo de parseo genuino,
+> apunta al contenido/encriptación del archivo) y resuelve+loguea `SAVE_nLiveMercenarySlot` en el mismo
+> fallback NULL/NULL (0xff ahí = el parseo salió bien y esto es el resultado propio del motor para "grupo
+> muerto", el bug estaría más arriba, en por qué todo el grupo terminó muerto/sin HP al guardar; cualquier
+> otro valor apunta a otra causa). No arregla un bug confirmado todavía -- convierte el próximo log real
+> del usuario en una respuesta en vez de otra suposición.
+>
+> Build (Corridas 73/74 juntas, en modo Debug esta vez) compilado y verificado sin errores nuevos.
+>
+> **Pendiente**: redeployar el build de Debug de esta corrida y reproducir AMBOS reportes (crash/freeze de
+> stage transition, y guardar+cargar) en la misma sesión si es posible, para tener por fin un log real y
+> completo de los dos. Sin eso, tanto "sigue habiendo táctil muerto al cambiar de stage" como "por qué el
+> grupo llega muerto al guardar" siguen abiertos.
+
+> **Corrida 75 (2026-08-11) — Encontrada y arreglada la causa REAL del freeze de stage transition, gracias
+> al primer log de Debug completo de esta sesión (`logs/log_009.txt`, 64680 líneas -- el fix de la Corrida
+> 73 para el gap Release/Debug funcionó).** El usuario reportó: "el mundo carga" pero los botones físicos
+> y el táctil dejan de responder por completo, sin crash. Las últimas ~11000 líneas del log son EXACTAMENTE
+> un ciclo repitiéndose para siempre: `WrapperJinterface.SetTimer` → 2x `glOrthox` → una búsqueda JNI de
+> `"isUsableNetwork"` (nunca registrada, "not found") → `WrapperJinterface.Flush` → `SetTimer` de nuevo --
+> el bucle de render/timer sigue vivo (coincide con la firma del freeze ORIGINAL pre-Corrida-65, no un
+> colgado real del hilo), pero nada sale nunca de ese ciclo específico.
+>
+> **Causa raíz confirmada contra `out_ghidra.c`**: `GAMESTATE_DrawMapChange` (`:8333`) dibuja el banner de
+> anuncio y llama a `jIsUsableNetwork()` (resultado descartado, sólo un side-effect) TODOS los frames
+> mientras `onAd==1`, coincidiendo exacto con el ciclo del log. `GAMESTATE_ProcessMapChange` (`:8359`), la
+> máquina de estados hermana, es donde realmente se traba: al llegar `MAPCHANGE_nFrame` a 4,
+> `Extend_CheckAdvDisplay()` corre y -- salvo que `adBlocked` sea distinto de cero -- 1 de cada 3 transiciones
+> (`adCounter % 3 == 0`) pone `onAd=1` y llama `DisplayCenterAd()` (`:117473`), que pone `adAvailable=1`
+> INCONDICIONALMENTE y de inmediato (sin ida y vuelta real a ningún SDK de anuncios -- los stubs JNI de
+> anuncios de este port son no-ops, CLAUDE.md ya los marca "no-op-until-proven-necessary"). El ÚNICO código
+> que vuelve a poner `adAvailable=0` es `ProcessResume` (`:24822`), que sólo corre como parte del ciclo de
+> vida real `nativePause`→`nativeResume`→`nativeResumeClet` que dispararía una Activity de anuncio real
+> ABRIÉNDOSE y CERRÁNDOSE -- como los stubs de anuncio de este port nunca abren una Activity real, ese
+> ciclo nunca ocurre, y `adAvailable` queda en 1 para siempre tras el primer anuncio disparado. La única
+> salida de `GAMESTATE_ProcessMapChange` (`GAMESTATE_SetState(2)`, `:8386-8388`) requiere `onAd==0 &&
+> MAPCHANGE_nFrame==0xb` EXACTOS -- pero como `onAd`/`adAvailable` quedan atascados en 1, `MAPCHANGE_nFrame`
+> sigue incrementándose cada llamada (el `goto` de fallthrough incrementa el frame incluso cuando ninguna
+> rama de anuncio aplica) pasando de largo el 11 sin que `onAd` sea nunca 0 en ese instante EXACTO -- un
+> chequeo de igualdad, no `>=`, así que una vez perdido se pierde para siempre. La máquina de estados queda
+> girando en el lugar indefinidamente, nunca llega al estado 2, y cualquier input que dependa de estar en
+> juego normal queda muerto -- exactamente "el mundo cargó, los botones no responden, sin crash".
+>
+> **Fix aplicado** (`source/patch.c`): hookeado `Extend_CheckAdvDisplay` para forzar `adBlocked=1`
+> incondicionalmente en vez de correr su lógica real basada en
+> `ITEMSYSTEM_IsAdvItemInInven()`/`ITEMSYSTEM_IsAdvOn()` (confirmado que es una escritura pura de flag global,
+> sin ninguna otra llamada JNI/insegura de omitir). Con `adBlocked` siempre distinto de cero, el bloque
+> disparador de anuncios de `GAMESTATE_ProcessMapChange` (`:8418`, gateado por `adBlocked=='\0'`) nunca
+> corre -- `onAd` nunca llega a 1, y la máquina de estados llega a `GAMESTATE_SetState(2)` en horario todas
+> las veces, coincidiendo con la postura ya establecida de este port de que el subsistema de anuncios está
+> fuera de alcance de punta a punta (`HubInitialize_stub`, los no-ops de Hub de la Corrida 72) en vez de
+> intentar fingir un ciclo de vida de anuncio funcional para una función que este port nunca va a servir de
+> verdad.
+>
+> **Sobre el guardado ("no estaba al darle en continue... lanzó un crash")**: `logs/log_010.txt` (la
+> sesión donde se intentó cargar) NO contiene ninguna línea de `SAVE_Load`/`Corrida 69`/`Corrida 74` en
+> absoluto, y tampoco hay `.psp2dmp` nuevo -- el final del log muestra la pantalla de selección de slot
+> renderizando "NO DATA"/"No data has been saved." para todos los slots, es decir: la lista de saves ya
+> decidió "no hay nada" ANTES de siquiera llamar a `SAVE_Load` (ese chequeo de existencia/resumen es más
+> liviano, no pasa por el hook instrumentado). El guardado en cuestión se hizo durante la MISMA sesión
+> congelada de `log_009.txt` (el freeze de la Corrida 75, arriba) -- es plausible que la escritura nunca
+> haya llegado a completarse limpiamente si el freeze interrumpió el flujo antes o durante el guardado.
+> **No confirmado todavía** -- no se puede distinguir con los logs actuales entre "la escritura nunca
+> terminó por el freeze" y un bug independiente en el guardado. El "crash" mencionado tampoco aparece en
+> `log_010.txt` (0 líneas fatal/error, sin `.psp2dmp` nuevo) -- probablemente ocurrió en una sesión
+> posterior todavía no compartida.
+>
+> Build (Corrida 75, modo Debug) compilado y verificado -- `Extend_CheckAdvDisplay_hook` confirmado presente
+> en `build/inotia3.elf` vía `nm`, sin errores nuevos.
+>
+> **Pendiente**: redeployar. El freeze de stage transition debería estar resuelto por completo ahora --
+> confirmar probando varias transiciones seguidas (al menos 3-4, para cubrir el patrón de "cada 3ra"). Para
+> el guardado: con el freeze ya arreglado, guardar de nuevo en una sesión limpia (sin haber pasado por un
+> freeze antes) y probar "Continuar" -- si el save persiste y carga bien esta vez, confirma que el freeze
+> era la causa de la pérdida; si sigue en blanco, mandar el log de ESA sesión específica (debería tener
+> líneas `SAVE_Load`/`Corrida 69`/`Corrida 74` esta vez, al haber llegado más lejos) para retomar la
+> investigación con datos reales en vez de la ausencia total de log_010.txt.
+
+> **Corridas 76-77 (2026-08-11) — Confirmado: el fix de la Corrida 75 funcionó, el usuario ya puede
+> cambiar de stage sin congelarse. Dos reportes nuevos: la cruceta física (arriba) sigue sin hacer nada
+> (esta vez con una captura real del juego corriendo en el port, no la referencia vieja del APK), y el
+> guardado sigue sin persistir de forma confiable ("dice éxito, cargar falla, y el save desaparece") --
+> pedido explícito del usuario: guardar directo en la raíz de la carpeta del juego en vez de depender del
+> esquema de subcarpeta con hash.**
+>
+> **Corrida 76 -- BUTTON_MAP remedido contra una captura real del port, no la referencia del APK
+> (`source/wr_touch.c`).** El usuario adjuntó `2026-08-11-184634.jpg`, confirmado por `sips` como 960x544
+> EXACTOS -- el canvas nativo de este port, sin necesitar ninguna conversión/anclaje de bordes como la
+> vieja referencia de 960x640. Remedido cada botón por centroide de brillo (Python/PIL), no a ojo:
+>
+> | Botón | Valor viejo | Medido/nuevo | Δ |
+> |---|---|---|---|
+> | UP | (140,294) | (140,341) | **47px -- el bug reportado; el valor viejo caía fuera de la zona real de la flecha** |
+> | DOWN | (140,489) | (145,507) | 18px |
+> | LEFT | (35,389) | (42,417) | 28px |
+> | RIGHT | (245,389) | (245,417) | 28px |
+> | START/pausa | (50,320) | (42,272) | 48px (dirección opuesta -- anclado arriba, no abajo) |
+> | CROSS/ataque | (877,454) | (880,470) | 16px |
+> | CIRCLE | (915,332) | (917,365) | 33px |
+> | SQUARE | (750,409) | (757,427) | 18px |
+> | TRIANGLE | (830,329) | (827,365) | 36px |
+> | L/R/SELECT | ~(540/640/735,499) | dentro de 6-19px | sin cambios -- error bajo, no reportados rotos |
+>
+> Todo el cluster anclado al borde inferior tenía un error vertical sistemático que crece con la distancia
+> al borde -- UP (el elemento más alto) tuvo el error más grande (47px) y caía FUERA de su zona real;
+> LEFT/RIGHT/DOWN (errores de 18-28px) tuvieron suerte de caer todavía DENTRO de sus zonas. CIRCLE/SQUARE/
+> TRIANGLE estaban vacíos/sin equipar en la captura (sin ícono visible) -- se emparejaron con su
+> `SCE_CTRL_*` existente por coordenada X más cercana (X no se ve afectado por el error de anclaje
+> vertical, así que es la señal confiable) en vez de adivinar por apariencia de ícono.
+>
+> **Corrida 77 -- guardado movido a la raíz del juego, logging permanente agregado
+> (`source/patch.c`).** Leído `HubSave_MakeFullName` (`out_ghidra.c:124212-124222`) directamente: YA TIENE
+> un fallback a la raíz incorporado -- `if (folder==NULL || folder[0]=='\0') sprintf(out,"%s",name); else
+> sprintf(out,"%s/%s",folder,name);` -- así que vaciar la salida de `HubSave_GetFolderName` es el fix
+> completo y mínimo, sin tocar la lógica del nombre de archivo. **Fix**: `HubSave_GetFolderName_hook`
+> (reemplazo completo, sólo vacía el buffer de salida) reemplaza el cálculo de MD5 -- la ruta resultante
+> pasa a ser `save<N>.dat` sin subcarpeta, que el `has_subdir` de `CS_fsOpen_hook` (Corrida 65) ya trata
+> correctamente como "no necesita crear directorio" -- resuelve directo a
+> `ux0:data/inotia3/save<N>.dat`. También agregado: `SAVE_Save_hook` (wrapper que loguea entrada/salida/
+> resultado con `l_error`, antes CERO logging del lado de guardar) y logging de entrada/éxito incondicional
+> en `SAVE_Load_hook` (antes sólo logueaba en sus ramas de fallback) -- ambos con `l_error` (Corrida 73:
+> siempre compila, a diferencia de `l_warn`/`l_debug` en build Release) para que el próximo log muestre
+> evidencia real sin importar el resultado. Esto cierra el hueco que dejó tanto `log_010.txt` como
+> `log_011.txt` completamente en blanco de actividad de `SAVE_*` a pesar de que el usuario guardó y cargó
+> activamente en ambas sesiones.
+>
+> Build (Corridas 76-77, modo Debug) compilado y verificado sin errores nuevos.
+>
+> **Pendiente**: redeployar y probar arriba/abajo/izquierda/derecha, guardar, volver al menú principal, y
+> cargar -- todo en la misma sesión si es posible. El save ahora debería aparecer directo como
+> `ux0:data/inotia3/save<N>.dat` (inspeccionable/respaldable a mano). Si el guardado sigue fallando, el
+> próximo log DEBE mostrar `Corrida 77: SAVE_Save()`/`SAVE_Load(...)` esta vez -- si sigue sin aparecer
+> ninguna línea, significa que ninguna de las dos funciones se está alcanzando siquiera, y habría que
+> buscar más arriba en la cadena de lo que este fix toca.
+
 ## 3. Riesgos genéricos heredados de la arquitectura SoLoader (aplican igual que en cualquier port)
 - Rutas con espacio en `PSVITA Develop` → build en `/tmp` (`porting_tools/build/build_and_install.sh` ya lo
   resuelve).

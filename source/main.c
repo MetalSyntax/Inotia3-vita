@@ -4,6 +4,7 @@
 #include "utils/logger.h"
 #include "wr_timer.h"
 #include "wr_touch.h"
+#include "audio.h"
 
 #include <psp2/kernel/threadmgr.h>
 
@@ -121,6 +122,12 @@ static void wr_dispatch_event(int type, int p1, int p2, int touchCount) {
 }
 
 int main() {
+    // Corrida 67: started before anything else so it can flush the log ring
+    // independently of the main thread's health for the whole process
+    // lifetime, including a hang inside soloader_init_all()/nativeInit()
+    // itself, not just the render loop below.
+    logger_start_watchdog();
+
     soloader_init_all();
 
     int (* JNI_OnLoad)(void *jvm) = (void *) so_symbol(&so_mod, "JNI_OnLoad");
@@ -169,6 +176,12 @@ int main() {
     void (* nativeRender)(void *env, void *clazz, int timerID) =
         (void *) so_symbol(&so_mod, "Java_com_com2us_wrapper_WrapperRenderer_nativeRender");
     g_nativeEvent = (void *) so_symbol(&so_mod, "Java_com_com2us_wrapper_WrapperRenderer_nativeEvent");
+
+    // Audio mixer must be up before nativeInit(): startClet() (which runs
+    // *inside* nativeInit()) can reach SOUNDSYSTEM_*/SOUNDPLAYER_* code that
+    // calls SoundCreate/SoundPlay via JNI immediately (Corrida 63, see
+    // PORTING_PLAN.md -- audio_init() was never called anywhere before this).
+    audio_init();
 
     // Timer table must be in its constructed (empty, maxIndex == -1) state
     // before nativeInit(): startClet() runs *inside* nativeInit() and
@@ -220,6 +233,7 @@ int main() {
     // Flush_stub -> wr_request_present()), exactly like requestRender().
     while (1) {
         wr_process_touch(wr_dispatch_event);
+        wr_process_buttons(wr_dispatch_event);
         wr_run_timers(wr_update_time, wr_render);
         if (wr_take_present_request()) {
             gl_swap();

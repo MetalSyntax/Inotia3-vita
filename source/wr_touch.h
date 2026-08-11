@@ -48,4 +48,14 @@ void wr_touch_init(void);
 // Java original) branches.
 void wr_process_touch(wr_native_event_fn native_event);
 
+// Call once per frame, alongside wr_process_touch() -- maps the Vita's
+// physical buttons to synthetic touches at the fixed screen coordinates of
+// this game's on-screen button cluster (see wr_touch.c's BUTTON_MAP), so the
+// game is fully playable without touching the actual (small, tightly
+// packed) screen elements. Shares the same 5-slot pool wr_process_touch()
+// uses, so real touch and physical buttons combined can never exceed
+// WR_MAX_TOUCH_POINT concurrently -- the same ceiling the original Android
+// MultiTouchListener already enforces.
+void wr_process_buttons(wr_native_event_fn native_event);
+
 #endif // INOTIA3_WR_TOUCH_H

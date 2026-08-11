@@ -9,11 +9,13 @@
 
 #include <psp2/kernel/clib.h>
 #include <psp2/kernel/threadmgr.h>
+#include <psp2/kernel/processmgr.h>
 #include <psp2/io/fcntl.h>
 #include <psp2/io/stat.h>
 
 #include <stdbool.h>
 #include <stdatomic.h>
+#include <stdint.h>
 #include <string.h>
 
 #define COLOR_RED    "\x1B[38;5;196m"
@@ -67,6 +69,55 @@ static char buffer_b[2048];
 static char log_ring[LOG_RING_CAPACITY];
 static size_t log_ring_len = 0;
 
+// Corrida 65: a user-reported hang (touch freeze on stage change) coincided
+// with NO log file appearing at all -- unlike the same freeze symptom before
+// Fase 9's audio/save/text fixes, which kept producing log lines throughout
+// (the render/timer loop stayed alive; only game logic was stuck). A true
+// hang (main thread blocked, nothing left running to ever trigger the
+// size-based flush above) means whatever sat in this ring since the last
+// flush is lost -- there's no clean-shutdown path to rely on. Tracking wall
+// time since the last flush and forcing one after LOG_FLUSH_INTERVAL_US
+// regardless of the ring's fill level bounds that loss to a fixed window
+// instead of however long it takes to accumulate 4KB of debug/info lines
+// (which, away from the JNI-call-heavy boot sequence, can be much longer
+// than it sounds). Checked cheaply on every _log_print call -- no new
+// thread, no extra syscalls except the flush itself.
+#define LOG_FLUSH_INTERVAL_US (500 * 1000)
+static uint64_t log_last_flush_time = 0;
+
+// Corrida 67: the Corrida 65 flush-by-elapsed-time check above only ever
+// runs from INSIDE _log_print() -- it fires "the next time someone logs
+// something", not on a real clock. That's exactly backwards for a TRUE main-
+// thread hang (the scenario Corrida 65's own comment describes: input,
+// render, AND logging all live on that one thread, so when it wedges,
+// _log_print() is never called again either, and the elapsed-time check
+// never gets a chance to re-evaluate). Retested by the user against this
+// exact code: still zero new log content on the freeze. A background thread
+// that flushes on its own schedule, with no dependency on the main thread
+// still being alive to trigger it, is the only way to actually bound the
+// loss. Kept deliberately separate from the main thread's own locking so a
+// stuck sceIoWrite/sceIoOpen (the same class of risk source/audio.c's
+// AUDIO_LOCK_TIMEOUT_US already guards against on the audio mutex) can never
+// turn this watchdog into a second thing that hangs forever either.
+#define LOG_WATCHDOG_INTERVAL_US (250 * 1000)
+#define LOG_WATCHDOG_LOCK_TIMEOUT_US (50 * 1000)
+// sceKernelCreateThread's initPriority doc: "Less if higher priority." audio.c
+// deliberately uses the default 0x10000100 for audio_thread because it's a
+// real-time mixer that can't afford to be starved -- that reasoning doesn't
+// apply here. This thread wakes up 4x/second to do, at most, one small
+// buffered write; it should never compete with rendering, input, or audio
+// for CPU time, so it runs at a deliberately LOWER priority (higher number)
+// than the default instead of copying audio.c's value unexamined.
+#define LOG_WATCHDOG_PRIORITY (0x10000100 + 10)
+// Same reasoning as _log_print()'s own lock below and as AUDIO_LOCK_TIMEOUT_US
+// in audio.c: _log_print() (main thread) can now contend with this watchdog
+// for _log_mutex, and _log_print()'s own critical section is normally quick
+// but can include a full sceIoOpen/Write/Close on LT_WARN/ERROR/FATAL or a
+// ring overflow -- bounded here too so the main thread is never made to wait
+// indefinitely for this background helper.
+#define LOG_PRINT_LOCK_TIMEOUT_US (100 * 1000)
+static SceUID log_watchdog_thread_id = -1;
+
 static void log_flush_ring(void) {
     if (log_ring_len == 0) return;
     SceUID fd = sceIoOpen(log_path, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0777);
@@ -75,6 +126,7 @@ static void log_flush_ring(void) {
         sceIoClose(fd);
     }
     log_ring_len = 0;
+    log_last_flush_time = sceKernelGetProcessTimeWide();
 }
 
 void _log_print(int t, const char* fmt, ...) {
@@ -86,7 +138,22 @@ void _log_print(int t, const char* fmt, ...) {
         }
         atomic_store_explicit(&_log_mutex_ready, true, memory_order_relaxed);
     }
-    sceKernelLockLwMutex(&_log_mutex, 1, NULL);
+
+    // Corrida 67 follow-up: this used to be an infinite (NULL-timeout) wait.
+    // Now that the watchdog thread above also takes _log_mutex -- and holds
+    // it across a sceIoOpen/Write/Close that can stall under I/O pressure,
+    // same as any other file access on this console's shared storage -- an
+    // infinite wait here would let the main thread (input, rendering, game
+    // logic, AND this very logging call, all on one thread) block forever on
+    // that background helper. That's a NEW hang this fix would introduce on
+    // top of the one it exists to survive, so it's bounded exactly like
+    // audio.c's audio_mutex call sites. Losing one debug/info line to a timeout
+    // is a far smaller loss than stalling the whole game.
+    unsigned int log_print_lock_timeout = LOG_PRINT_LOCK_TIMEOUT_US;
+    if (sceKernelLockLwMutex(&_log_mutex, 1, &log_print_lock_timeout) < 0) {
+        sceClibPrintf("Warning: _log_mutex busy (watchdog flushing?), dropping one log line\n");
+        return;
+    }
 
     if (!atomic_load_explicit(&_log_path_ready, memory_order_relaxed)) {
         sceIoMkdir("ux0:data/inotia3", 0777);
@@ -184,9 +251,53 @@ void _log_print(int t, const char* fmt, ...) {
         }
         memcpy(log_ring + log_ring_len, buffer_b, line_len);
         log_ring_len += line_len;
+        if (sceKernelGetProcessTimeWide() - log_last_flush_time >= LOG_FLUSH_INTERVAL_US) {
+            log_flush_ring();
+        }
     }
 
     if (atomic_load_explicit(&_log_mutex_ready, memory_order_relaxed)) {
         sceKernelUnlockLwMutex(&_log_mutex, 1);
+    }
+}
+
+// Locks _log_mutex with a bounded wait (never forever -- same reasoning as
+// audio.c's AUDIO_LOCK_TIMEOUT_US) and flushes the ring, then unlocks. Safe
+// to call before the mutex/path have ever been set up (e.g. the watchdog's
+// very first tick, if it wins a race against the main thread's first log
+// line): _log_mutex_ready being false means there is nothing buffered yet
+// either, so this is just a no-op in that window, not a bug.
+static void log_watchdog_tick(void) {
+    if (!atomic_load_explicit(&_log_mutex_ready, memory_order_relaxed)) {
+        return;
+    }
+    unsigned int timeout = LOG_WATCHDOG_LOCK_TIMEOUT_US;
+    if (sceKernelLockLwMutex(&_log_mutex, 1, &timeout) < 0) {
+        return; // _log_mutex contended right now -- try again next cycle
+    }
+    log_flush_ring();
+    sceKernelUnlockLwMutex(&_log_mutex, 1);
+}
+
+static int log_watchdog_thread_entry(SceSize args, void *argp) {
+    (void) args;
+    (void) argp;
+    while (1) {
+        sceKernelDelayThread(LOG_WATCHDOG_INTERVAL_US);
+        log_watchdog_tick();
+    }
+    return 0;
+}
+
+void logger_start_watchdog(void) {
+    if (log_watchdog_thread_id >= 0) {
+        return; // already running
+    }
+    log_watchdog_thread_id = sceKernelCreateThread("log_watchdog", log_watchdog_thread_entry,
+                                                    LOG_WATCHDOG_PRIORITY, 0x4000, 0, 0, NULL);
+    if (log_watchdog_thread_id >= 0) {
+        sceKernelStartThread(log_watchdog_thread_id, 0, NULL);
+    } else {
+        sceClibPrintf("Error: failed to create log watchdog thread: 0x%x\n", log_watchdog_thread_id);
     }
 }

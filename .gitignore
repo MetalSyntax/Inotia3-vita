@@ -39,6 +39,13 @@
 # Librerías dinámicas originales no deben subirse (salvo que sea el binario final generado localmente, pero mejor ser restrictivo)
 *.so
 
+# Capturas de pantalla del juego corriendo (in-game o de la app original) --
+# muestran contenido con copyright de Com2uS directamente, mismo criterio que
+# el resto de esta sección. Usadas puntualmente como referencia para medir
+# coordenadas de UI (ver comentarios de source/wr_touch.c) pero no se suben.
+2026-*.jpg
+inotia-3-children-of-carnia_*.jpg
+
 # ==============================================================================
 # IMÁGENES GENERADAS POR IA (GEMINI) / MOCKUPS
 # ==============================================================================

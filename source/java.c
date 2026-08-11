@@ -34,6 +34,7 @@
 #include "utils/logger.h"
 #include "wr_timer.h"
 #include "reimpl/apk_zip.h"
+#include "audio.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -129,9 +130,8 @@ NameToMethodID nameToMethodId[] = {
     // Com2uS audio surface. The .so's SOUNDSYSTEM_*/SOUNDPLAYER_* code delegates
     // playback to Android via these static WrapperJinterface methods (jSound*
     // wrappers). All return int; SoundCreate returns a sound handle the engine
-    // keeps and passes to the others. Stubbed as no-ops for now (Fase 7 audio),
-    // but SoundCreate hands back a unique nonzero handle so the engine treats
-    // every sound as "loaded" and doesn't retry loading it every frame.
+    // keeps and passes to the others. Real Tremor-backed playback (source/
+    // audio.c, wired in below at Corrida 63 -- see PORTING_PLAN.md).
     { 27, "SoundCreate", METHOD_TYPE_INT },     // (Ljava/lang/String;Z)I
     { 28, "SoundDestroy", METHOD_TYPE_INT },    // (I)I
     { 29, "SoundPlay", METHOD_TYPE_INT },       // (IZ)I
@@ -210,6 +210,39 @@ NameToMethodID nameToMethodId[] = {
     // engine's universal text-draw entry point (every menu/HP/item/dialogue
     // string in the game funnels through it), left unregistered until now.
     { 49, "DrawTextInRect", METHOD_TYPE_INT },
+
+    // Corrida 60: WrapperJinterface.GetStringWidth(String, int, int): int --
+    // confirmed literal signature "(Ljava/lang/String;II)I" via the native
+    // wrapper jGetStringWidth (out_ghidra.c:143919). Investigated for a user
+    // report of "some texts have no background panel and show as plain white
+    // letters" (readability bug). This is a SEPARATE text-measurement entry
+    // point from GetStringWidthHeightInRect (id 46, fixed in Corrida 44):
+    // jGetStringWidth is called by __utilGetStringWidth (out_ghidra.c:151938,
+    // backing CSOGL_grpGetStringWidth/ByUTF8) and by SGL_GetAsciiTextSize
+    // (out_ghidra.c:162608-162632) -- a sibling of SGL_GetTextSizeInRect/
+    // SGL_GetTextSize (:162570-162604), which correctly go through the
+    // already-working id 46 (jGetStringWidthHeightInRect) instead. Left
+    // unregistered, GetMethodID returns NULL -- but unlike Corrida 40/50's
+    // crash-prone strcpy(NULL) call sites, jGetStringWidth is written
+    // defensively enough not to crash on that: it unconditionally calls
+    // CallIntMethod(env, obj, NULL, ...) anyway, and FalsoJNI's
+    // methodIntCall() (lib/falso_jni/FalsoJNI_ImplBridge.c) falls through its
+    // "not found" loop to `return -1;` (NOT 0 -- confirmed by reading that
+    // function directly, unlike methodObjectCall/methodVoidCall which have
+    // different fallbacks). That -1 propagates straight back out as a
+    // "measured text width" of -1 to whichever caller uses it to size a
+    // background/highlight rect BEFORE the actual text glyphs are drawn.
+    // Since the glyphs themselves are sized and drawn through the OTHER,
+    // correctly-registered id 46/49 pair (SGL_grpCreateStringImageInRect's
+    // own string-image object, which never touches this value), the net
+    // effect for any UI element that sizes its background via THIS call path
+    // instead of SGL_GetTextSizeInRect's is exactly "text renders fine, its
+    // background box does not" -- the most concrete, decompile-supported
+    // candidate found for the "some texts have no background" report. NOT
+    // confirmed against a real hardware log yet -- see GetStringWidth_stub's
+    // own comment and PORTING_PLAN.md's Corrida 60 entry for the full
+    // writeup and what's still open.
+    { 50, "GetStringWidth", METHOD_TYPE_INT },
 };
 
 MethodsBoolean methodsBoolean[] = {};
@@ -375,6 +408,35 @@ jint GetStringWidthHeightInRect_stub(jmethodID id, va_list args) {
     return max_width;
 }
 
+// Corrida 60: WrapperJinterface.GetStringWidth(String, int, int): int -- see
+// the NameToMethodID comment above (id 50) for the full call-chain writeup.
+// A flat, single-line measurement (the real Java implementation is one
+// paint.measureText() call, no wrapping) using the SAME per-byte metric table
+// as GetStringWidthHeightInRect_stub/DrawTextInRect_stub (inotia3_char_width)
+// for the same reason those do: this port's bitmap font has one fixed
+// per-byte metric, not a scalable one, so fontSize/fontStyle are accepted
+// (to match the real signature) but otherwise ignored.
+jint GetStringWidth_stub(jmethodID id, va_list args) {
+    jstring str_obj = va_arg(args, jstring);
+    va_arg(args, jint); // fontSize
+    va_arg(args, jint); // fontStyle
+
+    if (!str_obj) return 0;
+
+    const unsigned char *str = (const unsigned char *) jni->GetStringUTFChars(&jni, str_obj, NULL);
+    size_t len = strlen((const char *) str);
+
+    int width = 0;
+    for (size_t i = 0; i < len;) {
+        size_t advance;
+        width += inotia3_char_width(str, i, len, &advance);
+        i += advance;
+    }
+
+    jni->ReleaseStringUTFChars(&jni, str_obj, (char *) str);
+    return width;
+}
+
 // Corrida 59: DrawTextInRect never being registered was the root cause of
 // EVERY piece of dynamically-drawn text in this port being invisible (menus,
 // HP, item names, save-slot text, dialogues) -- not just Hub-style rich text
@@ -534,30 +596,129 @@ void Flush_stub(jmethodID id, va_list args) {
     wr_request_present();
 }
 
-// --- Audio no-op stubs -------------------------------------------------------
-// Fase 7's real Tremor-backed playback (source/audio.c/.h) is temporarily
-// disconnected (not deleted) to eliminate the audio subsystem/mixer thread
-// as a variable while triaging the Fase 9 stack-protector crash in
-// png_create_read_struct_2 -- see PORTING_PLAN.md. Re-wire these back to
-// audio_sound_*() once that crash is resolved.
-static jint g_next_sound_handle = 1;
+// --- Audio wrappers -----------------------------------------------------
+// Corrida 63 (PORTING_PLAN.md): re-wired to the real Tremor-backed playback
+// in source/audio.c/.h. These 9 ids were deliberately disconnected (wired to
+// no-ops instead) starting around Corrida 33 to rule the audio/mixer thread
+// out while triaging the Fase 9 stack-protector crash in
+// png_create_read_struct_2 -- that crash was root-caused in Corrida 47 to an
+// unrelated sign-bit bug in RES_MoveToFilePack (already fixed), so there is
+// no longer a known reason to keep audio disconnected. See PORTING_PLAN.md
+// Corrida 63 for the full note and remaining verification caveats.
 
-jint SoundCreate_stub(jmethodID id, va_list args) {
-    jstring name_obj = va_arg(args, jstring);
-    if (name_obj) {
-        const char *name = jni->GetStringUTFChars(&jni, name_obj, NULL);
-        game_log("[Audio] SoundCreate(\"%s\") -> handle %d (no-op)", name, g_next_sound_handle);
-        jni->ReleaseStringUTFChars(&jni, name_obj, (char *)name);
+// Resolves the logical name libgame.so passes to SoundCreate into a real
+// on-disk path, mirroring GetFileDescriptor_stub's loose-asset convention
+// above: assets are staged loose under INOTIA3_LOOSE_ASSETS_PATH keeping
+// their original APK "disguise" suffix (INOTIA3_RES_NAME_APPEND, ".jpg" on
+// what is actually a plain OggS/Vorbis file -- see audio.h), and the code
+// re-appends that suffix itself rather than requiring any asset-staging
+// script to strip it (audio.h's own header comment says stripping is an
+// "asset-preparation concern" -- that turned out to be unnecessary and,
+// worse, inconsistent with how the already-working image path above
+// resolves names: it also keeps the ".jpg" suffix on disk and re-appends it
+// in code, never strips it). Tries multiple candidates and logs which one
+// hit (if any), since the exact string libgame.so passes here hasn't been
+// confirmed against out_ghidra.c in this environment (no decompiled_so
+// checkout available) -- see PORTING_PLAN.md Corrida 63.
+static int inotia3_resolve_sound_path(const char *name, char *out, size_t out_size) {
+    if (!name || !name[0] || out_size == 0) return 0;
+
+    struct stat st;
+
+    // Candidate 1: verbatim -- already absolute, or already fully resolved
+    // by whatever built the string on the .so side.
+    if (stat(name, &st) == 0) {
+        strncpy(out, name, out_size - 1);
+        out[out_size - 1] = '\0';
+        return 1;
     }
-    return g_next_sound_handle++;
-}
 
-jint Sound_NoopOk(jmethodID id, va_list args) {
+    // Candidate 2: loose-assets dir + name as-is (name may already carry
+    // ".ogg" or even the full disguise ".ogg.jpg" suffix).
+    snprintf(out, out_size, "%s%s", INOTIA3_LOOSE_ASSETS_PATH, name);
+    if (stat(out, &st) == 0) return 1;
+
+    // Candidate 3: loose-assets dir + name + disguise suffix -- same
+    // convention GetFileDescriptor_stub uses for images.
+    snprintf(out, out_size, "%s%s%s", INOTIA3_LOOSE_ASSETS_PATH, name, INOTIA3_RES_NAME_APPEND);
+    if (stat(out, &st) == 0) return 1;
+
+    out[0] = '\0';
     return 0;
 }
 
-jint SoundGetVolume_stub(jmethodID id, va_list args) {
-    return 100;
+// SoundCreate(String path, boolean loop): int -- (Ljava/lang/String;Z)I
+jint SoundCreate_wrapper(jmethodID id, va_list args) {
+    jstring name_obj = va_arg(args, jstring);
+    jint loop = va_arg(args, jint); // jboolean is promoted to int in varargs
+
+    if (!name_obj) return 0;
+    const char *name = jni->GetStringUTFChars(&jni, name_obj, NULL);
+
+    char resolved[256];
+    jint handle = 0;
+    if (inotia3_resolve_sound_path(name, resolved, sizeof(resolved))) {
+        handle = audio_sound_create(resolved, loop);
+        game_log("[Audio] SoundCreate(\"%s\") -> \"%s\", handle %d", name, resolved, handle);
+    } else {
+        game_log("[Audio] SoundCreate(\"%s\"): could not resolve to a real file under %s "
+                  "(tried verbatim, %s<name>, %s<name>%s)",
+                  name, INOTIA3_LOOSE_ASSETS_PATH, INOTIA3_LOOSE_ASSETS_PATH,
+                  INOTIA3_LOOSE_ASSETS_PATH, INOTIA3_RES_NAME_APPEND);
+    }
+
+    jni->ReleaseStringUTFChars(&jni, name_obj, (char *) name);
+    return handle;
+}
+
+// SoundDestroy(int handle): int -- (I)I
+jint SoundDestroy_wrapper(jmethodID id, va_list args) {
+    jint handle = va_arg(args, jint);
+    return audio_sound_destroy(handle);
+}
+
+// SoundPlay(int handle, boolean loop): int -- (IZ)I
+jint SoundPlay_wrapper(jmethodID id, va_list args) {
+    jint handle = va_arg(args, jint);
+    jint loop = va_arg(args, jint);
+    return audio_sound_play(handle, loop);
+}
+
+// SoundPause(int handle): int -- (I)I
+jint SoundPause_wrapper(jmethodID id, va_list args) {
+    jint handle = va_arg(args, jint);
+    return audio_sound_pause(handle);
+}
+
+// SoundResume(int handle): int -- (I)I
+jint SoundResume_wrapper(jmethodID id, va_list args) {
+    jint handle = va_arg(args, jint);
+    return audio_sound_resume(handle);
+}
+
+// SoundStop(int handle): int -- (I)I
+jint SoundStop_wrapper(jmethodID id, va_list args) {
+    jint handle = va_arg(args, jint);
+    return audio_sound_stop(handle);
+}
+
+// SoundGetVolume(int handle): int -- (I)I
+jint SoundGetVolume_wrapper(jmethodID id, va_list args) {
+    jint handle = va_arg(args, jint);
+    return audio_sound_get_volume(handle);
+}
+
+// SoundSetVolume(int handle, int volume): int -- (II)I
+jint SoundSetVolume_wrapper(jmethodID id, va_list args) {
+    jint handle = va_arg(args, jint);
+    jint volume = va_arg(args, jint);
+    return audio_sound_set_volume(handle, volume);
+}
+
+// SoundPrepare(int handle): int -- (I)I
+jint SoundPrepare_wrapper(jmethodID id, va_list args) {
+    jint handle = va_arg(args, jint);
+    return audio_sound_prepare(handle);
 }
 
 MethodsInt methodsInt[] = {
@@ -566,19 +727,20 @@ MethodsInt methodsInt[] = {
     { 12, GetRealScreenHeight_stub },
     { 16, JSON_getInt_stub },
     { 18, JSON_length_stub },
-    { 27, SoundCreate_stub },
-    { 28, Sound_NoopOk },    // SoundDestroy
-    { 29, Sound_NoopOk },    // SoundPlay
-    { 30, Sound_NoopOk },    // SoundPause
-    { 31, Sound_NoopOk },    // SoundResume
-    { 32, Sound_NoopOk },    // SoundStop
-    { 33, SoundGetVolume_stub },
-    { 34, Sound_NoopOk },    // SoundSetVolume
-    { 35, Sound_NoopOk },    // SoundPrepare
+    { 27, SoundCreate_wrapper },
+    { 28, SoundDestroy_wrapper },
+    { 29, SoundPlay_wrapper },
+    { 30, SoundPause_wrapper },
+    { 31, SoundResume_wrapper },
+    { 32, SoundStop_wrapper },
+    { 33, SoundGetVolume_wrapper },
+    { 34, SoundSetVolume_wrapper },
+    { 35, SoundPrepare_wrapper },
     { 36, GetScreenWidth_stub },
     { 37, GetScreenHeight_stub },
     { 46, GetStringWidthHeightInRect_stub },
     { 49, DrawTextInRect_stub },
+    { 50, GetStringWidth_stub },
 };
 MethodsLong methodsLong[] = {
     { 38, GetMaxMemory_stub },
@@ -724,10 +886,35 @@ jobject GetFileDescriptor_stub(jmethodID id, va_list args) {
     return 0;
 }
 
+// Corrida 69 (so-crash-triage, save-load crash) / Corrida 72 (reverted --
+// so-crash-triage, save disappeared): WrapperJinterface.GetAppProperty
+// (confirmed via jGetAppProperty, out_ghidra.c:146811, real signature
+// "([B)[B", byte[] in/out) is called with exactly 3 keys (grepped every
+// CS_hlpGetAppProperty call site): "uniqueUserId", "uniqueDeviceId",
+// "sessionKey". Corrida 69 changed this from a fixed non-empty 12-byte
+// payload ("123456789012") to an empty array, on the hypothesis that
+// DownloadGameData (out_ghidra.c:16260) gating a Hub cloud-download call on
+// `buf[0] != '\0'` was the cause of a save-load crash. Corrida 72 found the
+// REAL, byte-exact-confirmed cause of that crash was unrelated (SAVE_Load's
+// own PLAYER_pActivePlayer NULL-deref, fixed via SAVE_Load_hook below/
+// elsewhere in this file's history) -- the DownloadGameData angle was never
+// more than a plausible-looking stack-scan artifact. Worse, this same
+// "uniqueUserId" value is what HubSave_LoadKey() (out_ghidra.c:124296) uses
+// to compute the on-disk save subdirectory (HubSave_GetFolderName ->
+// MD5(HubSave_key)) -- making it empty changed that subdirectory's hash from
+// MD5("123456789012") to MD5(""), silently orphaning every save written
+// under the old value. Reverted to the original stable non-empty payload:
+// the save-path stability this is actually relied on for matters more than
+// the unconfirmed Hub-download hypothesis, and that path is closed properly
+// now anyway via a direct no-op hook on CS_hubDownloadGameData/
+// CS_hubUploadCompleteGameData/CS_hubUploadGameData in source/patch.c
+// (Corrida 72) -- the right layer to neutralize it without depending on
+// what this shared, multi-consumer JNI property call returns.
 jobject GetAppProperty_stub(jmethodID id, va_list args) {
     jbyteArray arr = jni->NewByteArray(&jni, 12);
-    jbyte data[12] = "123456789012";
-    jni->SetByteArrayRegion(&jni, arr, 0, 12, data);
+    if (arr) {
+        jni->SetByteArrayRegion(&jni, arr, 0, 12, (jbyte *) "123456789012");
+    }
     return arr;
 }
 
