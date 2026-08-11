@@ -37,7 +37,19 @@ void gl_preload() {
 }
 
 void gl_init() {
-    vglInitExtended(0, 960, 544, 6 * 1024 * 1024, SCE_GXM_MULTISAMPLE_4X);
+    // Corrida 78: MULTISAMPLE_4X was an unexamined leftover from this repo's
+    // original SoLoBoP boilerplate -- both ../Zenonia2-vita and
+    // ../Zenonia3-vita (same vitaGL, same hardware, confirmed working in
+    // production) deliberately use MULTISAMPLE_NONE for this exact
+    // 2D-sprite-blit rendering style, where MSAA's edge-antialiasing cost
+    // buys little visible benefit. Pure GPU-load reduction, no gameplay-logic
+    // risk (unlike the frame-cap/vsync tuning those two ports also carry,
+    // which compensates for Gamevil's Nexus2/"Clet" engine's own frame-rate-
+    // coupled game-logic timing -- NOT verified whether Inotia 3's Com2uS
+    // wrapper engine has the same coupling, given it already has its own
+    // explicit timer system (wr_timer.c) rather than relying on raw frame
+    // rate, so that specific technique was deliberately NOT ported here).
+    vglInitExtended(0, 960, 544, 6 * 1024 * 1024, SCE_GXM_MULTISAMPLE_NONE);
 }
 
 void gl_swap() {

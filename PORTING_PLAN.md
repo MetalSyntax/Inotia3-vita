@@ -3420,6 +3420,45 @@ decompilado ante cualquier crash con `.psp2dmp`.
 > ninguna línea, significa que ninguna de las dos funciones se está alcanzando siquiera, y habría que
 > buscar más arriba en la cadena de lo que este fix toca.
 
+> **Corrida 78 (2026-08-11) — Comparado contra `../Zenonia2-vita`/`../Zenonia3-vita` en busca de técnicas
+> de rendimiento probadas, a pedido del usuario (reportó caída de FPS probando builds de Debug; se generó
+> además un build Release, `build/inotia3-release.vpk`, sin el logging pesado de `DEBUG_SOLOADER`, para
+> medir el FPS real por separado de este cambio).**
+>
+> - **Overclock CPU/GPU/bus** (`source/utils/init.c:48-51`, 444/222/222/166 MHz): YA estaba presente y
+>   coincide exactamente con los valores de Zenonia3-vita (Zenonia2-vita usa un clock de GPU más bajo,
+>   166 en vez de 222) -- no se tocó, nada que portar.
+> - **MSAA -- cambiado**: `gl_init()` (`source/utils/glutil.c`) usaba `SCE_GXM_MULTISAMPLE_4X`. Ambos
+>   ports de Zenonia (`Zenonia2-vita/loader/main.c:377`, `Zenonia3-vita/loader/main.c:298`) usan
+>   `SCE_GXM_MULTISAMPLE_NONE` en producción, con un comentario explícito de que es la configuración
+>   confirmada en hardware real para render de sprites 2D. Cambiado para que coincida -- reducción pura de
+>   carga de GPU, sin ningún riesgo de lógica de juego, aplicado sin flag (no es experimental).
+> - **Cap de FPS/vsync -- descartado a propósito**: ambos ports de Zenonia tienen un modo
+>   `LOCK_FPS_30`-style (`eglSwapInterval`/`vglWaitVblankStart` + pacing manual) -- pero existe
+>   específicamente para compensar que el motor Nexus2/"Clet" de Gamevil (el de Zenonia, NO el de Inotia 3)
+>   ata su lógica de juego al framerate crudo de la era Android (~30 FPS) -- correr más rápido literalmente
+>   acelera el gameplay en ESE motor. Inotia 3 usa el wrapper propio de Com2uS con su propio sistema de
+>   timers explícitos (`source/wr_timer.c`), no necesariamente con el mismo acoplamiento -- copiar este
+>   "fix" a ciegas arriesgaría romper la velocidad del gameplay (un riesgo de corrección, no una ganancia
+>   de rendimiento) sin evidencia de que este motor lo necesite. No implementado -- si el usuario nota que
+>   el juego corre más rápido/lento de lo esperado, ahí es donde investigar primero.
+> - **Triple buffering -- descartado**: ambos ports de Zenonia desactivan `vglUseTripleBuffering` pero
+>   como fix de estabilidad (un crash de init de vitaGL que tuvieron), no una técnica de rendimiento
+>   comprobada -- sin evidencia de que este port lo necesite (ya inicializa y corre bien).
+> - **Flags de compilador/linker**: sin diferencias de flags seguros/estándar entre los `CMakeLists.txt`
+>   -- los flags propios de Zenonia3-vita son específicos de su motor (`RGB565_MODE_*`, etc.), no
+>   portables. `-O3 -ffast-math` ya estaba presente en ambos.
+> - **Prioridad de hilos**: ningún `sceKernelChangeThreadPriority` en el loop principal de ningún port de
+>   Zenonia -- nada que portar.
+>
+> Build (Debug y Release, con este cambio) compilado y verificado sin errores nuevos.
+>
+> **Pendiente**: probar el build Release (`build/inotia3-release.vpk`) para el FPS real sin overhead de
+> logging, y por separado notar si el cambio de MSAA se siente/ve distinto (visualmente, sin 4x MSAA los
+> bordes de sprites pueden verse un poco más dentados, a cambio de menos carga de GPU -- confirmar si el
+> trade-off vale la pena en este juego). Si el gameplay se siente con velocidad incorrecta en algún punto,
+> revisar primero el ángulo de acoplamiento framerate/lógica descartado arriba.
+
 ## 3. Riesgos genéricos heredados de la arquitectura SoLoader (aplican igual que en cualquier port)
 - Rutas con espacio en `PSVITA Develop` → build en `/tmp` (`porting_tools/build/build_and_install.sh` ya lo
   resuelve).
