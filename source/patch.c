@@ -17,6 +17,7 @@
 
 #include "utils/logger.h"
 #include "utils/utils.h"
+#include "utils/glutil.h"
 #include "reimpl/jmp_shim.h"
 
 #include <psp2/kernel/processmgr.h>
@@ -1470,6 +1471,164 @@ static void GRP_DrawPixel_hook(int x, int y) {
     SO_CONTINUE_VOID(h_GRP_DrawPixel, x, y);
 }
 
+// --- Corrida 79/81: translucent black backgrounds behind certain text/
+// panels are completely absent (stage-name banner, item-info tooltip, and
+// now confirmed on a THIRD, worse case: a "Saved"/OK confirmation popup
+// with literally zero backdrop, rendering directly on top of the SYSTEM
+// menu behind it) while everything drawn on top of them still renders
+// correctly ---------------------------------------------------------------
+//
+// Corrida 79's own hypothesis (GL_COLOR_ARRAY shadowing glColor4x's flat
+// color) was deployed and RETESTED on real hardware/emulator -- the bug
+// still happens. That hypothesis is not confirmed and its behavioral fix
+// (forcibly disabling GL_COLOR_ARRAY around every SGL_grpFillRect call) is
+// REVERTED below -- an unconfirmed state mutation that doesn't fix the
+// reported symptom is a liability, not a safety net (it could easily be
+// clobbering a legitimate per-vertex gradient fill elsewhere instead, which
+// may be why the retest screenshot also shows new-looking artifacts: full-
+// width horizontal lines and columns of flat gray blocks that don't match
+// any of this port's own changes this session -- unconfirmed, but a real
+// question mark this revert also removes as a suspect).
+//
+// New, decompile-confirmed lead for the THIRD case specifically (the "Saved"
+// popup): POPUPMSG_Draw -> DrawPopup -> DrawPopupFrame -> (display types
+// other than 1/6) -> DrawPopupFrameAnimation (out_ghidra.c:100820-100856) ->
+// DrawRect(&local_30, 0xc8000000) -> GRPX_FillRect(*param_1, param_1[2],
+// param_1[4], param_1[5], param_2). Unlike INSTANTMSG_DrawNameFrame (which
+// derives its width from GRPX_GetScreenWidth() every call), this function
+// hardcodes x=0 and w=0x1e0 (480) UNCONDITIONALLY (`local_30 = 0; local_20 =
+// 0x1e0;`) -- on this port's real 960px-wide canvas that only covers the
+// LEFT HALF of the screen, never centered, never adapting. Whether that's
+// actually the (full or partial) cause of "zero backdrop visible anywhere"
+// or a red herring next to a still-unconfirmed alpha/clip issue is NOT
+// established -- fixing this blindly (e.g. centering it, or deriving width
+// from GRPX_GetScreenWidth()) without a reference screenshot of what this
+// SPECIFIC popup should look like on this canvas risks trading one visual
+// bug for another. Left unfixed, flagged here for whoever has that
+// reference next.
+//
+// Also reconsidered from scratch: SGL_grpFillRect (:106134) checks a global
+// clip rect, SGL_CLIP (4 words: x, y, w, h -- confirmed exported via
+// `nm -D`), and returns WITHOUT drawing anything at all if the requested
+// rect falls outside it (out_ghidra.c:106146-106168) -- a stale/leftover
+// clip rect from whatever UI drew immediately before would produce exactly
+// "completely invisible," a better fit for the "Saved" popup's total
+// absence than an alpha-shadowing theory alone. SGL_grpSetClip (:105124) is
+// the only setter -- normal, deliberate, paired set/reset usage elsewhere
+// in this same unmodified .so, so if it's wrong here it's a state-leak this
+// port's own call timing exposes, not a bug in the .so itself. Not
+// confirmed either way without a live value.
+//
+// Corrida 83 retest (logs/log_018.txt, 282 calls captured with the raised
+// cap below): GL_COLOR_ARRAY=0 and SGL_CLIP=[-1,-1,-1,-1] (or a clip the
+// call's own rect falls INSIDE) on every single logged call, including both
+// confirmed-broken examples (the item-info popup's x=15,y=155,w=172,h=150,
+// color=0xd8000000, and a speech-bubble's x=196,y=233,w=87,h=34,
+// color=0xccffffff -- both from DrawSpeechBubble/TouchUIView_DrawRoundRect,
+// both semi-transparent). Both of Corrida 81's candidates are now DEFINITELY
+// ruled out for these calls, not just unconfirmed.
+//
+// Corrida 88 -- new lead, found by reading SGL_grpFillRect's full decompile
+// (not just its color math): unlike EVERY textured draw in this .so
+// (SGL_DrawTexturePart and siblings -- all confirmed rendering correctly),
+// which call glBindTexture + glVertexPointer + glTexCoordPointer themselves
+// on every single draw, SGL_grpFillRect only calls glDisable(GL_TEXTURE_2D)/
+// ...replaced by SO_CONTINUE_VOID.../glEnable(GL_TEXTURE_2D) around its flat
+// quad -- it never touches glBindTexture or GL_TEXTURE_COORD_ARRAY client
+// state at all, and never calls glVertexPointer itself either (it reuses
+// whatever textured draw most recently pointed glVertexPointer(2,GL_FIXED,0,
+// &DAT_001778a8) at the same shared global buffer, per this port's own
+// glVertexPointer_soloader -- confirmed harmless: flush_pending_fixed_arrays
+// re-reads that buffer's CURRENT contents at every glDrawArrays, so
+// SGL_grpFillRect's own fresh corner writes there are picked up correctly
+// regardless of who set the pointer up). GL_TEXTURE_COORD_ARRAY and the
+// last-bound texture, though, are NEVER reset by this function -- if
+// GL_TEXTURE_2D's disable doesn't fully bypass texture sampling in this
+// vitaGL build's fixed-function emulation (this project's own Corrida 24-27
+// history already found other enable-state/GL_FIXED assumptions vitaGL
+// didn't honor the way desktop GL would -- see glutil.c), the fragment could
+// still sample a stale bound texture through stale leftover texcoords and
+// multiply it into the intended flat color, plausibly zeroing out exactly
+// the translucent fills reported missing. Not vendor-source-confirmed (no
+// vitaGL source tree in this repo, prebuilt .a only) -- a plausible, testable
+// lead, not a certainty.
+//
+// Fix: save/disable/restore GL_TEXTURE_COORD_ARRAY and force-unbind the
+// active texture around the real draw call (mirroring Corrida 79's original
+// GL_COLOR_ARRAY save/restore pattern, reverted there because it targeted
+// the wrong state -- this targets a DIFFERENT, not-yet-tested piece of
+// leftover client/texture state instead). Logging kept and extended with
+// the two new values so a still-broken retest immediately shows whether
+// this was already off/unbound (ruling this out too) or actually got
+// forced off by this fix (confirming the mechanism even if visually it
+// still doesn't help for some other reason).
+static so_hook h_SGL_grpFillRect;
+static uint32_t *g_ptr_SGL_CLIP = NULL;
+static int g_fillrect_log_count = 0;
+// Corrida 83: the original cap of 60 was exhausted almost entirely by a
+// legitimate, working full-canvas fade (x=0,y=0,w=480,h=320 -- the WHOLE
+// logical screen, per this .so's glOrthox(0,480,0,320,...) 480x320 logical
+// coordinate space, out_ghidra.c:105501 -- not a bug, just noisy) before the
+// user ever reached the actually-broken popups/panels this hook exists to
+// diagnose. Raised well past a single loading/transition sequence's own
+// call volume so a full test session's worth of calls gets captured instead.
+#define FILLRECT_LOG_MAX 2000
+
+// Corrida 89: Corrida 88's fix (save/force-off/restore GL_TEXTURE_COORD_ARRAY
+// + the bound texture) is confirmed present in the retested build (the log's
+// own diagnostic line format matches) and the anomaly it targeted was real
+// (GL_TEXTURE_COORD_ARRAY=1, a real bound texture) -- but the backgrounds are
+// STILL missing after it. Two additions this round: (1) GL_DEPTH_TEST is the
+// one enable-capability SGL_grpFillRect's own decompile never manages (it
+// only ever touches GL_TEXTURE_2D) -- saved/forced-off/restored the same way,
+// on the chance a UI-overlay quad's implicit Z is failing depth test against
+// whatever's already in the buffer (this project's own Corrida 24-27 history
+// already established vitaGL doesn't always honor enable-state the way
+// desktop GL would, so this is a real, not-yet-tested candidate, not a wild
+// guess). (2) A full diagnostic dump (real post-conversion vertex positions,
+// viewport/scissor, projection/modelview scale+translate -- Corrida 24-27's
+// own log_draw_call machinery, unused for this bug until now because its
+// 400-call budget is long exhausted before a session reaches these specific
+// draws) is FORCED for every semi-transparent fill (alpha < 0xff -- the exact
+// class of call under suspicion; opaque fills aren't reported broken) via
+// gl_force_log_next_draw(), bypassing that budget. If depth test wasn't it
+// either, this dump is the next real lead: it will show whether the actual
+// GPU-bound vertex positions for these draws land anywhere near the visible
+// screen at all.
+static void SGL_grpFillRect_hook(int x, int y, int w, int h, uint32_t color) {
+    int color_array_before = (int) gl_color_array_enabled();
+    int texcoord_array_before = (int) gl_texcoord_array_enabled();
+    int depth_test_before = (int) gl_depth_test_enabled();
+    GLint bound_tex_before = gl_get_bound_texture_2d();
+    if (g_fillrect_log_count < FILLRECT_LOG_MAX) {
+        l_error("Corrida 89: SGL_grpFillRect(x=%d,y=%d,w=%d,h=%d,color=%08x) "
+                "GL_COLOR_ARRAY=%d GL_TEXTURE_COORD_ARRAY=%d GL_DEPTH_TEST=%d bound_tex=%d "
+                "SGL_CLIP=[%d,%d,%d,%d]",
+                x, y, w, h, color, color_array_before, texcoord_array_before, depth_test_before,
+                (int) bound_tex_before,
+                g_ptr_SGL_CLIP ? (int32_t) g_ptr_SGL_CLIP[0] : -12345,
+                g_ptr_SGL_CLIP ? (int32_t) g_ptr_SGL_CLIP[1] : -12345,
+                g_ptr_SGL_CLIP ? (int32_t) g_ptr_SGL_CLIP[2] : -12345,
+                g_ptr_SGL_CLIP ? (int32_t) g_ptr_SGL_CLIP[3] : -12345);
+        g_fillrect_log_count++;
+    }
+    if ((color >> 24) < 0xff) {
+        // Semi-transparent -- the exact class of call reported broken (the
+        // "Saved" popup, item-info tooltip, speech bubble, stage-name banner
+        // are all alpha<0xff; opaque quest-row-style fills aren't reported
+        // broken). Force the deep dump only for these, not all ~800+ fills a
+        // session generates, to keep log volume sane.
+        gl_force_log_next_draw();
+    }
+    gl_set_texcoord_array_enabled(GL_FALSE);
+    gl_bind_texture_2d(0);
+    gl_set_depth_test_enabled(GL_FALSE);
+    SO_CONTINUE_VOID(h_SGL_grpFillRect, x, y, w, h, color);
+    gl_set_depth_test_enabled((GLboolean) depth_test_before);
+    gl_bind_texture_2d(bound_tex_before);
+    gl_set_texcoord_array_enabled((GLboolean) texcoord_array_before);
+}
+
 // --- Corrida 62: in-game "Save" always reports failure -- CS_fsOpen never
 // creates the save subdirectory it composes, and HubSave_ProcessInitialize
 // (the ONLY function that ever would) silently no-ops in this port ---------
@@ -1899,6 +2058,114 @@ static void Extend_CheckAdvDisplay_hook(void) {
     if (g_ptr_adBlocked) *g_ptr_adBlocked = 1;
 }
 
+// --- Corrida 85: instrument CHAR_DrawEx to chase missing party-member
+// thumbnails in the Quest/System side lists (blank tan slots where a small
+// character sprite should be, per user screenshots) -----------------------
+//
+// Traced the draw chain: TouchUIView_DrawQuest/DrawSystem (out_ghidra.c
+// :127362/:127349) don't touch this directly, but PARTY_DrawMember
+// (:76930) -- called for the persistent party-roster sidebar visible
+// alongside these menus -- loops every party slot and, for an occupied
+// slot, calls CHAR_DrawEx(pcVar1, x, y, 0, iVar3, 0) where `iVar3` comes
+// from `*(int *)(pcVar1+0x1e0)` dereferenced one level further, or is
+// forced to -1 if that pointer is NULL (:76952-76963). CHAR_DrawEx itself
+// (:35986) gates its ENTIRE draw body on `(-1 < param_5) && (param_5 <
+// ANIMATIONDEFINEBASE_nRecordCount)` in both the animation-type-2 branch
+// (:36008) and the default branch (:36026) -- passing -1 makes it silently
+// draw nothing at all, no fallback sprite, exactly matching "blank slot
+// with the panel backing still visible but no character on it." This is a
+// strong, decompile-confirmed CANDIDATE mechanism, but WHY that pointer
+// would be NULL specifically for non-active party members on this port
+// (vs. the original Android build) is not yet established -- could be a
+// real init-order/save-load gap specific to this port, or could be
+// legitimate behavior for a slot that's genuinely empty at this point in
+// the user's playthrough (in which case this isn't a bug at all, just
+// where the investigation currently sits). Rather than guess further,
+// hook CHAR_DrawEx itself and log every occurrence of the exact silent-skip
+// condition (param_5 == -1), with the caller's return address, so the next
+// test session's log either confirms this is really what's firing for the
+// reported slots (and from PARTY_DrawMember specifically, not some
+// unrelated call site) or rules it out outright.
+// Corrida 85 follow-up: coordinator confirmed this fires 58x identically in
+// a real session (logs/log_019.txt) -- SAME char pointer (0x9898cf78), SAME
+// screen position (x=360,y=8), SAME caller return address (0x9807fd9d) the
+// entire time. Resolved that caller: it's CHAR_Draw (out_ghidra.c:39319,
+// +0xd1), NOT PARTY_DrawMember -- CHAR_Draw is called from the MAP OBJECT
+// RENDER LOOP (:69511-69522, case 1 in the map-entity switch) with real
+// on-screen tile coordinates, meaning this is a genuine in-world character
+// entity (party member or NPC standing on the current map) that is
+// COMPLETELY INVISIBLE, not just a menu-thumbnail slot -- a materially
+// worse bug than first suspected, though possibly the same underlying gap.
+//
+// Traced offset +0x1e0 further: it's this character's "action list" head
+// (an ACTPOOL-backed linked list -- ACTPOOL_AddTail(char+0x1e0, ...) in
+// CHAR_AddAction, :34609-34633; ACTPOOL_FreeList(*(char+0x1e0)) in
+// CHAR_Destroy, :35675-35689, alongside sibling per-character pools at
+// +0x1a4/+0x1ec/+0x1f0 for buffs/states/effects). The render path
+// (PARTY_DrawMember :76949-76963, and TouchUIView_Draw's own inline copy at
+// :128259-128292) both read this list's FIRST node's +4 field as the
+// "frame_idx" CHAR_DrawEx needs to draw anything at all -- an empty list
+// (head==NULL) means "nothing to render," not "render a default pose."
+// This makes the list read like it's expected to ALWAYS carry at least one
+// baseline entry for any visible character (e.g. a permanent idle/standing
+// action), not just transient combat/skill actions -- but I have not yet
+// found the exact call site responsible for giving a character that
+// baseline entry (CHAR_AddAction's only 3 call sites so far found,
+// :34647/46016/46052, are all skill-learning contexts, not spawn/init) to
+// confirm that theory or find where this port's own init/save-load path
+// might be skipping it. Not confirmable without more data -- extended,
+// not replaced, the diagnostic instead of guessing at a fix I can't verify
+// (a wrong "default action ID" would risk a wrong pose/animation, worse
+// than staying invisible).
+//
+// Added: resolve+log the character's name (CHAR_GetName) alongside the
+// existing frame=-1 log, so the next session identifies WHO this is by
+// name instead of just a raw (and possibly session-specific) pointer value
+// -- and a sibling hook on CHAR_AddAction (below) logging every action
+// added to any character, so cross-referencing the two logs next session
+// answers directly: does this specific character ever get ANY action
+// added during its lifetime, or is its list permanently empty from the
+// moment it's created/loaded?
+typedef void *(*fn_char_getname_t)(int);
+static fn_char_getname_t CHAR_GetName_real = NULL;
+
+static so_hook h_CHAR_DrawEx;
+static int g_char_drawex_skip_log_count = 0;
+#define CHAR_DRAWEX_SKIP_LOG_MAX 100
+
+static void CHAR_DrawEx_hook(int char_ptr, int x, int y, int dir, int frame_idx, uint32_t param6) {
+    if (frame_idx == -1 && g_char_drawex_skip_log_count < CHAR_DRAWEX_SKIP_LOG_MAX) {
+        const char *name = "?";
+        if (CHAR_GetName_real && char_ptr) {
+            void *n = CHAR_GetName_real(char_ptr);
+            if (n) name = (const char *) n;
+        }
+        l_error("Corrida 85: CHAR_DrawEx(char=%p, name=\"%s\", x=%d, y=%d, frame=-1) -- "
+                "silent no-draw, caller return address=%p", (void *) (uintptr_t) char_ptr,
+                name, x, y, __builtin_return_address(0));
+        g_char_drawex_skip_log_count++;
+    }
+    SO_CONTINUE_VOID(h_CHAR_DrawEx, char_ptr, x, y, dir, frame_idx, param6);
+}
+
+static so_hook h_CHAR_AddAction;
+static int g_char_addaction_log_count = 0;
+#define CHAR_ADDACTION_LOG_MAX 200
+
+static uint32_t CHAR_AddAction_hook(int char_ptr, uint16_t *action_id_ptr) {
+    if (g_char_addaction_log_count < CHAR_ADDACTION_LOG_MAX) {
+        const char *name = "?";
+        if (CHAR_GetName_real && char_ptr) {
+            void *n = CHAR_GetName_real(char_ptr);
+            if (n) name = (const char *) n;
+        }
+        l_error("Corrida 85: CHAR_AddAction(char=%p, name=\"%s\", action_id=%u)",
+                (void *) (uintptr_t) char_ptr, name, action_id_ptr ? (unsigned) *action_id_ptr : 0);
+        g_char_addaction_log_count++;
+    }
+    return SO_CONTINUE(uint32_t, h_CHAR_AddAction, char_ptr, action_id_ptr);
+}
+
 // --- Corrida 64: instrument Portrait_Draw to chase a user-reported "glitch"
 // in the top-left HUD character portrait -- static analysis alone could not
 // confirm a bug, so this adds visibility for the next hardware log instead --
@@ -1969,19 +2236,53 @@ static void Portrait_Draw_hook(int record, uint32_t x, uint32_t y, int with_stat
                                 int flip, uint32_t param7) {
     int before_id = g_ptr_Portrait_nLoadedFileID ? *g_ptr_Portrait_nLoadedFileID : -999;
     if (g_portrait_log_count < PORTRAIT_LOG_MAX) {
-        l_debug("Corrida 64: Portrait_Draw(record=%d, x=%u, y=%u, with_state=%d, state=%d, "
-                "flip=%d) Portrait_nLoadedFileID(before)=%d", record, x, y, with_state, state,
-                flip, before_id);
+        // Corrida 80: param7 added -- this is the real Portrait_Draw's own
+        // param_7, which only matters when with_state!=0 (gates the SECOND,
+        // overlay-icon draw). It ends up as the alpha/fade value fed to
+        // SGL_DrawTexturePartEx's glColor4x call (out_ghidra.c:107174,
+        // `uVar3 = (100-param_11)/100`) for that overlay draw specifically --
+        // logging it directly tests whether an unstable per-frame alpha on
+        // that specific draw is what reads as "flicker", the one part of
+        // this call's own parameters that can legitimately vary frame to
+        // frame (everything else already confirmed rock-stable via this same
+        // hook in logs/log_013.txt -- see this function's own header comment).
+        l_debug("Corrida 64/80: Portrait_Draw(record=%d, x=%u, y=%u, with_state=%d, state=%d, "
+                "flip=%d, param7=%u) Portrait_nLoadedFileID(before)=%d", record, x, y, with_state,
+                state, flip, param7, before_id);
     }
+    // Corrida 82: record legitimately changes between real party members
+    // (confirmed via logs/log_015.txt -- NewStringUTF("Ameli")/("Lv.3 Arch
+    // Mage") right after two different reloads, and the 3 distinct call
+    // sites in out_ghidra.c for Portrait_DrawUI all pass a hardcoded Y that
+    // matches the x/y pairs logged here exactly: 0x28/0x2a/0x2b = 40/42/43).
+    // No load ever failed in that whole session (grep for
+    // "(after)=-1" across it: zero hits) and no rapid record-flapping either
+    // (record stays constant for 11-41+ consecutive calls per stretch, never
+    // interleaved) -- ruling out a flapping/state bug. The remaining
+    // candidate for the reported flicker is a genuine load HITCH: every
+    // record change does a full synchronous unload+reload (real disk I/O via
+    // mmap + PNG decode + GL texture upload, out_ghidra.c's GRPI_LoadImage ->
+    // SGL_CreateTexture chain, confirmed real GL not CSFB) on the render
+    // thread, inside this same call, before ever drawing. Timed directly
+    // instead of guessing at the hitch's real cost.
+    uint64_t reload_start_us = sceKernelGetProcessTimeWide();
     SO_CONTINUE_VOID(h_Portrait_Draw, record, x, y, with_state, state, flip, param7);
     if (g_portrait_log_count < PORTRAIT_LOG_MAX) {
         int after_id = g_ptr_Portrait_nLoadedFileID ? *g_ptr_Portrait_nLoadedFileID : -999;
+        int reloaded = after_id != before_id;
+        char reload_time_note[48];
+        reload_time_note[0] = '\0';
+        if (reloaded) {
+            uint64_t elapsed_us = sceKernelGetProcessTimeWide() - reload_start_us;
+            snprintf(reload_time_note, sizeof(reload_time_note),
+                     " Corrida 82: reload_us=%llu", (unsigned long long) elapsed_us);
+        }
         l_debug("Corrida 64: Portrait_Draw(record=%d) -> Portrait_nLoadedFileID(after)=%d "
-                "gImgPortrait={tex=%p piece_count=%d piece_ptr=%p}%s", record, after_id,
+                "gImgPortrait={tex=%p piece_count=%d piece_ptr=%p}%s%s", record, after_id,
                 g_ptr_gImgPortrait ? (void *)(uintptr_t)g_ptr_gImgPortrait[0] : NULL,
                 g_ptr_gImgPortrait ? g_ptr_gImgPortrait[1] : -1,
                 g_ptr_gImgPortrait ? (void *)(uintptr_t)g_ptr_gImgPortrait[2] : NULL,
-                after_id != before_id ? " [RELOADED]" : "");
+                reloaded ? " [RELOADED]" : "", reload_time_note);
         g_portrait_log_count++;
     }
 }
@@ -2326,6 +2627,146 @@ static int CS_hubUploadGameData_hook(int manager, uint32_t p2, uint32_t lo, uint
     return -1;
 }
 
+// --- Corrida 87: Corrida 84's STATE_Set(3->4) rewrite caused a real
+// regression -- a full soft-lock, worse than the original bug -- reverted
+// and replaced with the correct interception point ------------------------
+//
+// Corrida 84 hooked STATE_Set to rewrite state 3 (Hub join-invite) to state
+// 4 (Title) on every call, reasoning that STATE_EnterHub's own setup
+// (button list, image load) was "entirely local, nothing needed later."
+// That reasoning was INCOMPLETE: TITLE_Event (out_ghidra.c:113229-113244),
+// the Title screen's own "any key/touch to continue" handler (event
+// 0x18), re-decides EVERY time whether to go to state 5 (real gameplay) or
+// back to state 3 (Hub) -- `if (GetHubFirstLoginState()==1 ||
+// HUBINSTALL_Check()!=1) STATE_Set(5); else STATE_Set(3);`. Corrida 84's
+// rewrite never let the real STATE_EnterHub/STATE_ExitHub or the button
+// handlers run, so NEITHER of that condition's two escape hatches was ever
+// satisfied (see below) -- every tap on the Title screen re-requested
+// state 3, which got rewritten back to state 4, whose own tap immediately
+// re-requested state 3 again: an infinite loop confirmed directly in
+// `logs/log_017.txt` (STATE_Set(3) firing on every event from line 6644
+// to the end of the session).
+//
+// Traced the REAL "dismiss Hub, go to gameplay" path end to end:
+// HUB_EventButtonLater/HUB_EventButtonRegister (:111368-111408, triggered
+// by the LATER/JOIN NOW buttons) just flag `isReleased`/mark which button
+// was pressed; HUB_ProcessAnimation (:111487-111523, run every tick while
+// the Hub state is active) waits out that button's press animation, then
+// calls HUB_HandleEventAfterAimation (:111470-111483) exactly once:
+//   branch 0 (Register/Join Now): STATE_Set(5); C2S_HubMain();
+//                                  HUBINSTALL_Save(HUB_ChechShow);
+//   branch 1 (Later):             STATE_Set(5); HUBINSTALL_Save(HUB_ChechShow);
+// Both branches go STRAIGHT to state 5 -- NOT back through state 4/Title's
+// own re-check -- and persist the checkbox via HUBINSTALL_Save (confirmed
+// exported via `nm -D`). This is the actual mechanism that lets the real
+// game move on: TITLE_Event's `GetHubFirstLoginState()`/`HUBINSTALL_Check()`
+// gate only matters for the FIRST time Title is entered, before Hub has
+// ever been shown -- once Hub has been dismissed once via this direct
+// STATE_Set(5) path, Title is never re-entered at all on that boot, so its
+// gate never gets a chance to loop.
+//
+// Fix: hook STATE_EnterHub itself (confirmed exported) to replicate
+// EXACTLY what pressing "Later" does, synchronously, the instant the Hub
+// state would have been entered -- STATE_Set(5) then HUBINSTALL_Save(0)
+// (0 = checkbox left unchecked, matching STATE_EnterHub's own
+// HUB_ChechShow=0 default) -- instead of ever building the button list or
+// drawing anything. STATE_Set's own tail is a simple
+// `if (pcVar1) (*pcVar1)();` (out_ghidra.c, end of STATE_Set) with no
+// reentrancy guard, so calling STATE_Set(5) from inside the function that
+// STATE_Set(3) itself is about to invoke as its entry point is safe: the
+// inner call overwrites STATE_fpEnter/fpExit/fpProcess/fpPressKey with
+// state 5's, and the outer STATE_Set(3) call has nothing left to do
+// afterward. Net effect after both calls unwind: the game is in state 5,
+// never state 3 or 4, with HUBINSTALL_Save's persisted flag exactly as if
+// a real user had pressed Later -- so TITLE_Event's gate is simply never
+// consulted again this session, and the loop can't recur. Does not touch
+// the other Hub join-result popup (hubAlertPopupType/jAlertPopup,
+// out_ghidra.c:16440-16456, a different, unrelated UI element) or state 2
+// (Logo, a sibling's separate fix) -- both left completely alone.
+typedef void (*fn_state_set_t)(uint32_t);
+typedef void (*fn_hubinstall_save_t)(uint32_t);
+
+static so_hook h_STATE_EnterHub;
+static fn_state_set_t STATE_Set_real = NULL;
+static fn_hubinstall_save_t HUBINSTALL_Save_real = NULL;
+
+static void STATE_EnterHub_hook(void) {
+    l_warn("Corrida 87: STATE_EnterHub -- auto-dismissing Hub join-invite "
+           "(simulating Later) instead of entering it, no Hub backend in this port");
+    if (STATE_Set_real) STATE_Set_real(5);
+    if (HUBINSTALL_Save_real) HUBINSTALL_Save_real(0);
+}
+
+// --- Corrida 86: Com2uS splash/logo screen reportedly never appears --
+// diagnostics only, no root cause confirmed yet ---------------------------
+//
+// User expects a brief Com2uS-branded splash (static art + logo, per
+// decompiled_apk/resources/res/drawable/com2ushub_logo.png -- confirmed via
+// decompile there is NO video/MediaPlayer/VideoView anywhere on this boot
+// path, so this is not a missing video-playback feature) before the
+// loading screen. Confirmed this IS a real native state in this .so's own
+// STATE_Set(int) dispatcher (out_ghidra.c:24479-24520, distinct from
+// GAMESTATE_SetState/EVTSYSTEM_SetState elsewhere in this file): case 2 is
+// STATE_EnterLogo/STATE_ExitLogo/STATE_ProcessLogo/STATE_PressKeyLogo
+// (:111913-112042). Two real oddities found reading STATE_ProcessLogo
+// directly, neither confirmed against a live run:
+//   1. STATE_EnterLogo unconditionally sets LOGO_nState=1 on entry --  but
+//      STATE_ProcessLogo's LONG animated-intro branch (SNASYS_DrawAnimationEx
+//      stepping through every frame of the real logo animation) only runs
+//      while LOGO_nState=='\0' (0). Right after Enter, LOGO_nState is
+//      ALWAYS 1, so the ELSE branch runs instead: a short, fixed 20-frame
+//      (LOGO_nFrame 0..0x14) static hold-and-fade of frame 0 only, then
+//      STATE_Set(4) [Title] unconditionally. If that's really what always
+//      executes, the "animation" is a ~20-frame fade that could complete in
+//      well under a second at this port's real framerate -- easy to miss
+//      entirely, not necessarily "never happens."
+//   2. No literal `STATE_Set(2)` call site exists anywhere in this .so's
+//      decompile (grepped every `STATE_Set(` call -- 0,3,4,5,7,8,9,0x10,
+//      0x14,0x16 all appear, 2 and 1 never do). Either state 2 is reached
+//      via a computed/non-literal argument this grep can't catch, or it's
+//      this .so's compiled-in INITIAL default STATE_nState (never reached
+//      through the normal dispatcher at all) -- not resolved either way.
+// Forcing a fix on either guess (rewriting LOGO_nState's post-Enter value,
+// or manually calling STATE_Set(2) from this port's own boot code) risks a
+// worse regression than the missing splash itself if either theory is
+// wrong. Added pure instrumentation instead: logs every Enter/Exit and
+// every Process tick (capped) with real elapsed time, so the next test
+// settles whether this state is ever reached at all, and if so, exactly
+// how long it actually runs for.
+static so_hook h_STATE_EnterLogo, h_STATE_ExitLogo, h_STATE_ProcessLogo;
+static int16_t *g_ptr_LOGO_nFrame = NULL;
+static uint8_t *g_ptr_LOGO_nState = NULL;
+static uint64_t g_logo_enter_time_us = 0;
+static int g_logo_process_log_count = 0;
+#define LOGO_PROCESS_LOG_MAX 200
+
+static void STATE_EnterLogo_hook(void) {
+    g_logo_enter_time_us = sceKernelGetProcessTimeWide();
+    l_error("Corrida 86: STATE_EnterLogo -- entering Logo splash state");
+    SO_CONTINUE_VOID(h_STATE_EnterLogo);
+    l_error("Corrida 86: STATE_EnterLogo returned -- LOGO_nState=%d LOGO_nFrame=%d",
+            g_ptr_LOGO_nState ? (int) *g_ptr_LOGO_nState : -1,
+            g_ptr_LOGO_nFrame ? (int) *g_ptr_LOGO_nFrame : -1);
+}
+
+static void STATE_ExitLogo_hook(void) {
+    uint64_t now = sceKernelGetProcessTimeWide();
+    l_error("Corrida 86: STATE_ExitLogo -- leaving Logo splash state, elapsed_us=%llu",
+            (unsigned long long) (now - g_logo_enter_time_us));
+    SO_CONTINUE_VOID(h_STATE_ExitLogo);
+}
+
+static void STATE_ProcessLogo_hook(void) {
+    if (g_logo_process_log_count < LOGO_PROCESS_LOG_MAX) {
+        l_error("Corrida 86: STATE_ProcessLogo tick #%d -- LOGO_nState=%d LOGO_nFrame=%d",
+                g_logo_process_log_count,
+                g_ptr_LOGO_nState ? (int) *g_ptr_LOGO_nState : -1,
+                g_ptr_LOGO_nFrame ? (int) *g_ptr_LOGO_nFrame : -1);
+        g_logo_process_log_count++;
+    }
+    SO_CONTINUE_VOID(h_STATE_ProcessLogo);
+}
+
 void so_patch(void) {
     hook_addr(so_mod.text_base + OFF_excuteDirectly, (uintptr_t)&excuteDirectly_bypass);
     hook_addr(so_mod.text_base + OFF_jIsCracked, (uintptr_t)&jIsCracked_bypass);
@@ -2542,6 +2983,15 @@ void so_patch(void) {
         l_warn("Corrida 58: GRP_DrawPixel not found in .dynsym -- hook skipped");
     }
 
+    g_ptr_SGL_CLIP = (uint32_t *) so_symbol(&so_mod, "SGL_CLIP");
+    uintptr_t addr_SGL_grpFillRect = so_symbol(&so_mod, "SGL_grpFillRect");
+    if (addr_SGL_grpFillRect) {
+        h_SGL_grpFillRect = hook_addr(addr_SGL_grpFillRect, (uintptr_t)&SGL_grpFillRect_hook);
+    } else {
+        l_warn("Corrida 81: SGL_grpFillRect not found in .dynsym -- hook skipped, translucent "
+               "backgrounds may still be missing");
+    }
+
     g_ptr_Portrait_nLoadedFileID = (int *) so_symbol(&so_mod, "Portrait_nLoadedFileID");
     g_ptr_gImgPortrait = (int *) so_symbol(&so_mod, "gImgPortrait");
 
@@ -2594,6 +3044,40 @@ void so_patch(void) {
         l_warn("Corrida 61: MAP_Load not found in .dynsym -- hook skipped");
     }
 
+    // Corrida 87: see STATE_EnterHub_hook's own comment above.
+    STATE_Set_real = (fn_state_set_t)(uintptr_t) so_symbol(&so_mod, "STATE_Set");
+    HUBINSTALL_Save_real = (fn_hubinstall_save_t)(uintptr_t) so_symbol(&so_mod, "HUBINSTALL_Save");
+    uintptr_t addr_STATE_EnterHub = so_symbol(&so_mod, "STATE_EnterHub");
+    if (addr_STATE_EnterHub && STATE_Set_real && HUBINSTALL_Save_real) {
+        h_STATE_EnterHub = hook_addr(addr_STATE_EnterHub, (uintptr_t)&STATE_EnterHub_hook);
+    } else {
+        l_warn("Corrida 87: STATE_EnterHub/STATE_Set/HUBINSTALL_Save not found in .dynsym -- "
+               "hook skipped, Hub join-invite popup will still show with blank text");
+    }
+
+    // Corrida 86: see STATE_EnterLogo_hook's own comment above -- diagnostics
+    // only for the missing Com2uS splash report.
+    g_ptr_LOGO_nFrame = (int16_t *) so_symbol(&so_mod, "LOGO_nFrame");
+    g_ptr_LOGO_nState = (uint8_t *) so_symbol(&so_mod, "LOGO_nState");
+    uintptr_t addr_STATE_EnterLogo = so_symbol(&so_mod, "STATE_EnterLogo");
+    if (addr_STATE_EnterLogo) {
+        h_STATE_EnterLogo = hook_addr(addr_STATE_EnterLogo, (uintptr_t)&STATE_EnterLogo_hook);
+    } else {
+        l_warn("Corrida 86: STATE_EnterLogo not found in .dynsym -- hook skipped");
+    }
+    uintptr_t addr_STATE_ExitLogo = so_symbol(&so_mod, "STATE_ExitLogo");
+    if (addr_STATE_ExitLogo) {
+        h_STATE_ExitLogo = hook_addr(addr_STATE_ExitLogo, (uintptr_t)&STATE_ExitLogo_hook);
+    } else {
+        l_warn("Corrida 86: STATE_ExitLogo not found in .dynsym -- hook skipped");
+    }
+    uintptr_t addr_STATE_ProcessLogo = so_symbol(&so_mod, "STATE_ProcessLogo");
+    if (addr_STATE_ProcessLogo) {
+        h_STATE_ProcessLogo = hook_addr(addr_STATE_ProcessLogo, (uintptr_t)&STATE_ProcessLogo_hook);
+    } else {
+        l_warn("Corrida 86: STATE_ProcessLogo not found in .dynsym -- hook skipped");
+    }
+
     // Corrida 75: see Extend_CheckAdvDisplay_hook's own comment above -- force
     // adBlocked so GAMESTATE_ProcessMapChange's ad-trigger path never engages
     // (this port's ad JNI stubs never complete the real pause/resume round
@@ -2606,6 +3090,22 @@ void so_patch(void) {
     } else {
         l_warn("Corrida 75: Extend_CheckAdvDisplay or adBlocked not found in .dynsym -- hook "
                "skipped, stage transitions may still freeze if an interstitial ad triggers");
+    }
+
+    // Corrida 85: see CHAR_DrawEx_hook's own comment above -- pure diagnostic,
+    // no behavior change (always calls through via SO_CONTINUE_VOID/SO_CONTINUE).
+    CHAR_GetName_real = (fn_char_getname_t)(uintptr_t) so_symbol(&so_mod, "CHAR_GetName");
+    uintptr_t addr_CHAR_DrawEx = so_symbol(&so_mod, "CHAR_DrawEx");
+    if (addr_CHAR_DrawEx) {
+        h_CHAR_DrawEx = hook_addr(addr_CHAR_DrawEx, (uintptr_t)&CHAR_DrawEx_hook);
+    } else {
+        l_warn("Corrida 85: CHAR_DrawEx not found in .dynsym -- hook skipped");
+    }
+    uintptr_t addr_CHAR_AddAction = so_symbol(&so_mod, "CHAR_AddAction");
+    if (addr_CHAR_AddAction) {
+        h_CHAR_AddAction = hook_addr(addr_CHAR_AddAction, (uintptr_t)&CHAR_AddAction_hook);
+    } else {
+        l_warn("Corrida 85: CHAR_AddAction not found in .dynsym -- hook skipped");
     }
 
     // Corrida 69: resolve every real callee/global SAVE_Load_hook needs

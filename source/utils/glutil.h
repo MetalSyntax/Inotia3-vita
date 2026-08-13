@@ -97,6 +97,69 @@ void glTranslatex_soloader(GLfixed x, GLfixed y, GLfixed z);
 void glEnable_soloader(GLenum cap);
 void glDisable_soloader(GLenum cap);
 
+// Corrida 79: SGL_grpFillRect (source/patch.c's SGL_grpFillRect_hook) sets
+// the flat draw color via glColor4x and draws a quad, but never touches
+// GL_COLOR_ARRAY itself either way -- if a preceding textured/tinted sprite
+// draw left it enabled, the flat color is ignored and the quad's alpha comes
+// from whatever per-vertex color data happens to still be bound, instead of
+// the intended translucent black. Exposed here (rather than pulling
+// vitaGL.h into patch.c for one narrow use) so that hook can save/restore
+// this one piece of client-array state around its real draw call.
+GLboolean gl_color_array_enabled(void);
+void gl_set_color_array_enabled(GLboolean enabled);
+
+// Corrida 88: SGL_grpFillRect (source/patch.c's SGL_grpFillRect_hook) is the
+// ONE draw call pattern in this whole missing-background investigation that
+// never sets up its own GL_TEXTURE_COORD_ARRAY/glBindTexture state at all --
+// every textured draw (sprites, portraits, icons -- all confirmed rendering
+// correctly) calls glTexCoordPointer/glBindTexture itself every time, right
+// before its own glDrawArrays. SGL_grpFillRect only calls glDisable(
+// GL_TEXTURE_2D)/glEnable(GL_TEXTURE_2D) around its flat-color quad and
+// relies on that alone to skip texturing -- if GL_TEXTURE_COORD_ARRAY client
+// state and the last-bound texture are both still leftover from whatever
+// textured draw ran immediately before (a real possibility: this port's own
+// GL_FIXED->float deferred-conversion state, see glVertexPointer_soloader's
+// own pending_fixed_* statics, persists across draws by design and is never
+// touched by SGL_grpFillRect either), and if this vitaGL build's
+// GL_TEXTURE_2D disable doesn't fully bypass sampling in its fixed-function
+// emulation path (unconfirmed without vitaGL's own source, not vendored in
+// this repo -- but consistent with this project's own established history of
+// vitaGL not honoring several other enable-state/GL_FIXED assumptions taken
+// for granted on desktop GL, see Corrida 24-27's glGetIntegerv() findings
+// above and the whole Fase 4 GL_FIXED saga in PORTING_PLAN.md), the fragment
+// could still sample a stale bound texture through stale leftover texcoords
+// and multiply it into the intended flat color -- plausibly zeroing out a
+// translucent black/white fill exactly as reported. Exposed here so
+// SGL_grpFillRect_hook can save/restore this client-array state and force an
+// explicit unbind around its real draw call, the same defensive pattern
+// gl_color_array_enabled() above already established for GL_COLOR_ARRAY.
+GLboolean gl_texcoord_array_enabled(void);
+void gl_set_texcoord_array_enabled(GLboolean enabled);
+GLint gl_get_bound_texture_2d(void);
+void gl_bind_texture_2d(GLint texture);
+
+// Corrida 89: same save/force/restore pattern, for GL_DEPTH_TEST -- the one
+// enable-capability SGL_grpFillRect's own decompile never touches (it only
+// manages GL_TEXTURE_2D around its flat quad), unlike every OTHER capability
+// this file's Corrida 24-27 investigation already found reasons to distrust
+// vitaGL's default handling of. If depth testing is active during a UI
+// overlay draw and the popup's implicit Z fails against whatever's already
+// in the depth buffer there, the fragment is discarded before it ever
+// reaches blending -- invisible regardless of how correct every other piece
+// of state (color, alpha, clip, texture) already confirmed to be.
+GLboolean gl_depth_test_enabled(void);
+void gl_set_depth_test_enabled(GLboolean enabled);
+
+// Corrida 89: forces exactly ONE full diagnostic dump through this file's
+// existing log_draw_call machinery (viewport/scissor, projection/modelview
+// scale+translate, actual post-GL_FIXED-conversion vertex positions, every
+// relevant enable state) on the very next glDrawArrays/glDrawElements,
+// bypassing that machinery's own 400-call budget (long exhausted by the time
+// a real play session reaches the specific draw under investigation).
+// Call immediately before the draw you want dumped; the flag clears itself
+// after that one draw fires.
+void gl_force_log_next_draw(void);
+
 #ifdef __cplusplus
 };
 #endif

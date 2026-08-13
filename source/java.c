@@ -35,6 +35,7 @@
 #include "wr_timer.h"
 #include "reimpl/apk_zip.h"
 #include "audio.h"
+#include "splash.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -243,6 +244,43 @@ NameToMethodID nameToMethodId[] = {
     // own comment and PORTING_PLAN.md's Corrida 60 entry for the full
     // writeup and what's still open.
     { 50, "GetStringWidth", METHOD_TYPE_INT },
+
+    // Corrida 91 (splash screen, missing-feature investigation): these 5 are
+    // WrapperActivity INSTANCE methods (decompiled_apk's WrapperActivity.java
+    // declares them abstract; MainActivity.java implements them), not static
+    // WrapperJinterface methods like everything else in this table -- but
+    // confirmed by reading FalsoJNI's real GetMethodID() (lib/falso_jni/
+    // FalsoJNI.c:273-298) that it dispatches by NAME ALONE via
+    // getMethodIdByName(), ignoring the `clazz` argument entirely for any
+    // non-"<init>" lookup -- so registering them here, exactly like every
+    // other entry in this table, resolves correctly regardless of which
+    // Java object the .so's own code believes it's calling through.
+    // MainActivity.initializeBackgroundImage() (out_ghidra decompile not
+    // needed -- this is pure Java, decompiled_apk's own source is the
+    // primary source here) loads a real on-disk asset,
+    // "common/game_res/MainBackgroundImage.jpg" (WrapperData.GAME_ASSETS_PATH
+    // + "MainBackgroundImage" + WrapperData.RES_NAME_APPEND, the literal
+    // ".jpg" -- confirmed via decompiled_apk/sources/.../WrapperData.java:7-8
+    // -- a REAL, undisguised JPEG this time, unlike the audio files' fake
+    // ".jpg"-suffixed OggS streams from Corrida 63), via Android's
+    // BitmapFactory.decodeStream(), then sets it as an ImageView's bitmap.
+    // Before this Corrida, NONE of these 5 were registered -- GetMethodID
+    // returned NULL for every one, and whatever native code calls them
+    // (confirmed for ProgressBarStatus specifically:
+    // WrapperJinterface.java:410, `WrapperJinterface.activity.
+    // ProgressBarStatus(cursize, totalsize)`) silently no-ops via
+    // FalsoJNI's methodVoidCall() "not found" fallback -- this, not a
+    // native STATE_Set-driven splash the previous Corrida 86/90
+    // investigation chased, is the actual reason the Com2uS splash+progress
+    // bar this port's user expects (between the Vita's own boot splash and
+    // this port's "loading now") never appears: there IS no native-code
+    // splash sequence to hook, the whole thing is these 5 Java calls, and
+    // this port's JNI layer was dropping every one of them silently.
+    { 51, "InitializeProgressStatus", METHOD_TYPE_VOID }, // (Ljava/lang/String;)V
+    { 52, "ProgressBarStatus", METHOD_TYPE_VOID },         // (II)V
+    { 53, "dismissBackgroundImage", METHOD_TYPE_VOID },    // ()V
+    { 54, "initializeBackgroundImage", METHOD_TYPE_VOID }, // ()V
+    { 55, "setBackgroundImageProperty", METHOD_TYPE_VOID }, // (I)V
 };
 
 MethodsBoolean methodsBoolean[] = {};
@@ -990,6 +1028,48 @@ void WrapperJinterface_UnsetTimer(jmethodID id, va_list args) {
     wr_unset_timer(timerID);
 }
 
+// Corrida 91: WrapperActivity.initializeBackgroundImage()/dismissBackgroundImage()/
+// setBackgroundImageProperty(int)/ProgressBarStatus(int,int)/
+// InitializeProgressStatus(String) -- see the nameToMethodId[] comment above
+// (ids 51-55) for the full writeup. These calls were previously silently
+// dropped (methodID never found); registering them stops that and now also
+// actually draws the splash (source/splash.c -- decodes
+// "common/game_res/MainBackgroundImage.jpg" via a vendored stb_image.h and
+// draws it full-screen with vitaGL directly, since this port has no Java/
+// Android UI layer to show it the way the real app does).
+void InitializeProgressStatus_stub(jmethodID id, va_list args) {
+    jstring text_obj = va_arg(args, jstring);
+    if (text_obj) {
+        const char *text = jni->GetStringUTFChars(&jni, text_obj, NULL);
+        l_info("[Splash] InitializeProgressStatus(\"%s\")", text);
+        jni->ReleaseStringUTFChars(&jni, text_obj, (char *) text);
+    } else {
+        l_info("[Splash] InitializeProgressStatus(NULL)");
+    }
+}
+
+void ProgressBarStatus_stub(jmethodID id, va_list args) {
+    jint cur = va_arg(args, jint);
+    jint total = va_arg(args, jint);
+    l_info("[Splash] ProgressBarStatus(%d, %d)", cur, total);
+    splash_update_progress(cur, total);
+}
+
+void DismissBackgroundImage_stub(jmethodID id, va_list args) {
+    l_info("[Splash] dismissBackgroundImage()");
+    splash_hide();
+}
+
+void InitializeBackgroundImage_stub(jmethodID id, va_list args) {
+    l_info("[Splash] initializeBackgroundImage()");
+    splash_show();
+}
+
+void SetBackgroundImageProperty_stub(jmethodID id, va_list args) {
+    jint view_port_flag = va_arg(args, jint);
+    l_info("[Splash] setBackgroundImageProperty(%d)", view_port_flag);
+}
+
 MethodsVoid methodsVoid[] = {
     { 2, Inotia3_VoidNoop }, // alertPopup
     { 3, Inotia3_VoidNoop }, // setGameResolution
@@ -1001,6 +1081,11 @@ MethodsVoid methodsVoid[] = {
     { 14, Inotia3_VoidNoop }, // SetViewPort
     { 25, WrapperJinterface_SetTimer },
     { 26, WrapperJinterface_UnsetTimer },
+    { 51, InitializeProgressStatus_stub },
+    { 52, ProgressBarStatus_stub },
+    { 53, DismissBackgroundImage_stub },
+    { 54, InitializeBackgroundImage_stub },
+    { 55, SetBackgroundImageProperty_stub },
 };
 
 /*

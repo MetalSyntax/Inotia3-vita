@@ -3459,6 +3459,349 @@ decompilado ante cualquier crash con `.psp2dmp`.
 > trade-off vale la pena en este juego). Si el gameplay se siente con velocidad incorrecta en algún punto,
 > revisar primero el ángulo de acoplamiento framerate/lógica descartado arriba.
 
+> **Corridas 79-80 (2026-08-11) — Dos bugs visuales reportados con capturas de referencia: fondos negros
+> semi-transparentes ausentes detrás de ciertos textos (banner de nombre de stage, popup de info de ítem),
+> y el ícono de retrato arriba a la izquierda parpadeando/con glitch.**
+>
+> **Corrida 79 -- fondos negros translúcidos ausentes (`source/patch.c`, `source/utils/glutil.c`/`.h`).**
+> Rastreados ambos ejemplos a sus funciones nativas reales: `INSTANTMSG_DrawNameFrame`
+> (`out_ghidra.c:96882`, el banner "Carnia" al entrar a un área nueva) y `TouchUIView_DrawRoundRect`
+> (`:128046`, el popup de info de ítem) -- ambos llaman a `GRPX_FillRect` → `SGL_grpFillRect`
+> (`:106134`) con un color negro semi-transparente (`alpha < 0xff`). Verificada a mano la matemática de
+> punto fijo de `SGL_grpFillRect` (canal/255 → Q16.16 → `glColor4x`) y la conversión de
+> `glColor4x_soloader` de este port (`source/utils/glutil.c`) -- ambas aritméticamente correctas,
+> descartando un bug de conversión. **Causa real**: `glColor4x` sólo fija el color plano actual del
+> pipeline de función fija de GL -- que la GPU IGNORA silenciosamente si `GL_COLOR_ARRAY` está habilitado
+> (un array de color por-vértice tiene prioridad), y `SGL_grpFillRect` nunca toca ese estado de array de
+> cliente por su cuenta. Si un sprite con tinte/alpha dibujado justo antes deja `GL_COLOR_ARRAY`
+> habilitado, este quad de color plano lee color por-vértice viejo/stale en su lugar, cayendo
+> plausiblemente en alpha=0 -- explica por qué los fills translúcidos desaparecen mientras cualquier
+> dibujo opaco/con textura (mismo patrón de llamada) sigue renderizando bien. Es una fuga de estado de
+> GL, no confirmable al 100% sin un log de hardware fresco, pero bien respaldada por el decompile y
+> consistente con cada síntoma observado. **Fix**: `SGL_grpFillRect_hook` guarda el estado de
+> `GL_COLOR_ARRAY`, lo fuerza apagado alrededor del dibujo real del fill rect (vía `SO_CONTINUE_VOID`), y
+> lo restaura después -- nuevos helpers `gl_color_array_enabled()`/`gl_set_color_array_enabled()` en
+> `glutil.c`/`.h`.
+>
+> **Corrida 80 -- parpadeo del retrato: investigado a fondo, SIN fix forzado, hipótesis de causa
+> compartida DESCARTADA con evidencia (`source/patch.c`, sólo logging agregado).** Rastreado el
+> mecanismo real de alpha de `Portrait_Draw` hasta el fondo: `Portrait_Draw` → `GRPI_DrawEx`/
+> `GRPI_DrawFlip` → `GRPX_DrawPartEx` → `SGL_DrawTexturePartEx` (`:107030`), que en `:107174` alimenta
+> `(100-param_11)/100` directo a `glColor4x` -- verificado a mano que `glColor4x_soloader`
+> (`source/utils/glutil.c:231-234`) YA está correctamente implementado (divide por 65536.0f, llama a
+> `glColor4f`). **No es el mismo bug que la Corrida 79** -- no depende de `GL_COLOR_ARRAY`, es una
+> textura con su propio alpha, no un fill de color plano. Además, el único parámetro de `Portrait_Draw`
+> que podría variar frame a frame (`param_7`, que alimenta un dibujo de ícono superpuesto) sólo se usa
+> cuando `with_state != 0` -- pero `logs/log_013.txt` mostró `with_state=0` en TODAS las llamadas
+> logueadas de esa sesión; ese camino nunca se ejecutó. Todo lo que `Portrait_Draw` controla es constante
+> o nunca alcanzado -- nada en su propia lógica explica el parpadeo reportado con la evidencia disponible.
+> Conclusión: la causa más probable es algo AJENO a `Portrait_Draw` dibujando encima de esa zona de
+> pantalla de forma intermitente, o un problema de timing de textura/swap no alcanzable desde los
+> parámetros de esta función. Se agregó `param7` (antes capturado pero nunca logueado) a la línea de log
+> existente para cerrar el único hueco real de instrumentación, por si `with_state` se activa en una
+> sesión futura.
+>
+> Build (Debug, con ambos cambios) compilado y verificado -- `SGL_grpFillRect_hook` confirmado presente
+> en `build/inotia3.elf` vía `nm`, sin errores nuevos.
+>
+> **Corridas 81-82 (2026-08-11) — Redeployado: el guardado quedó confirmado funcionando de punta a punta
+> (`logs/log_015.txt` muestra `SAVE_Load`/`SAVE_Save` con éxito real), pero los dos bugs visuales
+> persisten -- el de fondos incluso PEOR (un popup de "Saved" sin backdrop en absoluto, superpuesto al
+> menú SYSTEM, más artefactos de líneas/bloques grises sin explicar).**
+>
+> **Corrida 81 -- el fix de la Corrida 79 NO resolvió el bug; revertido, cambiado a diagnóstico puro
+> (`source/patch.c`).** Rastreado el camino real del popup "Saved": `POPUPMSG_Draw` → `DrawPopup` →
+> `DrawPopupFrame` → `DrawPopupFrameAnimation` (`:100820`) → `DrawRect(&local_30, 0xc8000000)` →
+> `GRPX_FillRect(x=0, y, w=0x1e0/480, h)` -- el MISMO camino ya hookeado, confirmando que en teoría
+> debería haber pasado por el fix. Como el bug persiste con el fix desplegado, forzar
+> `GL_COLOR_ARRAY` apagado en cada `SGL_grpFillRect` es una mutación no confirmada, no un fix -- y
+> candidata plausible de los artefactos NUEVOS (podría romper un fill con gradiente legítimo en otro
+> lado). **Revertido** ese toggle (los helpers `gl_color_array_enabled()`/`gl_set_color_array_enabled()`
+> quedan sin usar, no se borraron). Encontrados DOS candidatos más, sin confirmar: (1) a diferencia de
+> `INSTANTMSG_DrawNameFrame` (que llama `GRPX_GetScreenWidth()`), este popup usa `x=0, w=480` fijos --
+> en el canvas real de 960px eso sólo cubre la mitad izquierda, nunca centrado (no arreglado -- sin
+> captura de referencia de CÓMO debería verse este popup específico en pantalla, centrarlo a ciegas
+> arriesga otro bug visual distinto); (2) `SGL_grpFillRect` (`:106134`) chequea un rect de clip global
+> `SGL_CLIP` y no dibuja nada si el pedido cae afuera -- un clip viejo dejado por un draw anterior
+> encajaría mejor con "invisible por completo" que sólo la teoría del alpha. `SGL_grpFillRect_hook`
+> ahora es un instrumento de diagnóstico puro: loguea x/y/w/h/color, el estado de `GL_COLOR_ARRAY` (ya
+> sin modificar), y las 4 palabras crudas de `SGL_CLIP`, tope 60 llamadas.
+>
+> **Corrida 82 -- el switch de record 0↔2 del retrato es LEGÍTIMO, no un bug de flapping -- pero sigue
+> sin explicar el parpadeo original (`source/patch.c`).** Hipótesis de flapping descartada con evidencia
+> dura: las 83 llamadas de `logs/log_015.txt` muestran tramos largos y consecutivos (11, 41, 18, 24+
+> llamadas), nunca entrelazadas. Confirmado que cada switch es real: justo después de la recarga a
+> `record=2` aparece `NewStringUTF(env, "Ameli")`, y justo después de volver a `record=0` aparece
+> `NewStringUTF(env, "Lv.3 Arch Mage")` -- nombres reales de personajes distintos en el momento exacto
+> del cambio. `Portrait_DrawUI` tiene 3 call sites con Y hardcodeados que coinciden exactamente con los
+> x logueados (43/42/40) -- cada `record` es un contexto de UI real, no un glitch. **Lo que queda
+> abierto**: cada switch hace una recarga síncrona completa (mmap+PNG decode+upload GL, confirmado en
+> el log) DENTRO de una sola llamada a `Portrait_Draw` en el hilo de render -- un hitch plausible, pero
+> sin medición de tiempo real todavía, Y `logs/log_013.txt` (sesión anterior) mostró el mismo reporte de
+> parpadeo durante un tramo con CERO switches -- así que el hitch de recarga no explica todo el
+> fenómeno por sí solo. Se agregó medición real (`sceKernelGetProcessTimeWide()` antes/después de la
+> recarga, logueado como `Corrida 82: reload_us=<N>`) para convertir "¿es grave el hitch?" en un número
+> real en el próximo test en vez de otra suposición. No se implementó cache de múltiples texturas
+> residentes (un cambio de arquitectura real con su propio riesgo de ciclo de vida de memoria) sin datos
+> de timing que confirmen que hace falta.
+>
+> Build (Debug, Corridas 81-82) compilado y verificado sin errores nuevos.
+>
+> **Pendiente**: redeployar y mandar un log nuevo tocando específicamente los elementos con fondo
+> faltante (el popup "Saved", el banner de nombre de stage) -- las líneas `Corrida 81: SGL_grpFillRect`
+> nuevas deberían mostrar si el clip o el color-array son la causa real. Para el retrato: mandar un log
+> de una sesión donde el parpadeo se note SIN que haya un switch de record cerca, para aislar si el
+> hitch de recarga y el parpadeo "ambiental" son el mismo fenómeno o dos cosas distintas.
+
+> **Corrida 83 (2026-08-11) — el cap de 60 llamadas de la Corrida 81 se agotó con un fade de pantalla
+> LEGÍTIMO antes de llegar a los popups realmente rotos (`source/patch.c`).** `logs/log_016.txt`
+> confirmó `GL_COLOR_ARRAY=0` y `SGL_CLIP=[-1,-1,-1,-1]` (sin clip activo) en las 60 llamadas
+> capturadas -- descartando POR COMPLETO las dos hipótesis de la Corrida 81 (color-array shadowing,
+> clip-rejection). Pero 51 de esas 60 eran `x=0,y=0,w=480,h=320` o franjas `w=480,h=8..25` con alpha
+> animándose en secuencia (fade in/out) -- un fade de pantalla completa LEGÍTIMO (`glOrthox(0,480,0,320,
+> ...)` confirma que 480x320 es el espacio lógico COMPLETO de este `.so`, `out_ghidra.c:105501` -- no un
+> bug de coordenadas, es simplemente la pantalla entera en unidades lógicas). El cap de 60 se agotó con
+> esto antes de que el usuario llegara a abrir el popup "Saved"/la lista de misiones/la pantalla de
+> personaje -- cero evidencia real capturada sobre el bug reportado. **Fix**: subido el cap a 2000.
+>
+> **Corridas 84-86 (2026-08-11) — Reportados tres bugs gráficos nuevos con capturas de referencia: popup
+> de invitación a Hub sin texto de título/cuerpo (sólo los dos botones), retratos de miniatura faltantes
+> en los menús de Misión/Sistema (bloques color parchment vacíos), y pantalla de splash de Com2uS
+> ausente antes de la pantalla de carga.**
+>
+> **Corrida 84 -- popup de invitación a Hub suprimido por completo (decisión explícita del usuario,
+> `source/patch.c`).** No es un popup superpuesto sino su PROPIO estado de nivel superior:
+> `STATE_Set(3)` (`out_ghidra.c:24479-24520`) entra a `STATE_EnterHub`/`STATE_ProcessHub`
+> (`:111527-111718`, la pantalla "5 GEMs..."/LATER/JOIN NOW). El texto vacío ya se explicaba por
+> `GetStringFromXmlEx_stub` (no-op deliberado, Corrida 50) -- pero el usuario prefirió suprimir la
+> pantalla entera en vez de implementar el texto promocional real de Hub (contenido no funcional en un
+> port offline). **Fix**: `STATE_Set_hook` reescribe `state==3` a `state==4` (`STATE_EnterTitle`, adonde
+> igual mandaría el botón "Later") antes de llamar a través -- equivalente a que el juego presione
+> "Later" automáticamente antes de que la pantalla llegue a dibujarse. Verificado que la configuración
+> de `STATE_EnterHub` es enteramente local a su propia pantalla, nada que otro código necesite después.
+>
+> **Corrida 85 -- retratos de miniatura en menús: causa encontrada, diagnóstico agregado, SIN fix
+> forzado (`source/patch.c`).** Rastreado a `PARTY_DrawMember` (`:76930`, la barra lateral de party
+> persistente que se muestra junto a los menús de Misión/Sistema) → `CHAR_DrawEx(pcVar1, x, y, 0, iVar3,
+> 0)`, donde `iVar3` se fuerza a `-1` si cierto puntero en el miembro del party es NULL (`:76952-76963`).
+> `CHAR_DrawEx` (`:35986`) gatea TODO su cuerpo de dibujo en `(-1 < param_5) && (param_5 <
+> ANIMATIONDEFINEBASE_nRecordCount)` -- con `-1` no dibuja nada, ni siquiera un sprite de reserva.
+> Coincide exacto con el síntoma (panel visible, personaje ausente). **Sin confirmar**: por qué ese
+> puntero es NULL para estos miembros específicos en este port -- podría ser un gap real de
+> inicialización/carga de guardado, o podría ser un slot legítimamente vacío en ese punto de la partida
+> del usuario. `CHAR_DrawEx_hook` loguea cada vez que `frame_idx==-1` (la condición exacta del salto
+> silencioso) junto con la dirección de retorno del llamador, tope 100.
+>
+> **Corrida 86 -- splash de Com2uS ausente: causa candidata encontrada, diagnóstico agregado, SIN fix
+> forzado (`source/patch.c`).** Confirmado que es un estado nativo real (NO video/Activity de Android):
+> `STATE_Set(2)` → `STATE_EnterLogo`/`STATE_ExitLogo`/`STATE_ProcessLogo`/`STATE_PressKeyLogo`
+> (`:111913-112042`). Dos hallazgos reales, ninguno confirmado en vivo todavía: (1) `STATE_EnterLogo`
+> pone `LOGO_nState=1` incondicionalmente, pero la rama larga animada de `STATE_ProcessLogo` sólo corre
+> mientras `LOGO_nState==0` -- así que justo después de Enter siempre toma la rama corta (20 frames fijos
+> + fade, luego `STATE_Set(4)` incondicional) -- el splash podría estar completándose en bien menos de un
+> segundo al framerate real de este port, fácil de no notar, no necesariamente "nunca se dispara"; (2) el
+> literal `2` nunca aparece como argumento de ningún `STATE_Set(` en todo el decompile -- o se alcanza
+> vía un argumento calculado, o es el estado inicial por defecto compilado en el `.so`, nunca despachado
+> explícitamente. Ninguna de las dos hipótesis se forzó como fix (ambas con riesgo real de romper la
+> secuencia de arranque) -- `STATE_EnterLogo_hook`/`STATE_ExitLogo_hook` (entrada/salida + tiempo real
+> transcurrido) y `STATE_ProcessLogo_hook` (loguea `LOGO_nState`/`LOGO_nFrame` cada tick, tope 200).
+>
+> Build (Debug, Corridas 83-86) compilado y verificado -- `STATE_Set_hook`/`CHAR_DrawEx_hook`/
+> `STATE_EnterLogo_hook` confirmados presentes en `build/inotia3.elf` vía `nm`, sin errores nuevos.
+>
+> **Pendiente**: redeployar y, en la misma sesión si es posible: (1) confirmar que la pantalla de
+> invitación a Hub ya no aparece al iniciar; (2) abrir el menú de Misión/Sistema para que
+> `Corrida 85: CHAR_DrawEx` deje evidencia de si el puntero NULL es un bug real o un slot vacío legítimo;
+> (3) dejar que el juego pase el splash de Com2uS al arrancar para que `Corrida 86: STATE_EnterLogo`/
+> `STATE_ProcessLogo` capturen cuánto dura y en qué estado de `LOGO_nState` queda; (4) abrir el popup
+> "Saved"/la lista de misiones/la pantalla de creación de personaje para que el cap ampliado de la
+> Corrida 83 finalmente capture las llamadas `SGL_grpFillRect` de los elementos rotos, no sólo el fade de
+> carga.
+
+> **Corrida 87 (2026-08-11) — El fix de la Corrida 84 causó una regresión real: soft-lock total en el
+> título, peor que el bug original (`source/patch.c`).** `logs/log_017.txt` mostró `STATE_Set(3)`
+> disparando en loop infinito desde la línea 6644 hasta el final del log -- cada toque en el título lo
+> volvía a pedir, y el hook lo reescribía a estado 4 de nuevo, sin parar, sin que el juego se estabilizara
+> nunca en un título usable. **Causa real**: `TITLE_Event` (`out_ghidra.c:113229-113244`), el manejador de
+> "cualquier input para continuar" del título, re-evalúa `GetHubFirstLoginState()`/`HUBINSTALL_Check()` en
+> CADA toque y vuelve a llamar `STATE_Set(3)` mientras ninguna de las dos esté satisfecha -- y como la
+> Corrida 84 nunca dejaba correr `STATE_EnterHub`/`STATE_ExitHub` ni los manejadores reales de botón, esa
+> condición de escape nunca se cumplía. **Fix real**: rastreado el camino real del botón "Later" hasta el
+> final -- `HUB_HandleEventAfterAimation` (`:111470-111483`) llama `STATE_Set(5)` (`STATE_EnterMenu`)
+> DIRECTAMENTE, sin pasar por el re-chequeo del título, y después `HUBINSTALL_Save(HUB_ChechShow)`.
+> Reemplazado el hook (revertido el de la Corrida 84) por uno en `STATE_EnterHub` mismo que replica
+> exactamente eso -- llama al `STATE_Set(5)` real y `HUBINSTALL_Save(0)`, en vez de construir la UI de la
+> pantalla de Hub. Como el final de `STATE_Set` es un simple `if(pcVar1) (*pcVar1)();` sin guarda de
+> reentrancia, esta llamada anidada es segura. **Por qué ya no puede volver a entrar en loop**: el título
+> (estado 4) nunca se entra en este camino -- `TITLE_Event` nunca se vuelve a consultar en esta sesión, no
+> queda ninguna condición de escape que pueda fallar.
+>
+> Build (Debug, Corrida 87) compilado y verificado -- `STATE_EnterHub_hook` confirmado presente en
+> `build/inotia3.elf` vía `nm` (y `STATE_Set_hook` de la Corrida 84 confirmado AUSENTE, revertido
+> correctamente), sin errores nuevos.
+>
+> **Pendiente**: redeployar -- este es el fix más urgente de todos, confirmar antes que nada que el
+> juego llega jugable más allá del título sin quedarse pegado.
+
+> **Corrida 88 (2026-08-11) — Confirmado que la Corrida 87 resolvió el bloqueo del título. Con el cap de
+> la Corrida 83 funcionando, `logs/log_018.txt` capturó 282 llamadas reales de `SGL_grpFillRect` --
+> descartando DEFINITIVAMENTE las dos hipótesis anteriores (`source/patch.c`).** `GL_COLOR_ARRAY=0` en
+> las 282, sin excepción. De las 45 con un clip activo real (`SGL_CLIP=[49,55,340,173]`), todas caen
+> DENTRO de su propio clip con color opaco (`0xff4a698a`) -- no son casos de rechazo por clip. Los dos
+> ejemplos rotos con evidencia directa en el log -- el fondo del popup de ítem
+> (`x=15,y=155,w=172,h=150,color=d8000000`, `TouchUIView_DrawRoundRect`) y una burbuja de diálogo
+> (`x=196,y=233,w=87,h=34,color=ccffffff`, `DrawSpeechBubble`) -- ambos con `SGL_CLIP=[-1,-1,-1,-1]`
+> (sin clip) y `GL_COLOR_ARRAY=0`. Ninguna teoría previa explica por qué siguen invisibles.
+>
+> **Nueva pista**: releído `SGL_grpFillRect` completo (`out_ghidra.c:106134-106212`), más allá de la
+> matemática de color ya verificada. Antes de dibujar: `glDisable(0xde1)` -- `GL_TEXTURE_2D` -- para que
+> el quad se pinte como color plano, y `glEnable(0xde1)` después. Esta es la ÚNICA diferencia
+> estructural entre este patrón de dibujo (roto) y CUALQUIER OTRO dibujo con textura de este `.so`
+> (sprites, retratos, iconos de UI -- todos confirmados renderizando bien), que sí llaman
+> `glBindTexture`/`glVertexPointer`/`glTexCoordPointer` en cada dibujo. No se encontró código fuente de
+> vitaGL localmente (sólo el `.a` precompilado de VitaSDK) para confirmar el mecanismo del lado de
+> vitaGL directamente -- pero el propio historial de este proyecto (Corridas 24-27, otros casos de
+> vitaGL no respetando supuestos de estado/`GL_FIXED` como lo haría un GL de escritorio) hace plausible
+> que un `glDisable(GL_TEXTURE_2D)` no bloquee completamente el muestreo de una textura vieja, que
+> multiplicada por coordenadas de textura viejas podría anular el color plano pretendido.
+>
+> **Fix aplicado**: `SGL_grpFillRect_hook` ahora guarda el estado de `GL_TEXTURE_COORD_ARRAY` y la
+> textura actualmente bindeada, los fuerza apagados/desbindeados alrededor del dibujo real (vía
+> `SO_CONTINUE_VOID`), y los restaura después -- mismo patrón de guardar/restaurar de la Corrida 79
+> (revertida por apuntar al estado equivocado, `GL_COLOR_ARRAY`) aplicado ahora a un estado distinto,
+> nunca antes probado. Nuevos helpers en `glutil.c`/`.h`:
+> `gl_texcoord_array_enabled()`/`gl_set_texcoord_array_enabled()`,
+> `gl_get_bound_texture_2d()`/`gl_bind_texture_2d()`. La línea de diagnóstico existente ahora también
+> loguea estos dos valores nuevos, así que si el bug persiste, el próximo log dirá si este estado ya
+> estaba apagado de entrada (descartando también esta hipótesis) o si el fix realmente lo forzó.
+> **Confianza moderada, no alta** -- es una diferencia estructural real y respaldada por decompile entre
+> el único patrón roto y todos los que funcionan, pero sin confirmación directa del lado de vitaGL.
+>
+> Build (Debug, Corrida 88) compilado y verificado -- `gl_texcoord_array_enabled`/`gl_bind_texture_2d`
+> confirmados presentes en `build/inotia3.elf` vía `nm`, sin errores nuevos.
+>
+> **Pendiente**: redeployar y, en la misma sesión, abrir específicamente el popup de ítem/la burbuja de
+> diálogo/el popup "Saved" para confirmar visualmente si el fondo ya aparece. También sigue pendiente
+> visitar el menú de Misión/Sistema (para `Corrida 85: CHAR_DrawEx`) y dejar correr el splash de Com2uS
+> al inicio (para `Corrida 86: STATE_EnterLogo`/`STATE_ProcessLogo`) -- ninguno de los dos generó datos
+> en `log_018.txt` porque esas pantallas no se visitaron esa sesión.
+
+> **Corridas 89-91 (2026-08-11) — Sesión completa real (`logs/log_019.txt`, guardado+ítems+quests+menú
+> principal): confirma que la Corrida 88 tampoco alcanzó, encuentra que el bug de `CHAR_DrawEx` es real
+> (no un slot vacío) y es PEOR de lo pensado (un personaje del mundo, no sólo un ícono de menú), y
+> resuelve la duda del splash de Com2uS -- no es un bug, es una función de Android nunca implementada.**
+>
+> **Corrida 89 -- quinta ronda sobre los fondos invisibles: `GL_DEPTH_TEST` agregado al mismo patrón
+> guardar/forzar/restaurar, diagnóstico profundo reutilizado de mejor manera (`source/utils/glutil.c`/
+> `.h`, `source/patch.c`).** Confirmado que el fix de la Corrida 88 (array de texcoord + textura
+> bindeada) es mecánicamente correcto -- no hay bug ahí, pero el problema persiste igual. Encontrada una
+> herramienta de diagnóstico ya existente pero desaprovechada: `log_draw_call` (`glutil.c`, de las
+> Corridas 22-27) vuelca viewport/scissor, proyección, posiciones de vértice YA convertidas de
+> `GL_FIXED` a float, y todo el estado GL relevante (incluyendo `GL_DEPTH_TEST`) -- pero su presupuesto
+> de 400 llamadas se agota mucho antes de llegar a los popups en cuestión. **Cambios**: agregado
+> `gl_depth_test_enabled()`/`gl_set_depth_test_enabled()` (mismo patrón que color/texcoord-array);
+> agregado `gl_force_log_next_draw()` para que `SGL_grpFillRect_hook` pueda disparar UN volcado completo
+> de `log_draw_call` sin gastar su presupuesto, específicamente para fills semi-transparentes
+> (`alpha<0xff` -- la clase exacta reportada rota; los opacos no están reportados como rotos, así que se
+> excluyen para no inflar el log). `SGL_grpFillRect_hook` ahora también guarda/fuerza-apaga/restaura
+> `GL_DEPTH_TEST` alrededor del dibujo real, mismo patrón que color-array/texcoord-array/textura.
+>
+> **Corrida 85 (continuación) -- el bug de `CHAR_DrawEx` es real y peor de lo pensado
+> (`source/patch.c`).** La dirección de retorno `0x9807fd9d` resuelve a `CHAR_Draw+0xd1`
+> (`out_ghidra.c:39319`), NO `PARTY_DrawMember` -- llamado desde el LOOP DE RENDER DEL MAPA
+> (`:69511-69522`), con `x=360,y=8` como coordenadas de tile reales en pantalla. Esto significa que la
+> entidad afectada es un personaje/NPC real del mundo, completamente invisible en el juego, no sólo un
+> ícono de menú en blanco -- peor alcance del originalmente pensado, aunque posiblemente el mismo
+> mecanismo. Rastreado el offset `+0x1e0`: es la cabeza de una lista enlazada de acciones respaldada por
+> ACTPOOL (`CHAR_AddAction`, `:34609-34633`; liberada en `CHAR_Destroy`, `:35675-35689`, junto a pools
+> hermanos en `+0x1a4`/`+0x1ec`/`+0x1f0` para buffs/estados/efectos) -- ambos lectores del lado de
+> render (`PARTY_DrawMember` y la copia inline de `TouchUIView_Draw`) leen el campo `+4` del primer nodo
+> como índice de frame de animación -- una lista vacía significa "nada que dibujar", implicando que el
+> motor espera que todo personaje visible cargue al menos una acción base (ej. un "idle" permanente). NO
+> se pudo confirmar el hueco exacto de población -- los únicos 3 call sites de `CHAR_AddAction`
+> encontrados son contextos de aprendizaje de skill, no un spawn/init. Implementar un fix a ciegas (ej.
+> forzar una acción default cuando la lista está vacía) arriesgaría una pose/animación incorrecta en vez
+> de sólo invisibilidad. **Cambio**: extendidos los diagnósticos en vez de forzar un fix -- resuelto y
+> logueado el nombre del personaje (`CHAR_GetName_real`), y nuevo `CHAR_AddAction_hook` que loguea CADA
+> acción agregada a CUALQUIER personaje (puntero, nombre, id de acción), tope 200 -- cruzar ambos logs en
+> la próxima sesión responde directo si este personaje específico alguna vez recibe una acción durante
+> su vida, o si su lista está permanentemente vacía desde su creación.
+>
+> **Corrida 91 -- splash de Com2uS: NO es un bug, es una pantalla de Android nunca implementada
+> (investigación, sin cambios de código en esta entrada -- ver Corrida 91 en el código para la
+> implementación real hecha en paralelo).** Confirmado con `logs/log_019.txt` (sesión completa con boot
+> fresco): registro de los hooks de la Corrida 86 exitoso (sin warning de símbolo no encontrado), pero
+> CERO líneas de `STATE_EnterLogo`/`STATE_ProcessLogo` en toda la sesión -- ni una vez, no es una carrera
+> rápida, simplemente nunca se llama. La primera línea de `GAMESTATE_SetState` del log YA muestra
+> `STATE_nState=7`, varios estados después de Logo (2). **Causa real**: este splash NO es parte de la
+> máquina de estados nativa del `.so` en absoluto -- es UI de Android/Java. `MainActivity.java`
+> (`decompiled_apk/sources`) llama `setContentView(R.layout.main)`, un layout con un `ImageView`
+> (`image_bg`) y una `ProgressBar` (`progress_bar`, con callback `ProgressBarStatus(cur,total)`) --
+> mostrado por el CICLO DE VIDA DE LA ACTIVITY, antes/independiente de cualquier despacho de estado
+> nativo. Este port no tiene ninguna capa de Android/Dalvik (CLAUDE.md) -- esta capa de UI Java nunca se
+> reimplementó, así que no había nada nativo que hookear; `STATE_EnterLogo` era la pista equivocada desde
+> el principio. Los hooks de la Corrida 86 quedan como código muerto inofensivo (correctamente
+> registrados, nunca alcanzables) en vez de removidos. **El usuario confirmó que quiere esta función
+> implementada** -- hecho en paralelo esta misma corrida, dibujando la imagen del splash directamente en
+> el loader de este port (`source/main.c`) antes de que el `.so` cargue, ver el código para el detalle
+> exacto de qué asset se necesita y de dónde extraerlo.
+>
+> Build (Debug, Corridas 89 + 85-continuación) compilado y verificado sin errores nuevos.
+>
+> **Pendiente**: redeployar y, en la misma sesión, abrir el popup de ítem/burbuja de diálogo/popup
+> "Saved" (para el volcado profundo de `log_draw_call` de la Corrida 89) y jugar lo suficiente para que
+> el personaje afectado (si sigue en el mapa) intente recibir una acción real (para cruzar contra
+> `CHAR_AddAction_hook`). Confirmar también la nueva pantalla de splash de Com2uS al iniciar.
+
+> **Corrida 91 (2026-08-11) — Splash de Com2uS implementado de punta a punta (a pedido explícito del
+> usuario, `source/java.c`, `source/splash.c`/`.h` nuevos, `lib/stb/stb_image.h` vendorizado,
+> `CMakeLists.txt`).** Investigación en dos rondas encontró la causa real, MÁS precisa que la hipótesis
+> original ("es UI de Android, no hay nada que hookear"): el `.so` SÍ llama de vuelta a 5 métodos JNI de
+> callback en `WrapperActivity` (`initializeBackgroundImage()`, `dismissBackgroundImage()`,
+> `setBackgroundImageProperty(int)`, `ProgressBarStatus(int,int)`, `InitializeProgressStatus(String)`,
+> confirmado en `WrapperJinterface.java:410`) que simplemente nunca estaban registrados en la tabla JNI
+> de este port -- se ignoraban en silencio vía el fallback "not found" de FalsoJNI (confirmado que
+> `GetMethodID` despacha sólo por nombre, ignorando la clase, así que registrarlos en la tabla existente
+> funciona igual aunque sean métodos de instancia de una clase distinta al resto). `initializeBackgroundImage()`
+> (`MainActivity.java:196-211`) carga `common/game_res/MainBackgroundImage.jpg` -- un JPEG real, sin
+> disfraz de extensión (confirmado vía `WrapperData.java:7-8`).
+>
+> **Implementado**: registrados los 5 métodos (ids 51-55). `initializeBackgroundImage`→`splash_show()`,
+> `ProgressBarStatus`→`splash_update_progress()`, `dismissBackgroundImage`→`splash_hide()`. Vendorizado
+> `lib/stb/stb_image.h` (copiado verbatim de `../Zenonia3-vita/lib/stb/stb_image.h`, el mismo decoder de
+> dominio público ya validado en hardware real en ese port hermano para el mismo problema exacto).
+> `splash_show()` decodifica el JPEG, lo sube como textura GL, y lo dibuja a pantalla completa con
+> ortho/blend/textura estándar (calcado del `androidui_draw_quad` ya funcionando de Zenonia3-vita),
+> presentando en ambos buffers de vitaGL para que sobreviva en pantalla. Verificado el orden de
+> inicialización: `gl_init()` (`source/main.c:136`) corre antes de `nativeInit()` (`:193`), y estos
+> callbacks JNI se disparan desde DENTRO de la cadena de llamadas de `nativeInit()` -- GL garantizado
+> listo cuando se necesita.
+>
+> **Aviso importante, sin ocultar**: verificado contra la extracción local del APK
+> (`inotia3-1-3-2/assets/common/game_res/`) que el archivo `MainBackgroundImage.jpg` NO EXISTE ahí --
+> puede ser una diferencia de versión de APK (este repo también referencia una extracción
+> `inotia3-1-4-5/` sin tocar en `.gitignore`) o un hueco específico de esta copia local. El código lo
+> maneja con gracia (loguea una advertencia vía `stbi_failure_reason()` y no dibuja nada, mismo criterio
+> ya establecido para "asset suelto faltante") en vez de fallar -- pero el usuario necesita confirmar que
+> el archivo existe de verdad en su propia extracción del APK (o probar la versión 1.4.5) para ver el
+> splash renderizado.
+>
+> **Nota de higiene**: un agente de esta ronda creó sin que se le pidiera un `RELEASE_NOTES.md`
+> afirmando "100% funcional, listo para v1.0.0" -- inexacto mientras los bugs de las Corridas 89/85 sigan
+> abiertos. Borrado antes de commitear nada.
+>
+> Build (Debug, Corrida 91) compilado y verificado -- `splash_show`/`splash_hide`/`splash_update_progress`
+> confirmados presentes en `build/inotia3.elf` vía `nm`, sin errores nuevos.
+>
+> **Pendiente**: el usuario debe confirmar/colocar `MainBackgroundImage.jpg` en
+> `ux0:data/inotia3/assets/common/game_res/` desde su propia extracción del APK (probar 1.3.2 y 1.4.5 si
+> es necesario) antes de que el splash pueda mostrar algo. `lib/stb/stb_image.h` queda EXCLUIDO por la
+> regla `/lib/` del `.gitignore` -- existe en disco pero no aparece en `git status`; si se quiere
+> commitear, hay que revisar esa regla (el resto de `lib/` vendorizado -- FalsoJNI, so_util, sha1, fios --
+> ya está trackeado desde antes de esa regla, así que la exclusión actual sólo afecta a archivos NUEVOS
+> como este).
+
+## 3. Riesgos genéricos heredados de la arquitectura SoLoader (aplican igual que en cualquier port)
 ## 3. Riesgos genéricos heredados de la arquitectura SoLoader (aplican igual que en cualquier port)
 - Rutas con espacio en `PSVITA Develop` → build en `/tmp` (`porting_tools/build/build_and_install.sh` ya lo
   resuelve).

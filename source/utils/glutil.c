@@ -215,6 +215,72 @@ void glDisable_soloader(GLenum cap) {
     glDisable(cap);
 }
 
+// Corrida 79: see the header comment on this pair (glutil.h) for why
+// SGL_grpFillRect_hook (source/patch.c) needs this.
+GLboolean gl_color_array_enabled(void) {
+    return glIsEnabled(GL_COLOR_ARRAY);
+}
+
+void gl_set_color_array_enabled(GLboolean enabled) {
+    if (enabled) {
+        glEnableClientState(GL_COLOR_ARRAY);
+    } else {
+        glDisableClientState(GL_COLOR_ARRAY);
+    }
+}
+
+// Corrida 88: see glutil.h's comment on these four functions.
+GLboolean gl_texcoord_array_enabled(void) {
+    return glIsEnabled(GL_TEXTURE_COORD_ARRAY);
+}
+
+void gl_set_texcoord_array_enabled(GLboolean enabled) {
+    if (enabled) {
+        glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+    } else {
+        glDisableClientState(GL_TEXTURE_COORD_ARRAY);
+    }
+}
+
+GLint gl_get_bound_texture_2d(void) {
+    GLint tex = 0;
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex);
+    return tex;
+}
+
+void gl_bind_texture_2d(GLint texture) {
+    glBindTexture(GL_TEXTURE_2D, (GLuint) texture);
+}
+
+// Corrida 89: see glutil.h's comment on these.
+GLboolean gl_depth_test_enabled(void) {
+    return glIsEnabled(GL_DEPTH_TEST);
+}
+
+void gl_set_depth_test_enabled(GLboolean enabled) {
+    if (enabled) {
+        glEnable(GL_DEPTH_TEST);
+    } else {
+        glDisable(GL_DEPTH_TEST);
+    }
+}
+
+// Corrida 89: sibling investigation to Corrida 24-27's log_draw_call below --
+// that machinery already dumps everything a "draw call happened but nothing
+// visible" bug needs (viewport/scissor, projection/modelview scale+translate,
+// actual post-GL_FIXED-conversion vertex positions, every relevant enable
+// state including GL_DEPTH_TEST) but its own 400-call cap is exhausted long
+// before a real play session reaches the specific UI draws under
+// investigation now (SGL_grpFillRect's own glDrawArrays). Rather than
+// duplicating that machinery a second time in patch.c, let SGL_grpFillRect_hook
+// force ONE full dump through the EXISTING log_draw_call, bypassing its cap,
+// for exactly the draw it's about to make.
+static int g_force_log_next_draw = 0;
+
+void gl_force_log_next_draw(void) {
+    g_force_log_next_draw = 1;
+}
+
 void glAlphaFuncx_soloader(GLenum func, GLfixed ref) {
     glAlphaFunc(func, ref / 65536.0f);
 }
@@ -434,7 +500,12 @@ static void log_draw_call(const char *fn, GLenum mode, GLsizei count, const GLfl
     // menu/background draws (the ones that matter for "is MainMenu.png
     // visible") happen later in the same run and were never reaching the log.
     static int log_count = 0;
-    if (log_count < 400) {
+    // Corrida 89: a forced dump (see gl_force_log_next_draw) bypasses the cap
+    // and doesn't consume it -- it's investigating a specific, rare draw
+    // (SGL_grpFillRect), not the high-frequency ones this cap was sized for.
+    int forced = g_force_log_next_draw;
+    if (forced) g_force_log_next_draw = 0;
+    if (log_count < 400 || forced) {
         GLint tex = 0;
         GLint viewport[4] = {0, 0, 0, 0};
         GLint scissor_box[4] = {0, 0, 0, 0};
@@ -496,17 +567,34 @@ static void log_draw_call(const char *fn, GLenum mode, GLsizei count, const GLfl
                      color_size > 2 ? c0[2] : 0.0f, color_size > 3 ? c0[3] : 1.0f);
         }
 
-        l_debug("[GL] %s mode=%x count=%d first=%d bound_tex=%d blend=%d depth_test=%d lighting=%d "
-                "texture_2d=%d cull_face=%d color_array=%d "
-                "scissor=%d(%d,%d,%d,%d) viewport=(%d,%d,%d,%d) "
-                "proj(sx=%.3f sy=%.3f tx=%.3f ty=%.3f) mv(sx=%.3f sy=%.3f tx=%.3f ty=%.3f) %s %s",
-                fn, mode, count, first, tex, blend, depth_test, lighting, texture_2d, cull_face, color_array,
-                scissor_test, scissor_box[0], scissor_box[1], scissor_box[2], scissor_box[3],
-                viewport[0], viewport[1], viewport[2], viewport[3],
-                proj[0], proj[5], proj[12], proj[13],
-                modelview[0], modelview[5], modelview[12], modelview[13],
-                verts_buf, color_buf);
-        log_count++;
+        // Corrida 89: forced dumps use l_error (always compiles, per Corrida
+        // 73's DEBUG_SOLOADER/Release finding) since this diagnostic must
+        // survive a Release retest too; the routine budgeted l_debug calls
+        // below are unchanged (this file's original, high-frequency use).
+        if (forced) {
+            l_error("[GL] Corrida 89 FORCED: %s mode=%x count=%d first=%d bound_tex=%d blend=%d "
+                    "depth_test=%d lighting=%d texture_2d=%d cull_face=%d color_array=%d "
+                    "scissor=%d(%d,%d,%d,%d) viewport=(%d,%d,%d,%d) "
+                    "proj(sx=%.3f sy=%.3f tx=%.3f ty=%.3f) mv(sx=%.3f sy=%.3f tx=%.3f ty=%.3f) %s %s",
+                    fn, mode, count, first, tex, blend, depth_test, lighting, texture_2d, cull_face, color_array,
+                    scissor_test, scissor_box[0], scissor_box[1], scissor_box[2], scissor_box[3],
+                    viewport[0], viewport[1], viewport[2], viewport[3],
+                    proj[0], proj[5], proj[12], proj[13],
+                    modelview[0], modelview[5], modelview[12], modelview[13],
+                    verts_buf, color_buf);
+        } else {
+            l_debug("[GL] %s mode=%x count=%d first=%d bound_tex=%d blend=%d depth_test=%d lighting=%d "
+                    "texture_2d=%d cull_face=%d color_array=%d "
+                    "scissor=%d(%d,%d,%d,%d) viewport=(%d,%d,%d,%d) "
+                    "proj(sx=%.3f sy=%.3f tx=%.3f ty=%.3f) mv(sx=%.3f sy=%.3f tx=%.3f ty=%.3f) %s %s",
+                    fn, mode, count, first, tex, blend, depth_test, lighting, texture_2d, cull_face, color_array,
+                    scissor_test, scissor_box[0], scissor_box[1], scissor_box[2], scissor_box[3],
+                    viewport[0], viewport[1], viewport[2], viewport[3],
+                    proj[0], proj[5], proj[12], proj[13],
+                    modelview[0], modelview[5], modelview[12], modelview[13],
+                    verts_buf, color_buf);
+            log_count++;
+        }
     }
 }
 

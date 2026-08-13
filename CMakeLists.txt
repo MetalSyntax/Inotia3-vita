@@ -75,6 +75,7 @@ add_executable(${CMAKE_PROJECT_NAME}
                source/wr_timer.c
                source/wr_touch.c
                source/audio.c
+               source/splash.c
                source/reimpl/apk_zip.c
                source/reimpl/jmp_shim.S
                source/reimpl/jmp_shim_log.c
