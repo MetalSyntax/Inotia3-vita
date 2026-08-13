@@ -3924,6 +3924,27 @@ decompilado ante cualquier crash con `.psp2dmp`.
 > stage-banner y bug de movimiento cerca de NPCs confirmados resueltos por el usuario en consola/emulador
 > real (`logs/log_026.txt` a `logs/log_036.txt` documentan la secuencia completa de diagnóstico).
 
+> **Corrida 101 (2026-08-13) — Solución y diagnóstico definitivo del bug del ícono del personaje en la esquina superior izquierda (`Screenshot 2026-08-11 at 8.03.39 PM.png`) (`source/patch.c`).**
+>
+> **Triaje profundo y causa raíz identificada**:
+> El análisis de `Screenshot 2026-08-11 at 8.03.39 PM.png` confirmó que el marco circular del HUD debe mostrar los íconos de los personajes de la party ("Lucio", "Ameli", etc.).
+> Cadena de dibujado: `VP_DrawObjectBack_Char` (`:116103`) → `UI_CharacterState_Draw` (`:129553`) → `UI_CharacterDraw_Icon` (`:129368`) → `GRPX_DrawPartExWithMask` (`:123828`, offset `0x000d2a68`) → `SGL_DrawTexturePartWithMask` (offset `0x000c0e08`).
+>
+> **Mecanismo de la falla**:
+> 1. `SGL_DrawTexturePartWithMask` es una función C estática no exportada en `.dynsym` de `libgame.so` (ubicada en el offset fijo `0x000c0e08`). Por ello, `so_symbol(&so_mod, "SGL_DrawTexturePartWithMask")` devolvía `NULL` y el hook inicial nunca se instaló, dejando ejecutarse el código nativo desincronizado.
+> 2. En `SGL_DrawTexturePartWithMask`, la función escribe los vértices en `DAT_001778a8` (`so_mod.text_base + 0x1778a8`) y las coordenadas UV de la textura 0 en `DAT_00177928` en enteros `GL_FIXED` (Q16.16), pero **NO invoca `glVertexPointer` ni `glTexCoordPointer` internamente**.
+> 3. Al cambiar los punteros de vértices en otras funciones (como `SGL_grpFillRect_hook`), `glVertexPointer` quedaba desfasado y `glDrawArrays` no convertía los datos de forma aislada.
+>
+> **Solución aplicada**:
+> - Se enganchó `SGL_DrawTexturePartWithMask` por dirección fija (`so_mod.text_base + 0x000c0e08`) en `source/patch.c`.
+> - Se reimplementó `SGL_DrawTexturePartWithMask_hook` de forma 100% aislada:
+>   - Calcula las coordenadas de vértices `verts` y texturas `uvs` directamente en `GLfloat` en la pila.
+>   - Asocia `tex0_id` a `GL_TEXTURE0` y desactiva la Unidad 1 de multitexturizado.
+>   - Configura `glVertexPointer` y `glTexCoordPointer` con los punteros `GLfloat` puros y llama directamente a `glDrawArrays(GL_TRIANGLE_STRIP, 0, 4)`.
+>   - Se añade log de diagnóstico con `l_error` para verificar parámetros de dibujado en hardware real.
+>
+> Build (Release, Corrida 101) compilado exitosamente y exportado a `build/inotia3.vpk`.
+
 ## 3. Riesgos genéricos heredados de la arquitectura SoLoader (aplican igual que en cualquier port)
 ## 3. Riesgos genéricos heredados de la arquitectura SoLoader (aplican igual que en cualquier port)
 - Rutas con espacio en `PSVITA Develop` → build en `/tmp` (`porting_tools/build/build_and_install.sh` ya lo

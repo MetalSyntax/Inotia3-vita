@@ -622,9 +622,11 @@ void glDrawArrays_soloader(GLenum mode, GLint first, GLsizei count) {
     GLint vert_size = pending_fixed_vert_size;
     GLint color_size = pending_fixed_color_size;
     flush_pending_fixed_arrays(first + count);
+
     log_draw_call("glDrawArrays", mode, count,
                    had_fixed_verts ? fixed_vert_buf : NULL, had_fixed_verts ? vert_size : 0,
                    had_fixed_colors ? fixed_color_buf : NULL, had_fixed_colors ? color_size : 0, first);
+
     glDrawArrays(mode, first, count);
 }
 

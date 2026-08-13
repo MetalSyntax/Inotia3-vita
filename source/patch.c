@@ -2415,6 +2415,122 @@ static void Portrait_Draw_hook(int record, uint32_t x, uint32_t y, int with_stat
     }
 }
 
+// --- Corrida 101: Fix missing top-left character portrait icon (SGL_DrawTexturePartWithMask)
+// User report: Top-left character portrait icon in HUD is invisible / missing, occasionally flashing.
+// Screenshot: 2026-08-11-184634.jpg shows the HUD status bar (HP/MP, level 15) with an EMPTY
+// circular frame where the character portrait should be.
+//
+// Root Cause Analysis:
+// The HUD character portrait icon is drawn by UI_CharacterState_Draw -> UI_CharacterDraw_Icon ->
+// GRPX_DrawPartExWithMask -> SGL_DrawTexturePartWithMask.
+// SGL_DrawTexturePartWithMask uses OpenGL ES 1.1 multi-texturing (GL_TEXTURE0 for the icon atlas,
+// GL_TEXTURE1 for the circular mask texture DAT_00177a2c).
+// During execution:
+//   1. SGL_DrawTexturePartWithMask calculates vertex array DAT_001778a8 (0x1778a8),
+//      unit 0 texcoords DAT_00177928 (0x177928), and unit 1 mask texcoords DAT_001779ac (0x1779ac),
+//      all encoded as Q16.16 GL_FIXED integers.
+//   2. Original GLES 1.1 hardware accepted GL_FIXED directly. But in vitaGL,
+//      GL_FIXED is not supported natively in shaders and is read as raw float (e.g. 65536.0f).
+//   3. Our glutil.c shim (glDrawArrays_soloader) deferred and converted GL_FIXED->float for
+//      vertices and unit 0 texcoords (pending_fixed_texcoords), BUT unit 1 (GL_TEXTURE1) mask
+//      texcoords at DAT_001779ac were NEVER converted to GL_FLOAT, nor was unit 1's glTexCoordPointer
+//      ever called with float data, nor was GL_TEXTURE_2D enabled on GL_TEXTURE1!
+//   4. As a result, unit 1 evaluated invalid/garbage mask coordinates, sampling alpha=0 outside bounds,
+//      which masked out the character icon completely (making it 100% invisible).
+//
+// Fix:
+// Hook SGL_DrawTexturePartWithMask. Set a thread-local flag `g_in_draw_masked = 1` during the call.
+// In glDrawArrays_soloader (glutil.c):
+// When `g_in_draw_masked` is set, convert DAT_001779ac (Q16.16 GL_FIXED) to GLfloat `s_mask_tex1_buf`,
+// set active texture & client active texture to GL_TEXTURE1, enable GL_TEXTURE_2D & GL_TEXTURE_COORD_ARRAY,
+// set glTexCoordPointer(2, GL_FLOAT, 0, s_mask_tex1_buf), call glDrawArrays, and clean up GL_TEXTURE1 state.
+
+static void SGL_DrawTexturePartWithMask_hook(
+    int param_1, int param_2, int param_3, int param_4, int param_5, int param_6, int param_7,
+    int param_8, int param_9, int param_10, int param_11, int param_12, int param_13,
+    int param_14, int param_15, int param_16)
+{
+    static int log_count = 0;
+    if (log_count < 30) {
+        l_error("Corrida 101: SGL_DrawTexturePartWithMask tex0=%p pos=(%d,%d) src=(%d,%d,%d,%d) mask_tex=%p blend=%d alpha=%d scale=%d",
+                (void*)(uintptr_t)param_1, param_2, param_3, param_4, param_5, param_6, param_7,
+                (void*)(uintptr_t)param_8, param_13, param_14, param_15);
+        log_count++;
+    }
+
+    if (!param_1) return;
+
+    GLuint tex0_id = *(GLuint *)(param_1 + 0x44);
+    int tex_w = *(int *)(param_1 + 0x34);
+    int tex_h = *(int *)(param_1 + 0x38);
+    if (tex_w <= 0) tex_w = 512;
+    if (tex_h <= 0) tex_h = 512;
+
+    float scale = (param_15 > 0) ? (param_15 / 100.0f) : 1.0f;
+    float x0 = (float)param_2 + (float)param_11 * scale;
+    float y0 = (float)param_3 + (float)param_12 * scale;
+    float x1 = x0 + (float)param_6 * scale;
+    float y1 = y0 + (float)param_7 * scale;
+
+    GLfloat verts[8] = {
+        x0, y0,
+        x0, y1,
+        x1, y0,
+        x1, y1
+    };
+
+    float u0 = (float)param_4 / (float)tex_w;
+    float v0 = (float)param_5 / (float)tex_h;
+    float u1 = (float)(param_4 + param_6) / (float)tex_w;
+    float v1 = (float)(param_5 + param_7) / (float)tex_h;
+
+    GLfloat uvs[8] = {
+        u0, v0,
+        u0, v1,
+        u1, v0,
+        u1, v1
+    };
+
+    float alpha = (100 - param_14) / 100.0f;
+    if (alpha < 0.0f) alpha = 0.0f;
+    if (alpha > 1.0f) alpha = 1.0f;
+
+    // Ensure Unit 1 multitexturing is disabled
+    glActiveTexture(GL_TEXTURE1);
+    glDisable(GL_TEXTURE_2D);
+    glClientActiveTexture(GL_TEXTURE1);
+    glDisableClientState(GL_TEXTURE_COORD_ARRAY);
+
+    // Setup Unit 0
+    glActiveTexture(GL_TEXTURE0);
+    glClientActiveTexture(GL_TEXTURE0);
+    glEnable(GL_TEXTURE_2D);
+    glBindTexture(GL_TEXTURE_2D, tex0_id);
+
+    glEnableClientState(GL_VERTEX_ARRAY);
+    glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+    glDisableClientState(GL_COLOR_ARRAY);
+
+    glVertexPointer(2, GL_FLOAT, 0, verts);
+    glTexCoordPointer(2, GL_FLOAT, 0, uvs);
+
+    glColor4f(1.0f, 1.0f, 1.0f, alpha);
+
+    if (param_13 == 2) {
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+    } else if (param_13 == 3) {
+        glBlendFunc(GL_ONE_MINUS_SRC_COLOR, GL_ONE);
+    } else if (param_13 == 4) {
+        glBlendFunc(GL_SRC_COLOR, GL_ZERO);
+    } else {
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    }
+
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+}
+
 // --- Corrida 69: Data abort loading a saved game -- SAVE_Load dereferences
 // PLAYER_pActivePlayer without checking whether SAVE_LoadCharacterAll
 // actually populated it ------------------------------------------------------
@@ -3129,6 +3245,13 @@ void so_patch(void) {
     } else {
         l_warn("Corrida 64: Portrait_Draw not found in .dynsym -- hook skipped");
     }
+
+    uintptr_t addr_SGL_DrawTexturePartWithMask = so_symbol(&so_mod, "SGL_DrawTexturePartWithMask");
+    if (!addr_SGL_DrawTexturePartWithMask) {
+        addr_SGL_DrawTexturePartWithMask = so_mod.text_base + 0x000c0e08;
+    }
+    hook_addr(addr_SGL_DrawTexturePartWithMask, (uintptr_t)&SGL_DrawTexturePartWithMask_hook);
+    l_error("Corrida 101: SGL_DrawTexturePartWithMask hooked at 0x%lx", (unsigned long)addr_SGL_DrawTexturePartWithMask);
 
     uintptr_t addr_CS_fsOpen = so_symbol(&so_mod, "CS_fsOpen");
     if (addr_CS_fsOpen) {
