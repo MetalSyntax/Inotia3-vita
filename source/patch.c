@@ -1565,68 +1565,196 @@ static void GRP_DrawPixel_hook(int x, int y) {
 static so_hook h_SGL_grpFillRect;
 static uint32_t *g_ptr_SGL_CLIP = NULL;
 static int g_fillrect_log_count = 0;
-// Corrida 83: the original cap of 60 was exhausted almost entirely by a
-// legitimate, working full-canvas fade (x=0,y=0,w=480,h=320 -- the WHOLE
-// logical screen, per this .so's glOrthox(0,480,0,320,...) 480x320 logical
-// coordinate space, out_ghidra.c:105501 -- not a bug, just noisy) before the
-// user ever reached the actually-broken popups/panels this hook exists to
-// diagnose. Raised well past a single loading/transition sequence's own
-// call volume so a full test session's worth of calls gets captured instead.
 #define FILLRECT_LOG_MAX 2000
 
-// Corrida 89: Corrida 88's fix (save/force-off/restore GL_TEXTURE_COORD_ARRAY
-// + the bound texture) is confirmed present in the retested build (the log's
-// own diagnostic line format matches) and the anomaly it targeted was real
-// (GL_TEXTURE_COORD_ARRAY=1, a real bound texture) -- but the backgrounds are
-// STILL missing after it. Two additions this round: (1) GL_DEPTH_TEST is the
-// one enable-capability SGL_grpFillRect's own decompile never manages (it
-// only ever touches GL_TEXTURE_2D) -- saved/forced-off/restored the same way,
-// on the chance a UI-overlay quad's implicit Z is failing depth test against
-// whatever's already in the buffer (this project's own Corrida 24-27 history
-// already established vitaGL doesn't always honor enable-state the way
-// desktop GL would, so this is a real, not-yet-tested candidate, not a wild
-// guess). (2) A full diagnostic dump (real post-conversion vertex positions,
-// viewport/scissor, projection/modelview scale+translate -- Corrida 24-27's
-// own log_draw_call machinery, unused for this bug until now because its
-// 400-call budget is long exhausted before a session reaches these specific
-// draws) is FORCED for every semi-transparent fill (alpha < 0xff -- the exact
-// class of call under suspicion; opaque fills aren't reported broken) via
-// gl_force_log_next_draw(), bypassing that budget. If depth test wasn't it
-// either, this dump is the next real lead: it will show whether the actual
-// GPU-bound vertex positions for these draws land anywhere near the visible
-// screen at all.
+// Corrida 92: Fix for invisible translucent black backgrounds, quest row panels, item tooltips,
+// saved popups, and speech bubbles.
+// Deep triage of SGL_grpFillRect (out_ghidra.c:106134) revealed 4 root causes acting together:
+// 1. SGL_grpFillRect writes 4 vertices to DAT_001778a8 (so_mod.text_base + 0x1778a8)
+//    without calling glVertexPointer itself (expecting it to be bound to DAT_001778a8). If a prior
+//    draw call pointed glVertexPointer elsewhere or set type != GL_FIXED, glDrawArrays_soloader
+//    would not flush DAT_001778a8. Fix: re-bind DAT_001778a8 explicitly via glVertexPointer_soloader.
+// 2. GL_CULL_FACE: SGL_grpFillRect draws GL_TRIANGLE_FAN with vertices in (V0,V1,V2,V3) order.
+//    Under glOrthox(0,480,0,320,...) (y-down logical space with inverted NDC Y), this winding becomes
+//    Counter-Clockwise (CCW). If GL_CULL_FACE is active and culling CCW, the quad gets 100% culled
+//    by hardware. Fix: disable GL_CULL_FACE during fill.
+// 3. GL_COLOR_ARRAY / GL_TEXTURE_COORD_ARRAY / TEXTURE_2D: If client arrays were left enabled by
+//    prior sprite draws, flat glColor4f color is ignored or stale texcoords sample stale textures.
+//    Fix: disable GL_COLOR_ARRAY, GL_TEXTURE_COORD_ARRAY, unbind texture.
+// 4. GL_BLEND / GL_DEPTH_TEST / GL_SCISSOR_TEST: SGL_grpFillRect assumes GL_BLEND is enabled.
+//    Fix: force GL_BLEND enabled with GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, and disable depth/scissor.
+// Corrida 94: Clean, self-contained implementation for SGL_grpFillRect
+// Fixes:
+// 1. Differentiates solid vs translucent primitive fills via white 1x1 texture (gl_get_white_texture).
+// 2. Uses static buffers for vertex/color/uv data to avoid dangling stack pointers corrupting font/menu text.
+// 3. Disables CULL_FACE, DEPTH_TEST, SCISSOR_TEST during fill, enables BLEND with GL_SRC_ALPHA/GL_ONE_MINUS_SRC_ALPHA.
+// 4. Zero high-frequency log calls to eliminate I/O disk stalls and maintain steady 60 FPS.
+// Corrida 95: Stable, crash-free implementation for SGL_grpFillRect
+// Fixes:
+// 1. Eliminates the NULL pointer Data Abort crash when loading save games (removes NULL pointers passed to glVertexPointer).
+// 2. Restores translucent black/brown background panels, tooltips, dialogs, and quest lists via white 1x1 texture (gl_get_white_texture).
+// 3. Properly isolates state (CULL_FACE, DEPTH_TEST, SCISSOR_TEST, BLEND) and restores prior client states cleanly.
 static void SGL_grpFillRect_hook(int x, int y, int w, int h, uint32_t color) {
-    int color_array_before = (int) gl_color_array_enabled();
-    int texcoord_array_before = (int) gl_texcoord_array_enabled();
-    int depth_test_before = (int) gl_depth_test_enabled();
-    GLint bound_tex_before = gl_get_bound_texture_2d();
-    if (g_fillrect_log_count < FILLRECT_LOG_MAX) {
-        l_error("Corrida 89: SGL_grpFillRect(x=%d,y=%d,w=%d,h=%d,color=%08x) "
-                "GL_COLOR_ARRAY=%d GL_TEXTURE_COORD_ARRAY=%d GL_DEPTH_TEST=%d bound_tex=%d "
-                "SGL_CLIP=[%d,%d,%d,%d]",
-                x, y, w, h, color, color_array_before, texcoord_array_before, depth_test_before,
-                (int) bound_tex_before,
-                g_ptr_SGL_CLIP ? (int32_t) g_ptr_SGL_CLIP[0] : -12345,
-                g_ptr_SGL_CLIP ? (int32_t) g_ptr_SGL_CLIP[1] : -12345,
-                g_ptr_SGL_CLIP ? (int32_t) g_ptr_SGL_CLIP[2] : -12345,
-                g_ptr_SGL_CLIP ? (int32_t) g_ptr_SGL_CLIP[3] : -12345);
-        g_fillrect_log_count++;
+    // Corrida 99: this used to be a textbook symmetric AABB clamp (clamp all
+    // 4 edges independently), which is NOT what the real SGL_grpFillRect
+    // (out_ghidra.c:106146-106194) does. The real clip math is asymmetric:
+    // when the rect's left edge is outside the clip on the left, the RIGHT
+    // edge is taken from the rect's own unclamped x+w, not from the clip's
+    // right edge (and the mirrored case for top/bottom) -- only the "rect
+    // fully encloses the clip" case (a full-screen fade over a smaller
+    // dialog/banner clip window) reduces to a plain clamp. A banner sliding
+    // into view, or an NPC prompt panel positioned right at a clip edge, is
+    // exactly the kind of partial-overlap case where the two disagree --
+    // fits both reported glitches (stage-name banner appearing, panels near
+    // NPCs) far better than anything already tried (GL state save/restore
+    // fixes changed nothing, meaning the bug isn't state leakage). Ported
+    // directly from the decompile instead of re-deriving "equivalent" math,
+    // since Ghidra's register reuse here is too easy to mis-simplify.
+    int x2, y2;
+    if (g_ptr_SGL_CLIP && ((int32_t)g_ptr_SGL_CLIP[0] >= 0) && ((int32_t)g_ptr_SGL_CLIP[1] >= 0)) {
+        int cx = (int32_t)g_ptr_SGL_CLIP[0];
+        int cy = (int32_t)g_ptr_SGL_CLIP[1];
+        int clip_right = cx + (int32_t)g_ptr_SGL_CLIP[2];
+        int clip_bottom = cy + (int32_t)g_ptr_SGL_CLIP[3];
+
+        if (clip_right <= x) return;
+        if (clip_bottom <= y) return;
+        int rect_right = x + w;
+        if (rect_right <= cx) return;
+        int rect_bottom = y + h;
+        if (rect_bottom <= cy) return;
+
+        if ((cy <= y) || (x >= cx) || (rect_right <= clip_right) || (rect_bottom <= clip_bottom)) {
+            if (x < cx) {
+                x2 = rect_right; // unclamped on the right -- matches the original
+                x = cx;
+            } else if (rect_right <= clip_right) {
+                x2 = rect_right;
+            } else {
+                x2 = clip_right;
+            }
+            if (cy <= y) {
+                y2 = (rect_bottom <= clip_bottom) ? rect_bottom : clip_bottom;
+            } else {
+                y2 = rect_bottom; // unclamped on the bottom -- matches the original
+                y = cy;
+            }
+        } else {
+            // Rect fully encloses the clip rect (e.g. a full-screen fade) --
+            // draw exactly the clip rect, translated by the rect's own origin.
+            y = y + cy;
+            x = x + cx;
+            x2 = x + (int32_t)g_ptr_SGL_CLIP[2];
+            y2 = y + (int32_t)g_ptr_SGL_CLIP[3];
+        }
+    } else {
+        x2 = x + w;
+        y2 = y + h;
     }
-    if ((color >> 24) < 0xff) {
-        // Semi-transparent -- the exact class of call reported broken (the
-        // "Saved" popup, item-info tooltip, speech bubble, stage-name banner
-        // are all alpha<0xff; opaque quest-row-style fills aren't reported
-        // broken). Force the deep dump only for these, not all ~800+ fills a
-        // session generates, to keep log volume sane.
-        gl_force_log_next_draw();
-    }
-    gl_set_texcoord_array_enabled(GL_FALSE);
-    gl_bind_texture_2d(0);
-    gl_set_depth_test_enabled(GL_FALSE);
-    SO_CONTINUE_VOID(h_SGL_grpFillRect, x, y, w, h, color);
-    gl_set_depth_test_enabled((GLboolean) depth_test_before);
-    gl_bind_texture_2d(bound_tex_before);
-    gl_set_texcoord_array_enabled((GLboolean) texcoord_array_before);
+    if (x2 <= x || y2 <= y) return;
+
+    GLboolean color_array_before = glIsEnabled(GL_COLOR_ARRAY);
+    GLboolean texcoord_array_before = glIsEnabled(GL_TEXTURE_COORD_ARRAY);
+    GLboolean cull_face_before = glIsEnabled(GL_CULL_FACE);
+    GLboolean depth_test_before = glIsEnabled(GL_DEPTH_TEST);
+    GLboolean scissor_test_before = glIsEnabled(GL_SCISSOR_TEST);
+    GLboolean blend_before = glIsEnabled(GL_BLEND);
+    GLint bound_tex_before = 0;
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &bound_tex_before);
+    // Corrida 98: glBlendFunc/glTexEnv(GL_TEXTURE_ENV_MODE) are forced below
+    // but were never saved -- only GL_BLEND's on/off bit was. The engine
+    // itself proves these DO change transiently (several sprite/light-glow
+    // draws in out_ghidra.c set a special glBlendFunc then explicitly
+    // restore (0x302,0x303)=SRC_ALPHA/ONE_MINUS_SRC_ALPHA right after, e.g.
+    // out_ghidra.c:106413-106415). If this hook runs while one of those
+    // scopes is active (a stage-transition fade or an NPC's proximity
+    // prompt panel are exactly the kind of thing that could wrap a fill in
+    // its own blend mode), forcing SRC_ALPHA/ONE_MINUS_SRC_ALPHA and never
+    // restoring the caller's actual func would corrupt whatever draws next
+    // in that same scope -- the banner-text-over-fade glitch and the
+    // near-NPC glitch both fit. Save/restore the real func and env mode
+    // instead of assuming the hardcoded values are always safe to leave.
+    GLint blend_src_before = GL_SRC_ALPHA, blend_dst_before = GL_ONE_MINUS_SRC_ALPHA;
+    glGetIntegerv(GL_BLEND_SRC, &blend_src_before);
+    glGetIntegerv(GL_BLEND_DST, &blend_dst_before);
+    GLint texenv_mode_before = GL_MODULATE;
+    glGetTexEnviv(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, &texenv_mode_before);
+
+    // Corrida 100: this used to write into so_mod.text_base+0x1778a8 (the
+    // game's OWN DAT_001778a8 vertex scratch buffer) via
+    // glVertexPointer_soloader/glDrawArrays_soloader -- the SAME deferred
+    // GL_FIXED->float shim (glutil.c's pending_fixed_verts/colors/texcoords
+    // + shared fixed_*_buf conversion buffers) every sprite draw in the
+    // engine also goes through. That shim's glDrawArrays_soloader
+    // unconditionally reprocesses whichever of pending_fixed_colors/
+    // pending_fixed_texcoords are still set -- which, since this hook never
+    // touches them, are always leftover pointers into the game's OWN
+    // DAT_00177a30/DAT_00177928 scratch buffers from whatever sprite drew
+    // last. Every fillrect call was therefore re-running that stale
+    // conversion and re-binding the shared fixed_color_buf/fixed_texcoord_buf
+    // as a side effect, real GL state changes that only get corrected again
+    // once/if the next sprite draw reasserts its own pointers first -- a
+    // real, timing-dependent corruption window right when a banner/prompt
+    // panel fill lands between two sprite draws. Bypassing the shared shim
+    // entirely with our own static float buffer and the real (non-soloader)
+    // glVertexPointer/glDrawArrays removes this hook from that shared state
+    // machinery altogether -- no interaction with the engine's own vertex/
+    // color/texcoord buffers in either direction.
+    static GLfloat verts[8];
+    verts[0] = (GLfloat) x;  verts[1] = (GLfloat) y;
+    verts[2] = (GLfloat) x2; verts[3] = (GLfloat) y;
+    verts[4] = (GLfloat) x2; verts[5] = (GLfloat) y2;
+    verts[6] = (GLfloat) x;  verts[7] = (GLfloat) y2;
+
+    glVertexPointer(2, GL_FLOAT, 0, verts);
+
+    float r = (color & 0xff) / 255.0f;
+    float g = ((color >> 8) & 0xff) / 255.0f;
+    float b = ((color >> 16) & 0xff) / 255.0f;
+    float a = ((color >> 24) & 0xff) / 255.0f;
+
+    glDisableClientState(GL_COLOR_ARRAY);
+    glDisableClientState(GL_TEXTURE_COORD_ARRAY);
+
+    glDisable(GL_CULL_FACE);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_SCISSOR_TEST);
+
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+    glEnable(GL_TEXTURE_2D);
+    glBindTexture(GL_TEXTURE_2D, gl_get_white_texture());
+    glTexEnvf(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
+
+    glColor4f(r, g, b, a);
+
+    glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+
+    if (color_array_before) glEnableClientState(GL_COLOR_ARRAY);
+    if (texcoord_array_before) glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+    // Corrida 97: the real SGL_grpFillRect (out_ghidra.c:106195-106210) does
+    // glDisable(GL_TEXTURE_2D) unconditionally at entry and glEnable(
+    // GL_TEXTURE_2D) unconditionally at return -- NOT a save/restore of
+    // whatever it was before. Every sprite draw this engine has (e.g.
+    // SGL_DrawTexturePart, out_ghidra.c:106934) never calls glEnable(
+    // GL_TEXTURE_2D) itself -- it relies on texturing already being on from
+    // a previous call. Restoring to texture_2d_before instead of always
+    // re-enabling broke that invariant whenever this hook happened to run
+    // while GL_TEXTURE_2D was momentarily off, leaving it off for whatever
+    // sprite draw ran next -- the stage-name banner glitch (its fade uses
+    // this same fill) and the walk-near-NPC glitch (their nameplate/prompt
+    // panels do too) both fit that exact failure mode. Match the original:
+    // always leave GL_TEXTURE_2D enabled on return.
+    glEnable(GL_TEXTURE_2D);
+    glBindTexture(GL_TEXTURE_2D, (GLuint) bound_tex_before);
+    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, texenv_mode_before);
+
+    if (cull_face_before) glEnable(GL_CULL_FACE);
+    if (depth_test_before) glEnable(GL_DEPTH_TEST);
+    if (scissor_test_before) glEnable(GL_SCISSOR_TEST);
+    glBlendFunc(blend_src_before, blend_dst_before);
+    if (!blend_before) glDisable(GL_BLEND);
 }
 
 // --- Corrida 62: in-game "Save" always reports failure -- CS_fsOpen never

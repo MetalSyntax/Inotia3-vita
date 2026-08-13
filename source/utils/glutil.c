@@ -265,6 +265,24 @@ void gl_set_depth_test_enabled(GLboolean enabled) {
     }
 }
 
+// Corrida 93: Solid 1x1 white texture for untextured primitive draws in vitaGL.
+// When vitaGL executes fragment shaders for untextured primitives, binding a solid
+// white texture ensures sampler output is (1,1,1,1) so flat color (r,g,b,alpha) is
+// fully preserved instead of being zeroed out by texture 0.
+static GLuint g_white_tex = 0;
+
+GLuint gl_get_white_texture(void) {
+    if (!g_white_tex) {
+        uint32_t white_pixel = 0xffffffff;
+        glGenTextures(1, &g_white_tex);
+        glBindTexture(GL_TEXTURE_2D, g_white_tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, &white_pixel);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    }
+    return g_white_tex;
+}
+
 // Corrida 89: sibling investigation to Corrida 24-27's log_draw_call below --
 // that machinery already dumps everything a "draw call happened but nothing
 // visible" bug needs (viewport/scissor, projection/modelview scale+translate,

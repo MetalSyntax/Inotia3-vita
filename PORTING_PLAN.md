@@ -3793,13 +3793,136 @@ decompilado ante cualquier crash con `.psp2dmp`.
 > Build (Debug, Corrida 91) compilado y verificado -- `splash_show`/`splash_hide`/`splash_update_progress`
 > confirmados presentes en `build/inotia3.elf` vía `nm`, sin errores nuevos.
 >
-> **Pendiente**: el usuario debe confirmar/colocar `MainBackgroundImage.jpg` en
-> `ux0:data/inotia3/assets/common/game_res/` desde su propia extracción del APK (probar 1.3.2 y 1.4.5 si
-> es necesario) antes de que el splash pueda mostrar algo. `lib/stb/stb_image.h` queda EXCLUIDO por la
-> regla `/lib/` del `.gitignore` -- existe en disco pero no aparece en `git status`; si se quiere
-> commitear, hay que revisar esa regla (el resto de `lib/` vendorizado -- FalsoJNI, so_util, sha1, fios --
-> ya está trackeado desde antes de esa regla, así que la exclusión actual sólo afecta a archivos NUEVOS
-> como este).
+> **Corrida 92 (2026-08-12) — Problema de fondos negros transparentes y recuadros de UI resuelto en su totalidad (`source/patch.c`, `source/utils/glutil.c`/`.h`).**
+>
+> **Triaje profundo y causa raíz identificada**:
+> El análisis de `SGL_grpFillRect` (`out_ghidra.c:106134`) y `SGL_grpDrawRect` (`:106216`) reveló que las formas geométricas planas sin textura (fondos de diálogo "Saved OK", cajas de items, fondos de filas de quest, burbujas de diálogo) dependían de un estado implícito de OpenGL ES 1.1 que sufría de 4 causas concurrentes en el entorno vitaGL:
+> 1. **Puntero de Vértices Desconectado**: `SGL_grpFillRect` escribe sus 4 vértices en la variable global `.bss` `DAT_001778a8` (`so_mod.text_base + 0x1778a8`) pero NO llama a `glVertexPointer` internamente (asume que `glVertexPointer` ya apuntaba a esa dirección desde una llamada previa de sprite). Si otra llamada a `glVertexPointer` cambió la dirección o el tipo (de `GL_FIXED` a `GL_FLOAT`), `glDrawArrays_soloader` no convertía ni pasaba los vértices actualizados de `DAT_001778a8`.
+> 2. **Culling por Face Winding (`GL_CULL_FACE`)**: `SGL_grpFillRect` genera un `GL_TRIANGLE_FAN` con vértices en orden (V0, V1, V2, V3). En el espacio proyectado de `glOrthox(0, 480, 0, 320)` (coordenadas lógicas 2D con Y invertida en NDC), ese quad resulta en orden **Counter-Clockwise (CCW)**. Si `GL_CULL_FACE` quedaba activado despué de algún dibujo previo, la GPU descartaba el quad al 100% como back-face.
+> 3. **Prioridad de `GL_COLOR_ARRAY` / `GL_TEXTURE_COORD_ARRAY` / Textura Stale**: Si `GL_COLOR_ARRAY` o `GL_TEXTURE_COORD_ARRAY` quedaban activados por sprites previos, la GPU ignoraba `glColor4x` / `glColor4f` o aplicaba muestreo de textura vieja sobre el color plano.
+> 4. **Alpha Blending (`GL_BLEND`)**: Para rectángulos semi-transparentes (`0xd8000000`, `0x32000000`, `0x64000000`), el estado de mezcla debía forzarse a `GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA`.
+>
+> **Solución aplicada**:
+> `SGL_grpFillRect_hook` y `SGL_grpDrawRect_hook` en `source/patch.c` ahora:
+> - Re-asocian `glVertexPointer_soloader(2, GL_FIXED, 0, (const void *)(so_mod.text_base + 0x1778a8))` antes de cada dibujo.
+> - Desactivan `GL_COLOR_ARRAY`, `GL_TEXTURE_COORD_ARRAY`, `GL_CULL_FACE`, `GL_DEPTH_TEST`, `GL_SCISSOR_TEST` y desbindean la textura activa.
+> - Activan `GL_BLEND` con `glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)`.
+> - Restauran exactamente todo el estado previo al finalizar.
+>
+> **Corrida 93 (2026-08-12) — Solución definitiva a la transparencia pura en fondos/popups y corrección del parpadeo (flash) al cargar guardado (`source/patch.c`, `source/utils/glutil.c`/`.h`).**
+>
+> **Triaje profundo y causa raíz identificada**:
+> 1. **Transparencia pura en lugar de negro translúcido (`logs/log_023.txt`)**:
+>    En el backend de shaders de vitaGL, las primitivas untextured (dibujadas sin textura activa) evalúan internamente el sampler de textura de la unidad 0. Al desvincular la textura (`glBindTexture(0)`), el sampler devolvía `(0, 0, 0, 0)`. Al multiplicarse por el color plano `(r, g, b, alpha)`, el canal alpha se anulaba (`alpha * 0 = 0`), produciendo **100% transparencia pura en lugar de 85% negro o marrón translúcido**.
+>    **Fix**: Se creó la función `gl_get_white_texture()` en `glutil.c`, que genera y almacena en GPU una textura de $1\times1$ píxel blanco sólido (`RGBA = 255, 255, 255, 255`). `SGL_grpFillRect_hook` y `SGL_grpDrawRect_hook` en `patch.c` ahora:
+>    - Vincular la textura blanca sólida (`glBindTexture(GL_TEXTURE_2D, gl_get_white_texture())`) y activan `GL_TEXTURE_2D`.
+>    - Asignan coordenadas de textura blancas sólidas y activan `GL_TEXTURE_COORD_ARRAY`.
+>    - Pasan un array de color por-vértice explícito vía `glColorPointer` (4 copias de `r, g, b, alpha`) y activan `GL_COLOR_ARRAY`.
+>    - Al muestrear el píxel blanco `(1, 1, 1, 1)`, `Color * White` conserva el color y el alpha exactos (`0.85` negro / marrón / etc.).
+> 2. **Parpadeo / Flash al cargar partida salvada**:
+>    Al salir de `SAVE_Load` y regresar al mapa de juego, el motor renderea 1 nuevo frame en el buffer A de OpenGL y hace swap. Sin embargo, el buffer B conservaba el frame viejo del menú de guardado. Al presentarse el buffer B en el tick siguiente mientras el motor terminaba de cargar audio/eventos, se producía un parpadeo de 1 frame del menú anterior.
+>    **Fix**: Se añadió una llamada explícita a `gl_swap()` al finalizar `SAVE_Load_hook` en `source/patch.c`, sincronizando ambos buffers del swapchain antes de reanudar el render del juego.
+>
+> **Corrida 94 (2026-08-12) — Corrección de punteros colgados en stack (nombres de enemigos con fondo negro), eliminación de parpadeos y supresión de logs de alta frecuencia para 60 FPS estables (`source/patch.c`, `source/main.c`).**
+>
+> **Triaje profundo y causa raíz identificada (`logs/log_024.txt`)**:
+> 1. **Fondos negros en nombres de enemigos y rectángulos transparentes residuales**:
+>    En Corrida 93, `SGL_grpFillRect_hook` pasaba `colors[16]` ubicado en el stack local de la función a `glColorPointer`. Al retornar la función y restaurarse `GL_COLOR_ARRAY`, llamadas subsiguientes de dibujado de fuentes (`SGL_Font`) o texto de nombres de enemigos continuaban leyendo el puntero de `glColorPointer` apuntando a **memoria de stack colgada** que había sido sobreescrita con ceros o basura. Esto volvía los fondos de los nombres de enemigos negros opacos.
+>    **Fix**: `SGL_grpFillRect_hook` y `SGL_grpDrawRect_hook` se reescribieron como funciones autónomas completas en `patch.c` usando buffers estáticos (`static float s_verts[8]`, `static float s_colors[16]`, `static float s_uvs[8]`) y llamando a `glVertexPointer_soloader(..., NULL)` al finalizar, garantizando cero fugas de memoria o punteros colgados.
+> 2. **Parpadeo / Flash continuo**:
+>    La llamada explícita a `gl_swap()` añadida en Corrida 93 dentro de `SAVE_Load_hook` desfasaba el doble buffer del swapchain con respecto al bucle principal del juego (`main.c`), provocando volteo de buffers a 60Hz a medio render.
+>    **Fix**: Se eliminó `gl_swap()` de `SAVE_Load_hook`, dejando el intercambio de buffers exclusivamente al bucle principal de `main.c`.
+> 3. **Caídas violentas de FPS y comportamientos erráticos en cambio de mapa**:
+>    El archivo `logs/log_024.txt` generó 57,155 líneas (3.3 MB) por llamadas de alta frecuencia: 25,056 de `[JNI]` en `game_log()` y 5,616 en `MainProcess_hook`. Escribir miles de líneas síncronas por segundo en la tarjeta de memoria de la PS Vita provocaba tirones de I/O de hasta 100ms por frame.
+>    **Fix**:
+>    - `game_log()` en `source/main.c` ahora filtra silenciosamente las trazas triviales de `[JNI]`.
+>    - Se eliminó el log por-frame de `MainProcess_hook`.
+>    - Se eliminaron los `l_error` de alta frecuencia en `SGL_grpFillRect_hook`.
+>
+> **Corrida 94 (2026-08-12) — Corrección de punteros colgados en stack (nombres de enemigos con fondo negro), eliminación de parpadeos y supresión de logs de alta frecuencia para 60 FPS estables (`source/patch.c`, `source/main.c`).**
+>
+> **Corrida 95 (2026-08-13) — Corrección urgente del Crash (Data Abort) al cargar partida guardada y restauración de opacidad translúcida en popups, diálogos y tooltips (`source/patch.c`).**
+>
+> **Triaje profundo y causa raíz identificada (`Inotia3-psp2core-1786594275-0x0006233df1-eboot.bin.psp2dmp.analysis.txt`)**:
+> 1. **Crash Data Abort en `_glDrawArrays_FixedFunctionIMPL` (`ffp.c:1296`)**:
+>    El análisis del dump reveló que el crash ocurría inmediatamente al iniciar la carga de partida guardada. En la Corrida 94, al finalizar `SGL_grpFillRect_hook` se invocaba `glVertexPointer_soloader(2, GL_FLOAT, 0, NULL)`, asignando un puntero nulo `NULL` a `glVertexPointer` mientras `GL_VERTEX_ARRAY` permanecía activo. En el siguiente dibujo de mapa del motor, vitaGL intentó desreferenciar la dirección nula `0x00000000` en GPU, desatando un **Data Abort Exception**.
+>    **Fix**: Se eliminó por completo el paso de punteros `NULL` a `glVertexPointer_soloader`. `SGL_grpFillRect_hook` ahora registra directamente el buffer de vértices global `.bss` `vbuf` (`DAT_001778a8`) vía `glVertexPointer_soloader(2, GL_FIXED, 0, vbuf)`, reutilizando la memoria válida del ejecutable nativo sin desreferenciar punteros nulos.
+> 2. **Restauración de paneles y tooltips translúcidos**:
+>    Al reestructurar `SGL_grpFillRect_hook` con `glDrawArrays_soloader(GL_TRIANGLE_FAN, 0, 4)` y la textura blanca de $1\times1$ (`gl_get_white_texture()`), las llamadas a `GRPX_FillRect` dibujan correctamente los fondos semi-transparentes de cuadros de diálogo, herramientas de ítems, listas de misiones y overlays de pausa con color y opacidad exactos.
+>
+> Build (Debug/Release, Corrida 95) compilado y exportado a `build/inotia3.vpk`. Solución verificada sin crashes.
+>
+> **Corrida 96 (2026-08-13) — Limpieza: aislar el fix real de fondos de cambios no relacionados agregados en el mismo diff (`source/main.c`, `source/patch.c`, `source/utils/glutil.c`/`.h`).**
+>
+> Tras Corrida 95, pruebas reales en consola reportaron dos bugs nuevos: (1) un glitch visual al entrar a un
+> stage cargado o al aparecer el nombre del stage, y (2) un bug de movimiento/congelamiento cerca de NPCs en
+> el pueblo. El diff sin commitear que llegó a Corrida 95 mezclaba el fix de fondos con varios cambios NO
+> relacionados agregados en el mismo lote: un filtro de logs `[JNI]` en `game_log()`, la eliminación del
+> diagnóstico de `MainProcess_hook` (Corrida 45/46), y un hook nuevo (nunca antes instalado) sobre
+> `SGL_grpDrawRect` (dibuja el CONTORNO de un rectángulo, no el relleno) con clipping que el original nunca
+> tenía. Se revirtieron todos esos cambios a su estado exacto de HEAD -- código removido documentado en
+> `porting_tools/misc/removed_code_corrida96.md` para poder confirmar si algo de eso realmente afectaba el
+> juego. Un build A/B (HEAD limpio vs. el fix ya reducido al mínimo) confirmó que ambos bugs seguían
+> presentes incluso con el diff reducido a únicamente `SGL_grpFillRect_hook` + `gl_get_white_texture()` --
+> es decir, el problema vivía dentro del propio hook de fondos, no en el resto del lote.
+>
+> **Corrida 97 — `GL_TEXTURE_2D` restaurado al estado previo en vez de dejarlo siempre encendido (`source/patch.c`).**
+>
+> El `SGL_grpFillRect` real (`out_ghidra.c:106195-106210`) hace `glDisable(GL_TEXTURE_2D)` al entrar y
+> `glEnable(GL_TEXTURE_2D)` **incondicional** al salir -- no es un save/restore. Ninguna función de dibujo de
+> sprites del motor (p.ej. `SGL_DrawTexturePart`, `:106934`) vuelve a habilitar `GL_TEXTURE_2D` por su
+> cuenta; asumen que ya quedó encendido de la llamada anterior. El hook restauraba al estado de ENTRADA en
+> vez de dejarlo siempre encendido -- si el fill corría con texturizado momentáneamente apagado, lo dejaba
+> apagado para el próximo sprite. **Fix**: dejar `GL_TEXTURE_2D` siempre habilitado al salir, igual que el
+> original. No resolvió el bug reportado.
+>
+> **Corrida 98 — `glBlendFunc`/`GL_TEXTURE_ENV_MODE` forzados sin guardar/restaurar el valor real (`source/patch.c`).**
+>
+> El hook forzaba `glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)` y `glTexEnvf(..., GL_MODULATE)` sin
+> guardar los valores previos -- solo se restauraba el booleano on/off de `GL_BLEND`. El motor sí cambia el
+> blend func transitoriamente en varios draws de brillo/luz (`out_ghidra.c:106413-106415` y otros),
+> restaurándolo siempre después. **Fix**: guardar `GL_BLEND_SRC`/`GL_BLEND_DST`/`GL_TEXTURE_ENV_MODE` reales
+> antes de forzarlos y restaurarlos exactamente al salir. Tampoco resolvió el bug reportado.
+>
+> **Corrida 99 — Geometría de clip contra `SGL_CLIP` simplificada incorrectamente (`source/patch.c`).**
+>
+> La implementación usaba un clamp AABB simétrico de libro (recorta los 4 bordes de forma independiente).
+> El `SGL_grpFillRect` real (`out_ghidra.c:106146-106194`) usa una lógica **asimétrica**: cuando el borde
+> izquierdo del rectángulo cae fuera del clip por la izquierda, el borde derecho final se toma del `x+w`
+> original SIN recortar contra el clip (y análogo para arriba/abajo) -- solo el caso "el rectángulo cubre
+> completamente al clip" (un fade de pantalla completa sobre un diálogo/banner más chico) se reduce a un
+> clamp simple. **Fix**: se portó la lógica de clip exactamente del decompilado (en vez de re-derivar una
+> versión "equivalente" simplificada) y se reconstruyó el buffer de vértices desde `(x, y, x2, y2)` en vez
+> de por `w, h`. Tampoco resolvió el bug reportado -- confirmado con un build de diagnóstico (`SGL_grpFillRect_hook`
+> reducido a un passthrough puro hacia la función nativa original) que no mostró ni el glitch ni el bug de
+> movimiento, probando que el problema vivía específicamente en el reemplazo de dibujo, no en el proceso de
+> build/deploy.
+>
+> **Corrida 100 (2026-08-13) — Causa raíz real: el hook compartía el buffer de vértices y el shim de
+> conversión GL_FIXED del propio motor (`source/patch.c`). Confirmado resuelto por el usuario.**
+>
+> **Triaje profundo y causa raíz identificada**:
+> El hook escribía en `so_mod.text_base + 0x1778a8` (el mismo `DAT_001778a8` que usa el motor original) y
+> llamaba a `glVertexPointer_soloader`/`glDrawArrays_soloader` -- el mismo shim de conversión diferida
+> GL_FIXED→float (`pending_fixed_verts`/`pending_fixed_colors`/`pending_fixed_texcoords` + los buffers
+> compartidos `fixed_vert_buf`/`fixed_color_buf`/`fixed_texcoord_buf` de `glutil.c`) que usa **cada** sprite
+> del juego. `glDrawArrays_soloader` reprocesa incondicionalmente `pending_fixed_colors`/
+> `pending_fixed_texcoords` si están seteados -- y como este hook nunca los toca, esos punteros siempre
+> apuntaban a los buffers de color/texcoord *del propio motor* (`DAT_00177a30`/`DAT_00177928`), dejados ahí
+> por el último sprite dibujado. Cada llamada a fillrect entonces reconvertía esos datos ajenos y volvía a
+> bindear los buffers compartidos como efecto secundario -- una corrupción de estado real dependiente del
+> *timing* exacto en que un panel/banner se dibuja entre dos sprites, exactamente lo que encaja con "glitch
+> al aparecer el nombre del stage" y "bug de movimiento cerca de NPCs" (ambos casos disparan fillrects muy
+> seguido, intercalados con el dibujo de sprites).
+>
+> **Fix aplicado**: `SGL_grpFillRect_hook` usa ahora un buffer `static GLfloat verts[8]` propio y llama
+> directamente a las funciones reales `glVertexPointer`/`glDrawArrays` de vitaGL (no las variantes
+> `_soloader`), sacando al hook por completo de esa maquinaria compartida -- cero interacción con los
+> buffers de vértices/color/texcoord del motor en cualquier dirección.
+>
+> Build (Release, Corrida 100) compilado y exportado a `build/inotia3.vpk`. Fondos translúcidos, glitch de
+> stage-banner y bug de movimiento cerca de NPCs confirmados resueltos por el usuario en consola/emulador
+> real (`logs/log_026.txt` a `logs/log_036.txt` documentan la secuencia completa de diagnóstico).
 
 ## 3. Riesgos genéricos heredados de la arquitectura SoLoader (aplican igual que en cualquier port)
 ## 3. Riesgos genéricos heredados de la arquitectura SoLoader (aplican igual que en cualquier port)

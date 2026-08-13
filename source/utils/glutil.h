@@ -150,6 +150,9 @@ void gl_bind_texture_2d(GLint texture);
 GLboolean gl_depth_test_enabled(void);
 void gl_set_depth_test_enabled(GLboolean enabled);
 
+// Corrida 93: Solid 1x1 white texture for untextured primitive draws in vitaGL
+GLuint gl_get_white_texture(void);
+
 // Corrida 89: forces exactly ONE full diagnostic dump through this file's
 // existing log_draw_call machinery (viewport/scissor, projection/modelview
 // scale+translate, actual post-GL_FIXED-conversion vertex positions, every
