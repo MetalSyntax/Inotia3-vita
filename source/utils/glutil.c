@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <malloc.h>
 #include <string.h>
+#include <arm_neon.h>
 #include <psp2/kernel/sysmem.h>
 #include <psp2/io/stat.h>
 
@@ -49,11 +50,19 @@ void gl_init() {
     // wrapper engine has the same coupling, given it already has its own
     // explicit timer system (wr_timer.c) rather than relying on raw frame
     // rate, so that specific technique was deliberately NOT ported here).
+    // vitaGL defaults to triple buffering; double buffering trades some
+    // tearing risk for lower memory/bandwidth pressure. Must be called
+    // before vglInitExtended.
+    vglUseTripleBuffering(GL_FALSE);
     vglInitExtended(0, 960, 544, 6 * 1024 * 1024, SCE_GXM_MULTISAMPLE_NONE);
 }
 
 void gl_swap() {
-    vglSwapBuffers(GL_TRUE);
+    // vglSwapBuffers' parameter is has_commondialog (whether to composite a
+    // SCE common dialog), not vsync -- passing GL_TRUE here every frame made
+    // vitaGL check for dialog compositing even when none is open. Common
+    // dialogs (dialog.c) pass GL_TRUE themselves while actually active.
+    vglSwapBuffers(GL_FALSE);
 }
 
 void glViewport_soloader(GLint x, GLint y, GLsizei width, GLsizei height) {
@@ -141,6 +150,12 @@ static void sample_pixels(const void *pixels, GLsizei width, GLsizei height, GLe
     *out_avg = nsamples ? (double) sum / nsamples : -1.0;
 }
 
+// This soloader forwards every texture's format/type to the real glTexImage2D/
+// glTexSubImage2D verbatim -- unlike ../Zenonia2-vita, which had to convert
+// GL_UNSIGNED_SHORT_5_6_5 (RGB565) to RGBA8888 on the CPU because an older
+// vitaGL rejected the native 16-bit upload with GL_INVALID_ENUM. Confirmed on
+// this toolchain (native.so log: "native 16-bit upload OK") that no such
+// conversion is needed here either.
 void glTexImage2D_soloader(GLenum target, GLint level, GLint internalformat,
                            GLsizei width, GLsizei height, GLint border,
                            GLenum format, GLenum type, const void *pixels) {
@@ -457,6 +472,17 @@ void glTexCoordPointer_soloader(GLint size, GLenum type, GLsizei stride, const G
     glTexCoordPointer(size, type, stride, pointer);
 }
 
+// Perf investigation (log_050.txt): a busy scene (Deep Forest map, several
+// CHAR_AddAction'd wolves/NPCs) showed wr_run_timers() costing up to ~113ms/
+// frame while touch/swap stayed negligible -- and this runs on EVERY single
+// glDrawArrays/glDrawElements call (vertex/color/texcoord GL_FIXED arrays),
+// scaling directly with how many sprites get drawn per frame, as a plain
+// scalar loop. NEON is confirmed available on this toolchain by default
+// (arm-vita-eabi-gcc targets armv7-a+simd/-mfpu=neon with no extra flags --
+// same as ../Zenonia2-vita's own NEON conversion) and was previously unused
+// here since the RGB565 path needs no CPU conversion at all. Unlike that
+// case, this conversion genuinely runs on the hot per-draw-call path, so
+// vectorizing it is a real (not speculative) target.
 static void convert_fixed_array(const int32_t *src, GLint size, GLsizei stride,
                                  int needed_verts, GLfloat **buf, int *buf_cap) {
     int needed_floats = needed_verts * size;
@@ -465,6 +491,29 @@ static void convert_fixed_array(const int32_t *src, GLint size, GLsizei stride,
         *buf_cap = needed_floats;
     }
     int stride_elems = stride > 0 ? stride / (int) sizeof(int32_t) : size;
+
+    // Fast path: tightly-packed arrays (stride==0, the common case for
+    // glVertexPointer_soloader/etc -- see their callers) mean src/dst are
+    // just flat int32/float buffers regardless of `size` (2/3/4 components),
+    // so 4 lanes can be converted at a time irrespective of vertex boundaries.
+    if (stride_elems == size) {
+        int total = needed_verts * size;
+        const float32x4_t scale = vdupq_n_f32(1.0f / 65536.0f);
+        int i = 0;
+        for (; i + 4 <= total; i += 4) {
+            int32x4_t s = vld1q_s32(src + i);
+            float32x4_t f = vcvtq_f32_s32(s);
+            f = vmulq_f32(f, scale);
+            vst1q_f32(*buf + i, f);
+        }
+        for (; i < total; i++) {
+            (*buf)[i] = src[i] / 65536.0f;
+        }
+        return;
+    }
+
+    // Interleaved-stride fallback (rare for this engine, but stride is a
+    // caller-supplied value -- don't assume it never happens).
     for (int i = 0; i < needed_verts; i++) {
         const int32_t *s = src + i * stride_elems;
         GLfloat *d = *buf + i * size;

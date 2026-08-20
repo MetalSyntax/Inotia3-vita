@@ -117,9 +117,10 @@ void wr_run_timers(int64_t (*update_time)(void), void (*render)(int timerID)) {
     for (int i = 0; i <= maxIndex; i++) {
         int64_t losstime = (now - firetimeList[i]) + losstimeList[i];
         if (timerList[i] != 0 && losstime >= 0) {
+            int fired_id = timerList[i];
             firetimeList[i] = 0;
-            log_fired_id_once(timerList[i]);
-            render(timerList[i]);
+            log_fired_id_once(fired_id);
+            render(fired_id);
             // If the native callback re-armed this timer id during render,
             // firetimeList[i] is nonzero again and the slot is kept; otherwise
             // it was a one-shot and is cleared.

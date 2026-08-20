@@ -236,6 +236,7 @@ int main() {
         wr_process_buttons(wr_dispatch_event);
         wr_run_timers(wr_update_time, wr_render);
         if (wr_take_present_request()) {
+            wr_touch_draw_menu_highlight();
             gl_swap();
         }
     }

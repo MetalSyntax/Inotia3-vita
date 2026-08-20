@@ -55,17 +55,36 @@ endif()
 # Unique debug definition for loader's logging to not interfere with anything
 if (CMAKE_BUILD_TYPE STREQUAL "Debug")
   add_definitions(-DDEBUG_SOLOADER)
-  # Uncomment this for verbose FalsoJNI logging:
+  # Verbose FalsoJNI logging (every JNI call does a vsnprintf, twice) --
+  # only worth the cost in a Debug build.
   add_definitions(-DFALSOJNI_DEBUGLEVEL=0)
+else()
+  # Release: skip the ALL/INFO log bodies at compile time (see
+  # FalsoJNI_Logger.c's #if guards) instead of just no-op'ing them through
+  # l_info -- the vsnprintf formatting cost was paid either way before this
+  # change, on every JNI call, even in "Release" builds.
+  add_definitions(-DFALSOJNI_DEBUGLEVEL=2)
 endif()
-
-add_definitions(-DFALSOJNI_DEBUGLEVEL=0)
 
 # makes sincos, sincosf, etc. visible
 add_definitions(-D_GNU_SOURCE -D__POSIX_VISIBLE=999999)
 
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wl,-q -O3 -g -ffast-math -Wno-deprecated -Wl,--allow-multiple-definition")
 set(CMAKE_CXX_FLAGS "${CMAKE_C_FLAGS} -std=gnu++20 -Wno-write-strings -Wno-psabi")
+
+# Experimental: neither ../Zenonia2-vita nor ../Zenonia3-vita use -flto -- this
+# is untested territory, not a port of a confirmed sibling technique. LTO can
+# change inlining/reordering across translation units in ways that -O3 alone
+# doesn't, which is a real (if unlikely) risk around so_util's manual .so
+# relocation and FalsoJNI's function-pointer stubs. OFF by default: opt in
+# with -DENABLE_LTO=ON in a separate build dir and compare .velf size + FPS
+# on hardware before ever making this the default.
+option(ENABLE_LTO "Experimental: build with link-time optimization (-flto)" OFF)
+if (ENABLE_LTO)
+  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -flto")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -flto")
+  set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -flto -O3")
+endif()
 
 add_executable(${CMAKE_PROJECT_NAME}
                source/main.c
@@ -94,6 +113,7 @@ add_executable(${CMAKE_PROJECT_NAME}
                source/utils/init.c
                source/utils/logger.c
                source/utils/settings.c
+               source/utils/remap_menu.c
                source/utils/utils.c
                lib/falso_jni/FalsoJNI.c
                lib/falso_jni/FalsoJNI_ImplBridge.c
@@ -101,6 +121,22 @@ add_executable(${CMAKE_PROJECT_NAME}
                lib/sha1/sha1.c
                lib/fios/fios.c
                lib/so_util/so_util.c)
+
+if (ENABLE_LTO)
+  # These three declare real libstdc++/libc runtime symbols as opaque
+  # `extern void *` just to take their address for the loader's own
+  # import/export tables (see dynlib.c's _Znwj/__throw_bad_alloc/etc, patch.c,
+  # reimpl/sys.c). Fine for a normal per-TU compile+link (the linker only
+  # matches by name), but -flto's whole-program merge cross-checks types and
+  # hard-errors on "redeclared as function" the moment any LTO'd TU also sees
+  # the real declaration (e.g. via asset_manager.cpp's C++ headers). Excluding
+  # just these three from LTO keeps them as ordinary non-LTO objects, which
+  # link into an LTO binary fine since only LTO objects participate in that
+  # merge -- confirmed as the actual (not hypothetical) failure mode when
+  # -flto was first tried here.
+  set_source_files_properties(source/dynlib.c source/patch.c source/reimpl/sys.c
+                               PROPERTIES COMPILE_OPTIONS "-fno-lto")
+endif()
 
 add_subdirectory(lib/libc_bridge)
 add_dependencies(${CMAKE_PROJECT_NAME} SceLibcBridge)

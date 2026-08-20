@@ -58,4 +58,9 @@ void wr_process_touch(wr_native_event_fn native_event);
 // MultiTouchListener already enforces.
 void wr_process_buttons(wr_native_event_fn native_event);
 
+// Call once per frame, right before gl_swap() -- draws a highlight outline
+// around the D-pad menu-cursor's current selection (see wr_touch.c's "D-pad
+// menu-cursor navigation" section). A no-op outside a qualifying menu state.
+void wr_touch_draw_menu_highlight(void);
+
 #endif // INOTIA3_WR_TOUCH_H

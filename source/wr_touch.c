@@ -6,11 +6,17 @@
 #include "wr_touch.h"
 #include "utils/utils.h"
 #include "utils/logger.h"
+#include "utils/settings.h"
+#include "utils/remap_menu.h"
 
 #include <psp2/touch.h>
 #include <psp2/ctrl.h>
+#include <vitaGL.h>
+#include <so_util/so_util.h>
 
 #include <stdlib.h>
+
+extern so_module so_mod;
 
 #define WR_MAX_HW_REPORTS 8
 
@@ -42,6 +48,196 @@ static int active_slot_count(void) {
     return n;
 }
 
+static inline int makeword(int x, int y) {
+    return ((x & 0xFFFF) << 16) | (y & 0xFFFF);
+}
+
+// --- D-pad menu-cursor navigation --------------------------------------------
+//
+// User request: navigate menus with the D-pad (X confirms) instead of only
+// via the touchscreen. Investigation ruled out reviving the engine's own
+// dormant CONTROL2_navigateKeyProc cursor system (out_ghidra.c ~19187,
+// ~25384): its input queue (g_lnkInputQueue) is only ever fed by
+// TOUCH_HandleCletEvent, which has ZERO callers anywhere in the decompile --
+// that whole path is unreachable dead code in this build, and reviving it
+// would mean reinstating an orphaned call site, materially riskier than this.
+//
+// Instead: `UI_listControl` (confirmed via `nm -D libgame.so`, a real exported
+// data symbol, present in both 1-3-2 and 1-4-5) is a LIVE array of UICONTROL
+// entries (44 bytes/0x2c stride) the engine itself populates for whichever
+// screen currently has touchable widgets, and hit-tests by simple center-rect
+// (confirmed by reading UICONTROLLIST_Event/UICONTROL_IsInEventArea,
+// out_ghidra.c ~129838-129990). This reads that array to get REAL button
+// coordinates (no guessing/hardcoding), and drives selection by synthesizing
+// an ordinary DOWN+UP touch tap at the chosen entry's center through the SAME
+// slot pool and native_event() path BUTTON_MAP already uses -- indistinguishable
+// from a real finger tap to the engine, no internal function called directly.
+//
+// Activation is gated purely on `ui_list_count() > 0` -- NOT also on
+// GAMESTATE_nState==3 as a first attempt did: that state number turned out
+// not to correspond to the screens users actually call "the main menu"
+// (D-pad did nothing there), and the live control count is the only signal
+// that actually matters ("are there touchable widgets right now"), so the
+// state check was a wrong, overly-restrictive assumption -- removed rather
+// than guessing at the right state number without a way to verify it.
+//
+// Coverage caveat: some menu sub-screens (Shop/SkillEquip/SystemSetting, per
+// TouchUIView_Touch<Screen> ad-hoc handlers) don't populate UI_listControl at
+// all -- on those, ui_list_count() is 0 and this silently does nothing,
+// leaving the D-pad's normal BUTTON_MAP behavior active there instead (see
+// wr_process_buttons). Extending coverage to those screens would need
+// per-screen hardcoded coordinates (same style as BUTTON_MAP), not attempted
+// here.
+#define UICTRL_LIST_OFF_COUNT   0xc
+#define UICTRL_LIST_OFF_ENTRIES 0x10
+#define UICTRL_ENTRY_STRIDE     0x2c
+#define UICTRL_OFF_CENTER_X     0xc
+#define UICTRL_OFF_CENTER_Y     0x10
+#define UICTRL_OFF_WIDTH        0x14
+#define UICTRL_OFF_HEIGHT       0x18
+#define UICTRL_OFF_CLICK_CB     0x28
+
+#define WR_MENU_CURSOR_VIRTUAL_HW_ID (WR_VIRTUAL_HW_ID_BASE + 100) // distinct from BUTTON_MAP's 0..11
+
+static void *g_ui_list_control = NULL;  // &UI_listControl (a struct instance, not a pointer-to-struct)
+static int g_menu_cursor_index = -1;
+static int g_was_active = 0;
+
+static int ui_list_count(void) {
+    if (!g_ui_list_control) return 0;
+    return *(int32_t *) ((uint8_t *) g_ui_list_control + UICTRL_LIST_OFF_COUNT);
+}
+
+static uint8_t *ui_entry(int idx) {
+    if (!g_ui_list_control) return NULL;
+    uint8_t *entries = *(uint8_t **) ((uint8_t *) g_ui_list_control + UICTRL_LIST_OFF_ENTRIES);
+    return entries ? entries + (size_t) idx * UICTRL_ENTRY_STRIDE : NULL;
+}
+
+static int ui_entry_clickable(int idx) {
+    uint8_t *e = ui_entry(idx);
+    return e && *(void **) (e + UICTRL_OFF_CLICK_CB) != NULL;
+}
+
+static void ui_entry_rect(int idx, int *cx, int *cy, int *w, int *h) {
+    uint8_t *e = ui_entry(idx);
+    *cx = e ? *(int32_t *) (e + UICTRL_OFF_CENTER_X) : 0;
+    *cy = e ? *(int32_t *) (e + UICTRL_OFF_CENTER_Y) : 0;
+    *w  = e ? *(int32_t *) (e + UICTRL_OFF_WIDTH)   : 0;
+    *h  = e ? *(int32_t *) (e + UICTRL_OFF_HEIGHT)  : 0;
+}
+
+// Re-evaluates cursor validity/entry each call (cheap: a handful of struct
+// reads) and returns whether menu-cursor mode should currently intercept the
+// D-pad/Cross. Also owns (re)picking a starting selection whenever this just
+// became active, or the current index falls off a resized/changed control list.
+static int wr_touch_menu_cursor_active(void) {
+    int now_active = ui_list_count() > 0;
+    if (!now_active) {
+        g_menu_cursor_index = -1;
+    } else if (!g_was_active || g_menu_cursor_index < 0 ||
+               g_menu_cursor_index >= ui_list_count() || !ui_entry_clickable(g_menu_cursor_index)) {
+        g_menu_cursor_index = -1;
+        for (int i = 0; i < ui_list_count(); i++) {
+            if (ui_entry_clickable(i)) { g_menu_cursor_index = i; break; }
+        }
+    }
+    g_was_active = now_active;
+    return now_active && g_menu_cursor_index >= 0;
+}
+
+// dir: 0=up, 1=down, 2=left, 3=right. Simple weighted directional-nav
+// heuristic: candidates must lie (strictly) on the pressed side along the
+// primary axis; score favors small primary-axis distance, penalizing
+// secondary-axis offset more heavily so a straight neighbor wins over a
+// diagonal one.
+static int find_nearest_in_direction(int current_idx, int dir) {
+    int cx, cy, cw, ch;
+    ui_entry_rect(current_idx, &cx, &cy, &cw, &ch);
+    int best = -1;
+    long best_score = -1;
+    int count = ui_list_count();
+    for (int i = 0; i < count; i++) {
+        if (i == current_idx || !ui_entry_clickable(i)) continue;
+        int ex, ey, ew, eh;
+        ui_entry_rect(i, &ex, &ey, &ew, &eh);
+        int dx = ex - cx, dy = ey - cy;
+        int primary, secondary;
+        switch (dir) {
+            case 0: if (dy >= 0) continue; primary = -dy; secondary = dx; break;
+            case 1: if (dy <= 0) continue; primary = dy;  secondary = dx; break;
+            case 2: if (dx >= 0) continue; primary = -dx; secondary = dy; break;
+            default: if (dx <= 0) continue; primary = dx; secondary = dy; break;
+        }
+        long score = (long) primary + (long) (secondary < 0 ? -secondary : secondary) * 2;
+        if (best < 0 || score < best_score) { best = i; best_score = score; }
+    }
+    return best;
+}
+
+// Moves the selection (D-pad edges) and, on a fresh Cross press, synthesizes
+// an ordinary tap (DOWN immediately followed by UP, same slot pool BUTTON_MAP
+// uses) at the selected entry's real on-screen center.
+static void wr_touch_process_menu_cursor(unsigned int now_buttons, unsigned int prev_buttons,
+                                          wr_native_event_fn native_event) {
+    int up    = (now_buttons & SCE_CTRL_UP)    && !(prev_buttons & SCE_CTRL_UP);
+    int down  = (now_buttons & SCE_CTRL_DOWN)  && !(prev_buttons & SCE_CTRL_DOWN);
+    int left  = (now_buttons & SCE_CTRL_LEFT)  && !(prev_buttons & SCE_CTRL_LEFT);
+    int right = (now_buttons & SCE_CTRL_RIGHT) && !(prev_buttons & SCE_CTRL_RIGHT);
+    int confirm = (now_buttons & SCE_CTRL_CROSS) && !(prev_buttons & SCE_CTRL_CROSS);
+
+    int dir = up ? 0 : down ? 1 : left ? 2 : right ? 3 : -1;
+    if (dir >= 0) {
+        int next = find_nearest_in_direction(g_menu_cursor_index, dir);
+        if (next >= 0) g_menu_cursor_index = next;
+    }
+
+    if (confirm && g_menu_cursor_index >= 0) {
+        int cx, cy, w, h;
+        ui_entry_rect(g_menu_cursor_index, &cx, &cy, &w, &h);
+        int slot = -1;
+        for (int s = 0; s < WR_MAX_TOUCH_POINT; s++) if (slotHwId[s] == -1) { slot = s; break; }
+        if (slot >= 0) {
+            slotHwId[slot] = WR_MENU_CURSOR_VIRTUAL_HW_ID;
+            slotX[slot] = cx;
+            slotY[slot] = cy;
+            native_event(WR_TOUCH_DOWN, slot + 1, makeword(cx, cy), active_slot_count());
+            native_event(WR_TOUCH_UP, slot + 1, makeword(cx, cy), active_slot_count());
+            slotHwId[slot] = -1;
+        }
+    }
+}
+
+// Call once per frame, right before gl_swap() -- draws a simple highlight
+// outline around the currently-selected control so D-pad navigation has
+// visible feedback (the engine's own "pressed" cursor visuals are driven by
+// touch events we deliberately don't synthesize for mere hovering, only for
+// the actual confirm tap -- see wr_touch_process_menu_cursor()).
+void wr_touch_draw_menu_highlight(void) {
+    if (!wr_touch_menu_cursor_active()) return;
+    int cx, cy, w, h;
+    ui_entry_rect(g_menu_cursor_index, &cx, &cy, &w, &h);
+    if (w <= 0) w = 40;
+    if (h <= 0) h = 40;
+    float x0 = cx - w / 2.0f, x1 = cx + w / 2.0f;
+    float y0 = cy - h / 2.0f, y1 = cy + h / 2.0f;
+    GLfloat verts[8] = { x0, y0, x1, y0, x1, y1, x0, y1 };
+
+    GLboolean tex2d = glIsEnabled(GL_TEXTURE_2D);
+    GLboolean blend = glIsEnabled(GL_BLEND);
+    glDisable(GL_TEXTURE_2D);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glColor4f(1.0f, 1.0f, 0.2f, 0.9f);
+    glLineWidth(2.0f);
+    glEnableClientState(GL_VERTEX_ARRAY);
+    glVertexPointer(2, GL_FLOAT, 0, verts);
+    glDrawArrays(GL_LINE_LOOP, 0, 4);
+    glColor4f(1.0f, 1.0f, 1.0f, 1.0f); // restore a sane default before the next frame's game draws
+    if (tex2d) glEnable(GL_TEXTURE_2D); else glDisable(GL_TEXTURE_2D);
+    if (!blend) glDisable(GL_BLEND);
+}
+
 void wr_touch_init(void) {
     for (int i = 0; i < WR_MAX_TOUCH_POINT; i++) {
         slotHwId[i] = -1;
@@ -52,10 +248,12 @@ void wr_touch_init(void) {
     // psvita-porting skill's input_handling.md: sceTouchPeek() always
     // reports reportNum == 0 until sampling is explicitly turned on.
     sceTouchSetSamplingState(SCE_TOUCH_PORT_FRONT, SCE_TOUCH_SAMPLING_STATE_START);
-}
 
-static inline int makeword(int x, int y) {
-    return ((x & 0xFFFF) << 16) | (y & 0xFFFF);
+    g_ui_list_control = (void *) so_symbol(&so_mod, "UI_listControl");
+    if (!g_ui_list_control) {
+        l_warn("wr_touch_init: UI_listControl not found -- "
+               "D-pad menu navigation disabled, touch/BUTTON_MAP unaffected");
+    }
 }
 
 void wr_process_touch(wr_native_event_fn native_event) {
@@ -202,14 +400,51 @@ static const wr_button_map_t BUTTON_MAP[] = {
 
 static unsigned int g_prev_buttons = 0;
 
+// Every physical button already drives some BUTTON_MAP tap, so this hotkey
+// chord unavoidably overlaps some of them -- detected on the exact frame all
+// three buttons first become simultaneously held, and consumed (skipped in
+// the normal per-BUTTON_MAP dispatch below) so the chord itself doesn't also
+// fire a spurious in-game tap.
+#define REMAP_MENU_CHORD_MASK (SCE_CTRL_LTRIGGER | SCE_CTRL_RTRIGGER | SCE_CTRL_SELECT)
+
 void wr_process_buttons(wr_native_event_fn native_event) {
     SceCtrlData pad;
     sceCtrlPeekBufferPositive(0, &pad, 1);
 
+    unsigned int consumed_mask = 0;
+
+    if ((pad.buttons & REMAP_MENU_CHORD_MASK) == REMAP_MENU_CHORD_MASK &&
+        (g_prev_buttons & REMAP_MENU_CHORD_MASK) != REMAP_MENU_CHORD_MASK) {
+        remap_menu_run(); // blocks (own gl_swap() loop) until the flow finishes
+        sceCtrlPeekBufferPositive(0, &pad, 1); // re-sync -- chord buttons are surely released by now
+        g_prev_buttons = pad.buttons;
+        return; // skip this frame's normal dispatch; next frame resumes as usual
+    }
+
+    int in_menu_cursor_mode = wr_touch_menu_cursor_active();
+
     for (size_t i = 0; i < WR_BUTTON_MAP_COUNT; i++) {
         const wr_button_map_t *m = &BUTTON_MAP[i];
-        int now = (pad.buttons & m->button) != 0;
-        int before = (g_prev_buttons & m->button) != 0;
+        // setting_button_remap[i] == 0 means "use the compiled default";
+        // m->button itself always identifies the ACTION slot (unaffected by
+        // remapping), used below to tell movement/confirm apart regardless
+        // of which physical button currently triggers them.
+        unsigned int mapped_button = setting_button_remap[i] != 0 ? setting_button_remap[i] : m->button;
+        if (mapped_button & consumed_mask) continue;
+
+        // While the D-pad menu-cursor is active (UI_listControl has live
+        // entries), movement + confirm are repurposed for cursor nav/select
+        // (wr_touch_process_menu_cursor()) instead of tapping the on-screen
+        // movement d-pad / attack button.
+        if (in_menu_cursor_mode &&
+            (m->button == SCE_CTRL_UP || m->button == SCE_CTRL_DOWN ||
+             m->button == SCE_CTRL_LEFT || m->button == SCE_CTRL_RIGHT ||
+             m->button == SCE_CTRL_CROSS)) {
+            continue;
+        }
+
+        int now = (pad.buttons & mapped_button) != 0;
+        int before = (g_prev_buttons & mapped_button) != 0;
         if (now == before) continue; // no state change this frame
 
         if (now) {
@@ -220,7 +455,7 @@ void wr_process_buttons(wr_native_event_fn native_event) {
             }
             if (slot == -1) {
                 l_warn("wr_process_buttons: all %d touch slots busy -- dropping button 0x%x",
-                       WR_MAX_TOUCH_POINT, m->button);
+                       WR_MAX_TOUCH_POINT, mapped_button);
                 continue;
             }
             slotHwId[slot] = m->virtual_hw_id;
@@ -239,6 +474,10 @@ void wr_process_buttons(wr_native_event_fn native_event) {
                 }
             }
         }
+    }
+
+    if (in_menu_cursor_mode) {
+        wr_touch_process_menu_cursor(pad.buttons, g_prev_buttons, native_event);
     }
 
     g_prev_buttons = pad.buttons;
