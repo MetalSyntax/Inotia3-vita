@@ -3945,6 +3945,155 @@ decompilado ante cualquier crash con `.psp2dmp`.
 >
 > Build (Release, Corrida 101) compilado exitosamente y exportado a `build/inotia3.vpk`.
 
+> **Corrida 102 (2026-08-19) — Confirmación de subida nativa de RGB565 y ajustes de vitaGL (`source/utils/glutil.c`).**
+>
+> El usuario preguntó si se podía aplicar a Inotia 3 la misma optimización RGB565 nativo que
+> `../Zenonia2-vita` implementó (evitar la conversión CPU RGB565→RGBA8888 que su motor necesitaba
+> originalmente porque una vitaGL vieja rechazaba `GL_UNSIGNED_SHORT_5_6_5` con `GL_INVALID_ENUM`).
+> **Hallazgo**: `glTexImage2D_soloader`/`glTexSubImage2D_soloader` en este port **nunca tuvieron esa
+> conversión** -- ya reenvían `format`/`type` verbatim a la GL real para cualquier textura. Se agregó un
+> chequeo puntual (`glGetError()` antes/después de la subida, `l_error` limitado a 5 líneas) que confirmó en
+> consola (`logs/log_049.txt`): `[GL] glTexImage2D native 16-bit upload OK: type=8363` -- sin
+> `GL_INVALID_ENUM`. Este chequeo diagnóstico se removió una vez confirmado (Corrida 107), quedando solo el
+> comentario explicando por qué no hace falta conversión.
+>
+> De paso se aplicaron dos ajustes de vitaGL sugeridos por el usuario, ambos con hallazgos propios que
+> matizan la sugerencia original:
+> - `vglUseTripleBuffering(GL_FALSE)` en `gl_init()`: cambia a double buffering (menor presión de memoria/
+>   ancho de banda a cambio de posible tearing) -- vitaGL usa triple buffer por defecto.
+> - `gl_swap()` pasaba `vglSwapBuffers(GL_TRUE)` en cada frame. **El parámetro real es
+>   `has_commondialog`, no vsync** (confirmado contra `vitaGL.h`) -- forzarlo en `GL_TRUE` todo el tiempo
+>   hacía que vitaGL revisara compositing de diálogos del sistema en cada swap aunque ninguno estuviera
+>   abierto. Se cambió a `GL_FALSE` en `gl_swap()`; `dialog.c`'s `fatal_error()` ya pasaba `GL_TRUE`
+>   correctamente en su propio loop mientras un diálogo real está activo (ver Corrida 106 para el bug que
+>   esto mismo causó en `remap_menu.c`).
+>
+> **Corrida 103 (2026-08-19) — NEON confirmado disponible + aplicado a la conversión GL_FIXED→float;
+> experimento `-flto` (`source/utils/glutil.c`, `CMakeLists.txt`).**
+>
+> El usuario preguntó si se podía usar NEON (como `../Zenonia2-vita`) y pidió probar `-flto` combinado con
+> `-O3` en un build aparte. Confirmado con `arm-vita-eabi-gcc -Q --help=target`: el toolchain apunta a
+> `armv7-a+simd` con `-mfpu=neon -mfloat-abi=softfp` **por defecto**, sin flags adicionales -- igual que
+> Zenonia 2/3. En ese momento no había un uso claro para NEON (la conversión RGB565 no existe en este port,
+> Corrida 102), así que quedó pendiente hasta que el profiling (Corrida 104) encontró un candidato real: la
+> conversión `GL_FIXED`→float de vértices/color/texcoord en `glutil.c` (`convert_fixed_array`), que corre en
+> **cada** `glDrawArrays`/`glDrawElements` y antes era un loop escalar puro. Se vectorizó con
+> `vld1q_s32`/`vcvtq_f32_s32`/`vmulq_f32` (4 elementos a la vez) para el caso común (arrays contiguos,
+> `stride==size`), con fallback escalar para arrays intercalados.
+>
+> Experimento `-flto`: agregar la flag directamente rompió el link con un error real (no hipotético):
+> `dynlib.c` declara ~20 símbolos de runtime de C++ (`_Znwj`, `__throw_bad_allocv`, etc.) como `extern void *`
+> opacos solo para tomar su dirección para la tabla de imports del loader -- sin LTO el linker solo
+> empareja por nombre y no valida tipos; con LTO el merge de todo el programa sí lo hace y lo rechaza como
+> "redeclarado como función" en cuanto otra TU (p.ej. `asset_manager.cpp`, que sí incluye los headers reales
+> de C++) participa del mismo merge. **Fix**: excluir `dynlib.c`, `patch.c` y `reimpl/sys.c` (los 3 archivos
+> con ese patrón) de LTO vía `set_source_files_properties(... COMPILE_OPTIONS "-fno-lto")` -- quedan como
+> objetos no-LTO normales, que sí pueden linkearse dentro de un binario LTO. Con eso el link cierra limpio.
+> Resultado medido (Release): `eboot.bin` 661,758 B → 644,584 B (**-2.6%**), `inotia3.velf` +0.6%, **sin
+> cambio de FPS** medible en consola. Quedó como `option(ENABLE_LTO "..." OFF)` en `CMakeLists.txt` --
+> apagado por defecto, no adoptado como default ya que el ahorro es de tamaño de binario, no de tiempo de
+> CPU por frame.
+>
+> **Corrida 104 (2026-08-19) — Instrumentación de profiling y diagnóstico de fondo del cuello de botella de
+> FPS en escenas con muchos personajes (`source/main.c`, `source/wr_timer.c`, `source/utils/glutil.c`).**
+>
+> El usuario reportó FPS estancado en ~15 (confirmado con un plugin de overlay de hardware en consola,
+> mostrando además que **ningún núcleo de CPU pasaba de 43%**, con los clocks ya al máximo -- ver
+> `scePowerSetArmClockFrequency(444)` y las 3 líneas siguientes en `source/utils/init.c`, ya presentes desde
+> antes de esta sesión). Se agregó instrumentación temporal (`l_error`, sobrevive Release, gateada por
+> tiempo real de 5 minutos en vez de cantidad de frames tras un primer intento fallido que se agotaba en
+> segundos durante una ráfaga rápida post-arranque -- ver `logs/log_049.txt` vs `log_050.txt`):
+> - `main.c`: log `[PERF]` por ventana de 30 presents -- desglosa touch/botones, `wr_run_timers`
+>   (lógica+dibujo del `.so`) y `gl_swap` (espera de vitaGL).
+> - `wr_timer.c`: log `[PERF][RENDER]` por llamada individual a `render()` que supere 10ms, y
+>   `[PERF][TIMER]` para el/los timers registrados.
+> - `glutil.c`: log `[PERF][DRAW]` (costo de `glDrawArrays`/`glDrawElements`, incluida la conversión
+>   `GL_FIXED`) y `[PERF][TEX]` (costo de `glTexImage2D`/`glTexSubImage2D`).
+>
+> **Resultado (`logs/log_050.txt`, `log_051.txt`, `log_052.txt`)**: `touch`/`swap` insignificantes (<1ms);
+> draw calls **0.02-0.1ms** cada uno; subidas de textura **2-4ms** cada una (con solo ~20 por ventana, no
+> alcanza para explicar el costo total). El costo real (`timers`, hasta ~125ms/frame en el mapa "Deep
+> Forest" con varios lobos/NPCs vivos vía `CHAR_AddAction`) vive **adentro de la lógica propia del `.so`**
+> (`nativeRender`), no en nada que este loader controle -- confirmado por eliminación, no por suposición.
+> Como ningún núcleo de CPU se satura tampoco, el costo parece ser trabajo real del motor (IA/animación por
+> personaje) más que un stall de espera bloqueante identificable. **Conclusión**: no hay una optimización de
+> bajo riesgo restante del lado del renderizado/loader -- cualquier ganancia adicional real requeriría tocar
+> lógica de juego decompilada (out_ghidra.c), fuera de alcance sin verificación exhaustiva adicional.
+> Toda esta instrumentación se removió en Corrida 107 una vez concluida la investigación.
+>
+> **Corrida 105 (2026-08-19) — Frameskip implementado y luego eliminado a pedido del usuario
+> (`source/wr_timer.c`/`.h`, `source/wr_touch.c`).**
+>
+> Dado que Corrida 104 no encontró una optimización segura, el usuario pidió un frameskip al estilo
+> `../Zenonia4-vita`, aceptando que fuera riesgoso siempre que estuviera gateado por un comando. Investigación
+> del frameskip de Zenonia 4 (agente de research): ese motor mantiene la lógica de juego y su rasterizado
+> por software como llamadas **separadas** cada frame, así que puede saltear solo el dibujo caro (glClear,
+> blit, subida de textura) mientras la lógica sigue a tiempo real -- no hay nada equivalente que saltear acá,
+> porque `nativeRender()` de Inotia 3 funde lógica y dibujo en una sola llamada (confirmado en Corrida 104:
+> los draws/texturas ya son baratos). Se implementó de todos modos: `wr_run_timers` saltea la llamada
+> completa a `render()` en ticks alternados (ciclo OFF → salta ~1 de cada 2 → salta ~2 de cada 3 → OFF, chord
+> SELECT+START), preservando manualmente el re-armado de `firetime`/`losstime` exactamente como lo haría un
+> disparo normal para que la contabilidad de catch-up del timer no notara nada saltado (un bug aquí hubiera
+> colgado el juego tras el primer salto). Confirmado por el usuario en consola: **el juego corre
+> perceptiblemente más lento** con frameskip activo (esperable, dado que también saltea lógica, no solo
+> dibujo) -- **se eliminó por completo** (chord, funciones, estado) a pedido explícito.
+>
+> **Corrida 106 (2026-08-19) — Navegación por D-pad en menús y menú de remapeo de botones físicos
+> (`source/wr_touch.c`/`.h`, `source/utils/settings.c`/`.h`, `source/utils/remap_menu.c`/`.h` nuevo).**
+>
+> Pedido del usuario: navegar menús con el D-pad (X confirma), emulando sostener un touch con las flechas y
+> soltar/tocar con X; más un menú para reprogramar botones físicos.
+>
+> **Navegación por D-pad**: se investigó revivir el sistema de cursor/teclado nativo del motor
+> (`CONTROL_GetCursor`/`CONTROL2_navigateKeyProc`, `out_ghidra.c` ~17480-17600/~19187/~25384) -- resultó ser
+> código muerto: su cola de entrada (`g_lnkInputQueue`) solo la llena `TOUCH_HandleCletEvent`, que no tiene
+> **ningún** call site en todo el decompilado; revivirlo exigiría reinstaurar un call site huérfano, más
+> riesgo del que vale. En cambio, se usa `UI_listControl` (confirmado símbolo real exportado vía
+> `nm -D libgame.so` en ambas versiones del APK, 1-3-2 y 1-4-5) -- un array vivo de `UICONTROL` (44 bytes/
+> stride `0x2c`: flag de estado en `+0x0`, centerX/Y en `+0xc`/`+0x10`, width/height en `+0x14`/`+0x18`,
+> callback de click en `+0x28`) que el motor mismo puebla para los widgets tocables de la pantalla actual, e
+> hit-testea por rectángulo centrado simple (confirmado leyendo `UICONTROLLIST_Event`/
+> `UICONTROL_IsInEventArea`, `out_ghidra.c` ~129838-129990). Se lee ese array para obtener coordenadas reales
+> (sin inventar nada) y se navega con un heurístico de "más cercano en la dirección presionada" (distancia
+> primaria + penalización de offset secundario); X sintetiza un toque DOWN+UP real en la coordenada
+> seleccionada, a través del mismo pool de slots y `native_event()` que ya usa `BUTTON_MAP` -- indistinguible
+> de un toque real para el motor.
+>
+> Primer intento gateaba la navegación además con `GAMESTATE_nState==3` (visto en logs como el estado que
+> sigue a cargar un mapa, asumido "GameMenu"). El usuario reportó que el D-pad no hacía nada en el menú
+> principal -- ese número de estado no correspondía a lo que el usuario llama "menú principal" (probablemente
+> gameplay real, no un menú). **Fix**: se eliminó el chequeo de `GAMESTATE_nState` por completo; la
+> activación depende únicamente de `ui_list_count() > 0` -- la única señal que realmente importa ("¿hay
+> controles tocables ahora?"). Limitación documentada, no oculta: pantallas con handlers ad-hoc
+> (`TouchUIView_Touch<Shop/SkillEquip/SystemSetting>`) no pueblan `UI_listControl` y quedan sin cobertura.
+>
+> **Menú de remapeo**: `settings.h`/`.c` (módulo genérico de soloader, ya existente) extendido con
+> `setting_button_remap[12]` (uno por acción de `BUTTON_MAP`, persistido en `config.txt` como
+> `button_remap_N`). Nuevo `source/utils/remap_menu.c`/`.h`: flujo secuencial con `SceMsgDialog` (informa la
+> acción y el botón actual, captura el primer botón recién presionado o cancela tras ~1.5s sosteniendo
+> START), abierto con el chord L+R+SELECT. `wr_process_buttons` en `wr_touch.c` ahora resuelve
+> `mapped_button = setting_button_remap[i] != 0 ? setting_button_remap[i] : BUTTON_MAP[i].button` y
+> consume (suprime el tap normal) los botones de cualquier chord detectado ese frame.
+>
+> **Bug encontrado y corregido**: el menú de remapeo era invisible en consola -- `remap_menu.c` reusaba
+> `gl_swap()` (que desde Corrida 102 siempre pasa `GL_FALSE`/`has_commondialog`) en vez de
+> `vglSwapBuffers(GL_TRUE)` como hace `dialog.c`'s `fatal_error()`, así que vitaGL nunca compositaba el
+> diálogo del sistema mientras el flujo quedaba bloqueado esperando un botón que el usuario no podía ver
+> pedido. **Fix**: `show_info_dialog()` en `remap_menu.c` llama `vglSwapBuffers(GL_TRUE)` directamente
+> mientras el diálogo está activo.
+>
+> **Corrida 107 (2026-08-19) — Limpieza final: eliminación de toda la instrumentación de diagnóstico de
+> esta sesión para un build Release limpio (`source/main.c`, `source/wr_timer.c`, `source/utils/glutil.c`).**
+>
+> A pedido del usuario ("build release sin logs"), se removieron: el log `[PERF]` por ventana de `main.c`,
+> `[PERF][RENDER]`/`[PERF][TIMER]` de `wr_timer.c`, `[PERF][DRAW]`/`[PERF][TEX]`/`check_native_16bit_upload`
+> de `glutil.c` -- toda instrumentación agregada durante Corridas 102-104, ya cumplió su función de
+> diagnóstico. Quedan intactos los `l_error` de error genuino preexistentes a esta sesión (audio, shaders,
+> Corrida 89) y los fixes reales (NEON, double buffering, parámetro de `gl_swap`, navegación por D-pad,
+> menú de remapeo). Build final compilado limpio (exit 0) y exportado a `build/inotia3.vpk`.
+>
+> Cambios de Corridas 102-107 commiteados en `cd6bcbc` (2026-08-19).
+
 ## 3. Riesgos genéricos heredados de la arquitectura SoLoader (aplican igual que en cualquier port)
 ## 3. Riesgos genéricos heredados de la arquitectura SoLoader (aplican igual que en cualquier port)
 - Rutas con espacio en `PSVITA Develop` → build en `/tmp` (`porting_tools/build/build_and_install.sh` ya lo
