@@ -12,5 +12,6 @@
   "vita_logs_dir": "/ux0:/data/inotia3/logs",
   "vita_cg_dir": "ux0:/data/inotia3/cg",
   "vita_glsl_dir": "ux0:/data/inotia3/glsl",
-  "vita_game_data_dir": "/ux0:/data/inotia3"
+  "vita_game_data_dir": "/ux0:/data/inotia3",
+  "platform": "ios"
 }

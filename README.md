@@ -8,6 +8,7 @@
   <a href="#setup-instructions-for-players">How to install</a> •
   <a href="#controls">Controls</a> •
   <a href="#known-issues">Known Issues</a> •
+  <a href="RELEASE.md">Release notes</a> •
   <a href="#build-instructions-for-developers">How to compile</a> •
   <a href="#credits">Credits</a>
 </p>
@@ -26,7 +27,7 @@ The game has been thoroughly reverse-engineered and debugged across 77+ porting 
 - [x] **Native 960x544 Visuals**: Fullscreen rendering via `vitaGL` (GLES 1.1 fixed-function pipeline with `GL_FIXED` to `GL_FLOAT` conversion and `GL_LINEAR` texture filtering).
 - [x] **Touch & Physical Controls**: Complete dual-input support (D-Pad, Analog Stick, and Action Buttons mapped to on-screen controls, alongside full front touchscreen multi-touch support).
 - [x] **Native Audio**: BGM and sound effects decoded via `Tremor` / `libogg` portlibs.
-- [x] **Save System**: Saved games persist directly as loose `.dat` files (`ux0:data/inotia3/save<N>.dat`).
+- [x] **Save System**: Saved games persist directly as loose `.dat` files (`ux0:data/inotia3/save<N>.dat`). Every save keeps the previous file as `save<N>.dat.bak`, and starting a New Game over an occupied slot moves the old save to `save<N>.dat.del` instead of deleting it.
 - [x] **Offline Bypasses**: Anti-tamper/protection routines (`excuteDirectly`, `jIsCracked`) and online ad/hub loops (`Extend_CheckAdvDisplay`, `HubInitialize`) are safely bypassed.
 
 ---
@@ -70,12 +71,14 @@ The port supports both hardware buttons (mapped directly to on-screen UI positio
 | :---: | :--- |
 | **D-Pad / Left Analog** | Character Movement (Up / Down / Left / Right) |
 | **Cross (`✕`)** | Attack / Confirm / Action |
-| **Circle (`◯`)** | Secondary Skill / Cancel |
+| **Circle (`◯`)** | Back / Close menu / Cancel pop-up |
 | **Square (`▢`)** | Skill / Quick Slot |
 | **Triangle (`Δ`)** | Special Skill / Quick Slot |
 | **L / R Triggers** | Quick Slots / Target Toggle |
 | **Start** | Pause Menu / System |
 | **Select** | Map / Character Info |
+| **L + R** or **Start + Select** | Show / hide the on-screen touch controls (hidden by default) |
+| **L + R + Select** | Button remap menu |
 | **Front Touchscreen** | Full Touch UI Navigation & Direct Movement |
 
 ---
@@ -83,6 +86,8 @@ The port supports both hardware buttons (mapped directly to on-screen UI positio
 ## Known Issues
 
 - **Online Hub / Store Disabled**: Online networking functions (Com2uS Hub, In-App Purchases, and News Banners) are disabled by design for offline stability.
+- **Touch HUD hidden by default**: The on-screen D-pad and action circles are drawn at 1% opacity (still touchable). Press **L + R** or **Start + Select** to show them.
+- **Main menu online buttons removed**: Tapjoy, Hub Gem and the Terms of Use scroll no longer appear on the title menu.
 - **Save File Placement**: Save files are written directly to `ux0:data/inotia3/save<N>.dat` rather than subdirectories to ensure reliable persistence across sessions.
 
 ---
@@ -105,9 +110,13 @@ cd Inotia3-vita
 mkdir build && cd build
 
 # Configure and compile
-cmake ..
+cmake .. -DCMAKE_BUILD_TYPE=Release
 make
 ```
+
+> **vitaGL**: The build compiles the vendored copy in `vendor/vitaGL` (see `vendor/vitaGL/VENDORED.md`) instead of the SDK's global `libvitaGL.a`.
+>
+> **Path with spaces / CMake 4**: VitaSDK tools fail when the source path contains spaces, so build from a space-free copy (e.g. `rsync` to `/tmp/inotia3-src`). With CMake 4.x, add `-DCMAKE_POLICY_VERSION_MINIMUM=3.5`.
 
 > **GCC 15 / VitaSDK Note**: `CMakeLists.txt` automatically includes flags (`-fpermissive`, `-Wl,--no-warn-mismatch`, `-Wl,--allow-multiple-definition`) required for ABI compatibility and softfp interop.
 

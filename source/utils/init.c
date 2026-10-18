@@ -44,11 +44,19 @@ void soloader_init_all() {
             sceAppMgrLoadExec("app0:/configurator.bin", NULL, NULL);
     }
 
-    // Set default overclock values
-    scePowerSetArmClockFrequency(444);
-    scePowerSetBusClockFrequency(222);
-    scePowerSetGpuClockFrequency(222);
-    scePowerSetGpuXbarClockFrequency(166);
+    // Set default overclock values (documented-safe maximums for this
+    // hardware -- not overclocking beyond spec, just requesting what the OS
+    // already allows). Each call is guarded rather than asserted: a rejected
+    // frequency on some firmware/hardware combination should just fall back
+    // to whatever clock the OS already had, not abort startup.
+    if (scePowerSetArmClockFrequency(444) < 0)
+        l_warn("scePowerSetArmClockFrequency(444) failed, using default clock.");
+    if (scePowerSetBusClockFrequency(222) < 0)
+        l_warn("scePowerSetBusClockFrequency(222) failed, using default clock.");
+    if (scePowerSetGpuClockFrequency(222) < 0)
+        l_warn("scePowerSetGpuClockFrequency(222) failed, using default clock.");
+    if (scePowerSetGpuXbarClockFrequency(166) < 0)
+        l_warn("scePowerSetGpuXbarClockFrequency(166) failed, using default clock.");
 
 #ifdef USE_SCELIBC_IO
     if (fios_init(DATA_PATH) == 0)

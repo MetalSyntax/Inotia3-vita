@@ -66,6 +66,26 @@ else()
   add_definitions(-DFALSOJNI_DEBUGLEVEL=2)
 endif()
 
+## vitaGL vendorizada (misma de Prince of Persia / Zenonia 3/4: upstream cd3791e
+## + mods de compat, ver vendor/vitaGL/VENDORED.md) en vez del libvitaGL.a global
+## del SDK, que se recompilo el 2026-09-03 con flags desconocidos -> pantalla negra.
+## SOFTFP_ABI=1 es OBLIGATORIO: el loader usa softfp (default de vitasdk).
+set(VITAGL_VENDOR_DIR ${CMAKE_CURRENT_SOURCE_DIR}/vendor/vitaGL)
+set(VITAGL_MAKE_FLAGS_STR "SOFTFP_ABI=1 NO_DEBUG=1 HAVE_SHADER_CACHE=1 NO_SPLASHSCREEN=1 HAVE_GLSL_UBOS=1 SAMPLERS_SPEEDHACK=1 DRAW_SPEEDHACK=2")
+separate_arguments(VITAGL_MAKE_FLAGS UNIX_COMMAND "${VITAGL_MAKE_FLAGS_STR}")
+include(ExternalProject)
+ExternalProject_Add(
+  vitaGL_vendored
+  SOURCE_DIR ${VITAGL_VENDOR_DIR}
+  BUILD_IN_SOURCE 1
+  CONFIGURE_COMMAND ""
+  BUILD_COMMAND make ${VITAGL_MAKE_FLAGS}
+  INSTALL_COMMAND ""
+)
+add_library(vitaGL_vendored_lib STATIC IMPORTED)
+set_target_properties(vitaGL_vendored_lib PROPERTIES IMPORTED_LOCATION ${VITAGL_VENDOR_DIR}/libvitaGL.a)
+add_dependencies(vitaGL_vendored_lib vitaGL_vendored)
+
 # makes sincos, sincosf, etc. visible
 add_definitions(-D_GNU_SOURCE -D__POSIX_VISIBLE=999999)
 
@@ -143,6 +163,7 @@ add_dependencies(${CMAKE_PROJECT_NAME} SceLibcBridge)
 
 target_include_directories(${CMAKE_PROJECT_NAME} SYSTEM
                            PUBLIC ${CMAKE_SOURCE_DIR}/lib
+                           PUBLIC ${VITAGL_VENDOR_DIR}/source
                            )
 
 target_include_directories(${CMAKE_PROJECT_NAME}
@@ -152,7 +173,7 @@ target_include_directories(${CMAKE_PROJECT_NAME}
 target_link_libraries(${CMAKE_PROJECT_NAME}
                       -Wl,--whole-archive pthread -Wl,--no-whole-archive
                       stdc++
-                      vitaGL
+                      vitaGL_vendored_lib
                       vitashark
                       SceShaccCgExt
                       taihen_stub

@@ -19,6 +19,7 @@
 #include "utils/utils.h"
 #include "utils/glutil.h"
 #include "reimpl/jmp_shim.h"
+#include "wr_touch.h"
 
 #include <psp2/kernel/processmgr.h>
 #include <stdint.h>
@@ -26,6 +27,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 extern so_module so_mod;
 
@@ -1700,6 +1702,10 @@ static void SGL_grpFillRect_hook(int x, int y, int w, int h, uint32_t color) {
     // glVertexPointer/glDrawArrays removes this hook from that shared state
     // machinery altogether -- no interaction with the engine's own vertex/
     // color/texcoord buffers in either direction.
+    // The original emits GL_FIXED (v << 16), which wraps to int16: a tall DESC
+    // popup stores a negative DESC_nY in a ushort (out_ghidra.c:125653) and
+    // relies on that wrap -- plain float conversion put its fill at y~65545.
+    x = (int16_t) x; y = (int16_t) y; x2 = (int16_t) x2; y2 = (int16_t) y2;
     static GLfloat verts[8];
     verts[0] = (GLfloat) x;  verts[1] = (GLfloat) y;
     verts[2] = (GLfloat) x2; verts[3] = (GLfloat) y;
@@ -1713,8 +1719,20 @@ static void SGL_grpFillRect_hook(int x, int y, int w, int h, uint32_t color) {
     float b = ((color >> 16) & 0xff) / 255.0f;
     float a = ((color >> 24) & 0xff) / 255.0f;
 
-    glDisableClientState(GL_COLOR_ARRAY);
+    // Draw like a normal sprite (unit 0 + texcoords + white tex) instead of
+    // relying on unit 1's state, which Corrida 101's mask hook leaves off.
+    static const GLfloat uvs[8] = {0}; // white 1x1 tex: any UV samples (1,1,1,1)
+    glActiveTexture(GL_TEXTURE1);
+    GLboolean tex1_before = glIsEnabled(GL_TEXTURE_2D);
+    glDisable(GL_TEXTURE_2D);
+    glClientActiveTexture(GL_TEXTURE1);
+    GLboolean tc1_before = glIsEnabled(GL_TEXTURE_COORD_ARRAY);
     glDisableClientState(GL_TEXTURE_COORD_ARRAY);
+    glActiveTexture(GL_TEXTURE0);
+    glClientActiveTexture(GL_TEXTURE0);
+    glDisableClientState(GL_COLOR_ARRAY);
+    glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+    glTexCoordPointer(2, GL_FLOAT, 0, uvs);
 
     glDisable(GL_CULL_FACE);
     glDisable(GL_DEPTH_TEST);
@@ -1732,7 +1750,13 @@ static void SGL_grpFillRect_hook(int x, int y, int w, int h, uint32_t color) {
     glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
 
     if (color_array_before) glEnableClientState(GL_COLOR_ARRAY);
-    if (texcoord_array_before) glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+    if (!texcoord_array_before) glDisableClientState(GL_TEXTURE_COORD_ARRAY);
+    glActiveTexture(GL_TEXTURE1);
+    if (tex1_before) glEnable(GL_TEXTURE_2D);
+    glClientActiveTexture(GL_TEXTURE1);
+    if (tc1_before) glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+    glActiveTexture(GL_TEXTURE0);
+    glClientActiveTexture(GL_TEXTURE0);
     // Corrida 97: the real SGL_grpFillRect (out_ghidra.c:106195-106210) does
     // glDisable(GL_TEXTURE_2D) unconditionally at entry and glEnable(
     // GL_TEXTURE_2D) unconditionally at return -- NOT a save/restore of
@@ -1888,6 +1912,48 @@ static int CS_fsOpen_hook(const char *name, int mode, int type) {
     return SO_CONTINUE(int, h_CS_fsOpen, name, mode, type);
 }
 
+// Save-loss guard: the game overwrites save<N>.dat in place (O_TRUNC, no temp
+// file) and "New Game" on an occupied slot unlinks it before the new
+// character exists (MENUSAVESLOT_DeleteSlot, out_ghidra.c:114424). Keep the
+// previous save as .bak on every write, and turn deletes into a move to .del
+// (separate suffix so the next writes' .bak rotation can't overwrite it).
+static so_hook h_SAVE_SaveDataAsNameAndKey, h_CS_fsRemove;
+
+static bool is_save_file(const char *n) {
+    const char *base = n ? strrchr(n, '/') : NULL;
+    base = base ? base + 1 : n;
+    return base && strncmp(base, "save", 4) == 0 && strstr(base, ".dat") != NULL;
+}
+
+static void save_move_aside(const char *name, const char *suffix) {
+    char src[512], dst[520];
+    if (name[0] == '/') {
+        snprintf(src, sizeof(src), "%s", name);
+    } else {
+        char *user_dir = ((fn_str_void_t)(so_mod.text_base + OFF_jGetUserDir))();
+        char *pkg = ((fn_str_void_t)(so_mod.text_base + OFF_jGetPackageName))();
+        snprintf(src, sizeof(src), "%s%s/%s", user_dir ? user_dir : "", pkg ? pkg : "", name);
+    }
+    snprintf(dst, sizeof(dst), "%s%s", src, suffix);
+    struct stat st;
+    if (stat(src, &st) != 0 || st.st_size == 0) return; // never replace a good backup with an empty file
+    unlink(dst); // sceIoRename fails if the target exists
+    if (rename(src, dst) != 0) l_warn("save guard: rename(\"%s\" -> \"%s\") failed", src, dst);
+    else l_info("save guard: kept previous \"%s\" as \"%s\"", src, dst);
+}
+
+// Real takes (name, data, len[, key]) per callers (out_ghidra.c:82243); r3 passed through untouched.
+static int SAVE_SaveDataAsNameAndKey_hook(const char *name, void *data, int len, void *key) {
+    if (is_save_file(name)) save_move_aside(name, ".bak");
+    return SO_CONTINUE(int, h_SAVE_SaveDataAsNameAndKey, name, data, len, key);
+}
+
+static void CS_fsRemove_hook(const char *name, int type) {
+    // every caller re-checks with FILE_IsExist, so moving instead of unlinking is transparent
+    if (type == 1 && is_save_file(name)) { save_move_aside(name, ".del"); return; }
+    SO_CONTINUE_VOID(h_CS_fsRemove, name, type);
+}
+
 // --- Corrida 61: user reports touch stops working and the character stops
 // moving right after finishing the tutorial and arriving at the next stage,
 // while the game keeps rendering (not crashed/frozen) -- audited every known
@@ -2000,6 +2066,29 @@ static int *g_ptr_EVTSYSTEM_nID = NULL;
 static int *g_ptr_EVTSYSTEM_nState = NULL;
 static uint16_t *g_ptr_STATE_nState = NULL;
 static uint8_t *g_ptr_adBlocked = NULL; // Corrida 75
+static uint8_t *g_ptr_onCPI = NULL;
+static uintptr_t g_draw_tabjoy, g_draw_hubgem, g_draw_terms;
+static so_hook h_UICONTROLLIST_Add, h_TouchUIView_InitMenu;
+
+// Drop the title-menu FREE GEM (Tapjoy) and Hub "Get 5x" controls before they
+// enter UI_listControl (STATE_EnterMenu, out_ghidra.c:112522-112539): no draw,
+// no touch, no D-pad stop. Draw callback lives at UICONTROL +0x24.
+static int UICONTROLLIST_Add_hook(int *list, uint8_t *ctrl) {
+    if (ctrl) {
+        uintptr_t draw = *(uintptr_t *)(ctrl + 0x24);
+        if ((g_draw_tabjoy && draw == g_draw_tabjoy) || (g_draw_hubgem && draw == g_draw_hubgem) ||
+            (g_draw_terms && draw == g_draw_terms)) // + top-left Terms of Use scroll
+            return 1; // pretend success
+    }
+    return SO_CONTINUE(int, h_UICONTROLLIST_Add, list, ctrl);
+}
+
+// onCPI gates the field-HUD FREE GEM draw (TouchUIView_DrawMenu) and its touch
+// (handleCletEvent -> CS_tapjoyShowOffers); InitMenu is its only setter.
+static void TouchUIView_InitMenu_hook(void) {
+    SO_CONTINUE_VOID(h_TouchUIView_InitMenu);
+    if (g_ptr_onCPI) *g_ptr_onCPI = 0;
+}
 static int g_gamestate_transition_log_count = 0;
 static int g_evtsystem_transition_log_count = 0;
 static int g_map_load_log_count = 0;
@@ -3011,6 +3100,95 @@ static void STATE_ProcessLogo_hook(void) {
     SO_CONTINUE_VOID(h_STATE_ProcessLogo);
 }
 
+// --- wr_touch.c's L+R chord: hide the on-screen touch-control graphics ------
+//
+// wr_touch.c's TOGGLE_TOUCH_UI_CHORD_MASK sets g_touch_ui_hidden (read via
+// wr_touch_ui_hidden()) when the user taps L+R -- purely a request to hide
+// the D-pad art + attack/skill/item circle cluster BUTTON_MAP already
+// synthesizes taps at. This is where that flag actually does something.
+//
+// Investigation (reading out_ghidra.c/out_ghidra.h): the whole on-screen
+// touch-control overlay is the engine's own "virtual pad" system --
+// `gVpControl`, a 15-slot array (0x8c/140 bytes each) covering, by index:
+// 1=pause/menu icon, 2=minimap icon, 3-8=the 6 skill/item circles,
+// 9-11=the 3 party-portrait character-switch buttons, 0xc=the d-pad,
+// 0xd=the attack button, 0xe=the shop/buy icon. `VP_Draw()` ==
+// `VP_DrawBackGround(); VP_DrawObject(); VP_DrawForeGround();` loops over
+// ALL 15 slots every frame and dispatches to small per-slot draw callbacks
+// by function pointer (VP_DrawBackGround/VP_DrawObject read each slot's
+// stored callback pointers directly, out_ghidra.c ~115543/~116179).
+// VP_DrawForeGround is unconditionally empty in this build.
+//
+// Hooking VP_Draw itself would ALSO hide the minimap icon, all 3 party
+// portraits, and the shop button -- none of which BUTTON_MAP maps a
+// physical button to, and none of which this toggle is supposed to touch.
+// Instead this hooks the individual per-slot draw callbacks BUTTON_MAP's
+// cluster actually uses (confirmed by reading every VP_ObjectAddEx call in
+// VP_Init, out_ghidra.c ~116309-116407, which wires up each slot's
+// callbacks by name):
+//   - VP_DrawObj_Skill (only slots 3-8), VP_DrawObjectAni_Pad/
+//     VP_DrawObjectBack_Pad (only slot 0xc), VP_DrawObjectAni_Pad_Fire/
+//     VP_DrawObjectBack_PadFire (only slot 0xd), VP_DrawObjectBack_Nenu
+//     (only slot 1) -- each used EXCLUSIVELY by one of our target slots
+//     (confirmed by grepping every call site of each in the whole
+//     decompile), so these unconditionally no-op when hidden.
+//   - VP_DrawObj and VP_DrawObjectAni_Normal are ALSO shared by slot 0xe
+//     (shop/buy icon, not ours) -- VP_DrawObjectAni_Normal is additionally
+//     shared by slot 2 (minimap icon, not ours either) -- both hooks only
+//     no-op for OUR indices (wr_vp_index_is_touch_ui below), passing every
+//     other index's call straight through.
+//   - VP_DrawObjectRepeat draws whichever slot is currently held/pressed
+//     (any of the 15, chosen at runtime by gVpControl's "currently touched"
+//     index) -- same per-index filter.
+//
+// Every one of these functions (read in full) does nothing but issue GL
+// draw calls (GRPX_DrawObject/GRPX_DrawObjectEx*) -- no state mutation, no
+// animation-timer advance, no input handling -- so no-opping them is purely
+// visual. Real touchscreen hit-testing (VP_TouchEvent_Process) and physical-
+// button synthetic taps (wr_process_buttons()/BUTTON_MAP, which calls
+// native_event() directly) are both entirely separate code paths that never
+// call through any of these draw functions, so both keep working
+// identically whether hidden or not.
+static so_hook h_VP_DrawObj, h_VP_DrawObjectAni_Normal, h_VP_DrawObjectRepeat,
+        h_VP_DrawObj_Skill, h_VP_DrawObjectAni_Pad, h_VP_DrawObjectBack_Pad,
+        h_VP_DrawObjectAni_Pad_Fire, h_VP_DrawObjectBack_PadFire, h_VP_DrawObjectBack_Nenu;
+
+// True for exactly the gVpControl slots BUTTON_MAP maps a physical button
+// to: the pause/menu icon (1), the 6 skill/item circles (3-8), the d-pad
+// (0xc), and the attack button (0xd).
+static char *g_ptr_PLAYER_ShortcutBar;
+static uint8_t *g_ptr_PLAYER_nShortcutIndex; // 1-byte global in the 1-3-2 .so
+
+// Dimmed slots: pause(1), skill/empty circles(3-8, but NOT item/potion
+// slots: shortcut type 2, see UI_SHORTCUT_Draw out_ghidra.c:129705), d-pad(0xc),
+// attack(0xd), shop(0xe). Map(2) and portraits(9-11) always stay fully visible.
+static int wr_vp_dimmed(int idx) {
+    if (!wr_touch_ui_hidden()) return 0;
+    if (idx >= 3 && idx <= 8) {
+        int e = (g_ptr_PLAYER_nShortcutIndex ? *g_ptr_PLAYER_nShortcutIndex : 0) - 3 + idx;
+        return !(g_ptr_PLAYER_ShortcutBar && e >= 0 && e < 12 && // PLAYER_ShortcutBar = 12 x 0xc bytes
+                 g_ptr_PLAYER_ShortcutBar[e * 0xc] == 2);
+    }
+    return idx == 1 || idx == 0xc || idx == 0xd || idx == 0xe;
+}
+
+// 1% opacity rather than a skipped draw, so the HUD stays touchable (touch
+// hit-testing never goes through these draw callbacks).
+#define VP_DIM_CONTINUE(h, idx) do { int d_ = wr_vp_dimmed(idx); \
+    if (d_) gl_set_alpha_mul(0.01f); \
+    SO_CONTINUE_VOID(h, idx); \
+    if (d_) gl_set_alpha_mul(1.0f); } while (0)
+
+static void VP_DrawObj_hook(int idx)                { VP_DIM_CONTINUE(h_VP_DrawObj, idx); }
+static void VP_DrawObjectAni_Normal_hook(int idx)   { VP_DIM_CONTINUE(h_VP_DrawObjectAni_Normal, idx); }
+static void VP_DrawObjectRepeat_hook(int idx)       { VP_DIM_CONTINUE(h_VP_DrawObjectRepeat, idx); }
+static void VP_DrawObj_Skill_hook(int idx)          { VP_DIM_CONTINUE(h_VP_DrawObj_Skill, idx); }
+static void VP_DrawObjectAni_Pad_hook(int idx)      { VP_DIM_CONTINUE(h_VP_DrawObjectAni_Pad, idx); }
+static void VP_DrawObjectBack_Pad_hook(int idx)     { VP_DIM_CONTINUE(h_VP_DrawObjectBack_Pad, idx); }
+static void VP_DrawObjectAni_Pad_Fire_hook(int idx) { VP_DIM_CONTINUE(h_VP_DrawObjectAni_Pad_Fire, idx); }
+static void VP_DrawObjectBack_PadFire_hook(int idx) { VP_DIM_CONTINUE(h_VP_DrawObjectBack_PadFire, idx); }
+static void VP_DrawObjectBack_Nenu_hook(int idx)    { VP_DIM_CONTINUE(h_VP_DrawObjectBack_Nenu, idx); }
+
 void so_patch(void) {
     hook_addr(so_mod.text_base + OFF_excuteDirectly, (uintptr_t)&excuteDirectly_bypass);
     hook_addr(so_mod.text_base + OFF_jIsCracked, (uintptr_t)&jIsCracked_bypass);
@@ -3253,6 +3431,26 @@ void so_patch(void) {
     hook_addr(addr_SGL_DrawTexturePartWithMask, (uintptr_t)&SGL_DrawTexturePartWithMask_hook);
     l_error("Corrida 101: SGL_DrawTexturePartWithMask hooked at 0x%lx", (unsigned long)addr_SGL_DrawTexturePartWithMask);
 
+    g_draw_tabjoy = so_symbol(&so_mod, "MAINMENU_DrawTabjoy");
+    g_draw_hubgem = so_symbol(&so_mod, "MAINMENU_DrawGetHubGem");
+    g_draw_terms = so_symbol(&so_mod, "MAINMENU_DrawTermsOfUse");
+    uintptr_t addr_UICONTROLLIST_Add = so_symbol(&so_mod, "UICONTROLLIST_Add");
+    if (addr_UICONTROLLIST_Add && (g_draw_tabjoy || g_draw_hubgem || g_draw_terms))
+        h_UICONTROLLIST_Add = hook_addr(addr_UICONTROLLIST_Add, (uintptr_t)&UICONTROLLIST_Add_hook);
+    g_ptr_onCPI = (uint8_t *) so_symbol(&so_mod, "onCPI");
+    uintptr_t addr_TouchUIView_InitMenu = so_symbol(&so_mod, "TouchUIView_InitMenu");
+    if (addr_TouchUIView_InitMenu && g_ptr_onCPI)
+        h_TouchUIView_InitMenu = hook_addr(addr_TouchUIView_InitMenu, (uintptr_t)&TouchUIView_InitMenu_hook);
+
+    uintptr_t addr_SAVE_SaveDataAsNameAndKey = so_symbol(&so_mod, "SAVE_SaveDataAsNameAndKey");
+    uintptr_t addr_CS_fsRemove = so_symbol(&so_mod, "CS_fsRemove");
+    if (addr_SAVE_SaveDataAsNameAndKey && addr_CS_fsRemove) {
+        h_SAVE_SaveDataAsNameAndKey = hook_addr(addr_SAVE_SaveDataAsNameAndKey, (uintptr_t)&SAVE_SaveDataAsNameAndKey_hook);
+        h_CS_fsRemove = hook_addr(addr_CS_fsRemove, (uintptr_t)&CS_fsRemove_hook);
+    } else {
+        l_warn("save guard: SAVE_SaveDataAsNameAndKey/CS_fsRemove not found -- save backups disabled");
+    }
+
     uintptr_t addr_CS_fsOpen = so_symbol(&so_mod, "CS_fsOpen");
     if (addr_CS_fsOpen) {
         h_CS_fsOpen = hook_addr(addr_CS_fsOpen, (uintptr_t)&CS_fsOpen_hook);
@@ -3472,5 +3670,42 @@ void so_patch(void) {
     for (size_t i = 0; i < sizeof(g_com2us_vm_offsets) / sizeof(g_com2us_vm_offsets[0]); i++) {
         void **slot = (void **)(so_mod.text_base + g_com2us_vm_offsets[i]);
         *slot = &jvm;
+    }
+
+    // See the VP_Draw*-family hooks' own comment above -- wr_touch.c's L+R
+    // chord toggling the on-screen touch-control graphics.
+    g_ptr_PLAYER_ShortcutBar = (char *) so_symbol(&so_mod, "PLAYER_ShortcutBar");
+    g_ptr_PLAYER_nShortcutIndex = (uint8_t *) so_symbol(&so_mod, "PLAYER_nShortcutIndex");
+    uintptr_t addr_VP_DrawObj = so_symbol(&so_mod, "VP_DrawObj");
+    uintptr_t addr_VP_DrawObjectAni_Normal = so_symbol(&so_mod, "VP_DrawObjectAni_Normal");
+    uintptr_t addr_VP_DrawObjectRepeat = so_symbol(&so_mod, "VP_DrawObjectRepeat");
+    uintptr_t addr_VP_DrawObj_Skill = so_symbol(&so_mod, "VP_DrawObj_Skill");
+    uintptr_t addr_VP_DrawObjectAni_Pad = so_symbol(&so_mod, "VP_DrawObjectAni_Pad");
+    uintptr_t addr_VP_DrawObjectBack_Pad = so_symbol(&so_mod, "VP_DrawObjectBack_Pad");
+    uintptr_t addr_VP_DrawObjectAni_Pad_Fire = so_symbol(&so_mod, "VP_DrawObjectAni_Pad_Fire");
+    uintptr_t addr_VP_DrawObjectBack_PadFire = so_symbol(&so_mod, "VP_DrawObjectBack_PadFire");
+    uintptr_t addr_VP_DrawObjectBack_Nenu = so_symbol(&so_mod, "VP_DrawObjectBack_Nenu");
+    if (addr_VP_DrawObj && addr_VP_DrawObjectAni_Normal && addr_VP_DrawObjectRepeat &&
+        addr_VP_DrawObj_Skill && addr_VP_DrawObjectAni_Pad && addr_VP_DrawObjectBack_Pad &&
+        addr_VP_DrawObjectAni_Pad_Fire && addr_VP_DrawObjectBack_PadFire &&
+        addr_VP_DrawObjectBack_Nenu) {
+        h_VP_DrawObj = hook_addr(addr_VP_DrawObj, (uintptr_t)&VP_DrawObj_hook);
+        h_VP_DrawObjectAni_Normal =
+            hook_addr(addr_VP_DrawObjectAni_Normal, (uintptr_t)&VP_DrawObjectAni_Normal_hook);
+        h_VP_DrawObjectRepeat = hook_addr(addr_VP_DrawObjectRepeat, (uintptr_t)&VP_DrawObjectRepeat_hook);
+        h_VP_DrawObj_Skill = hook_addr(addr_VP_DrawObj_Skill, (uintptr_t)&VP_DrawObj_Skill_hook);
+        h_VP_DrawObjectAni_Pad = hook_addr(addr_VP_DrawObjectAni_Pad, (uintptr_t)&VP_DrawObjectAni_Pad_hook);
+        h_VP_DrawObjectBack_Pad =
+            hook_addr(addr_VP_DrawObjectBack_Pad, (uintptr_t)&VP_DrawObjectBack_Pad_hook);
+        h_VP_DrawObjectAni_Pad_Fire =
+            hook_addr(addr_VP_DrawObjectAni_Pad_Fire, (uintptr_t)&VP_DrawObjectAni_Pad_Fire_hook);
+        h_VP_DrawObjectBack_PadFire =
+            hook_addr(addr_VP_DrawObjectBack_PadFire, (uintptr_t)&VP_DrawObjectBack_PadFire_hook);
+        h_VP_DrawObjectBack_Nenu =
+            hook_addr(addr_VP_DrawObjectBack_Nenu, (uintptr_t)&VP_DrawObjectBack_Nenu_hook);
+    } else {
+        l_warn("wr_touch L+R hide-UI chord: one or more VP_Draw* symbols not found in .dynsym -- "
+               "hooks skipped, the chord will still toggle g_touch_ui_hidden but nothing will "
+               "visually change");
     }
 }

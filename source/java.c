@@ -375,7 +375,8 @@ static void inotia3_wrap_lines(const unsigned char *str, size_t len, int rectWid
             continue;
         }
 
-        if (line_width + cw > rectWidth && i > line_start) {
+        // a trailing space never forces a break, so re-wrapping at the measured width gives the same lines
+        if (str[i] != ' ' && line_width + cw > rectWidth && i > line_start) {
             int have_space = (last_space != (size_t) -1 && last_space > line_start);
             size_t break_at = have_space ? last_space : i;
             int width_used = have_space ? width_at_last_space : line_width;
@@ -501,9 +502,9 @@ jint GetStringWidth_stub(jmethodID id, va_list args) {
 // by FONT_Load -- see Corrida 42) rather than a real TrueType rasterizer:
 // same glyph lookup GRP_PutAsciiChar uses (out_ghidra.c:20971-20999) -- 94
 // printable ASCII glyphs (0x21-0x7E) at `FONT_pFontData + 0xb10 +
-// (ch-0x21)*0xc`, 12 bytes/glyph, rows 1-9 of each record (row 0 and 10/11
-// are metrics this port doesn't need -- GRP_PutAsciiChar itself never reads
-// them either), 5 columns per row in bits 7-3, bit CLEAR ("0") means ink
+// (ch-0x21)*0xc`, 12 bytes/glyph, rows 1-10 of each record (row 10 is the
+// descender row; rows 0/11 are always 0xFF and GRP_PutAsciiChar never reads
+// them), 5 columns per row in bits 7-3, bit CLEAR ("0") means ink
 // (confirmed: the default/space glyph is memset to 0xFF, all bits set, and
 // draws nothing). Writes full-white ARGB (0xFFFFFFFF) for ink pixels --
 // SGL_RenderFontToAlphaImageInRect only ever reads the alpha byte (bits
@@ -547,7 +548,7 @@ static void inotia3_draw_glyph(unsigned char ch, int x, int y, int stride) {
     const uint8_t *glyph = (const uint8_t *) (uintptr_t) font_base + 0xb10 + glyph_idx * 0xc;
     long buffer_capacity = (long) g_textview_width * (long) g_textview_height;
 
-    for (int row = 0; row < 9; row++) {
+    for (int row = 0; row < 10; row++) { // GRP_PutAsciiChar draws bytes 1..10; byte 10 = descenders (g j p q y)
         int py = y + row;
         if (py < 0) continue;
         uint8_t bits = glyph[1 + row];

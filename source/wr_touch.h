@@ -63,4 +63,14 @@ void wr_process_buttons(wr_native_event_fn native_event);
 // menu-cursor navigation" section). A no-op outside a qualifying menu state.
 void wr_touch_draw_menu_highlight(void);
 
+// True when wr_process_buttons()'s L+R chord (without SELECT -- see
+// TOGGLE_TOUCH_UI_CHORD_MASK in wr_touch.c) has toggled the on-screen
+// touch-control graphics (D-pad art + attack/skill/item circle cluster)
+// hidden. Purely a draw-time flag: patch.c's VP_Draw*-family hooks are the
+// only readers, and they no-op only the drawing of that cluster's gVpControl
+// slots -- both wr_process_touch() (real touchscreen taps) and
+// wr_process_buttons() (physical-button synthetic taps, BUTTON_MAP) keep
+// working identically regardless of this flag, since neither reads it.
+int wr_touch_ui_hidden(void);
+
 #endif // INOTIA3_WR_TOUCH_H

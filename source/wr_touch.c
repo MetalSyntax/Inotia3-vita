@@ -100,6 +100,12 @@ static inline int makeword(int x, int y) {
 #define WR_MENU_CURSOR_VIRTUAL_HW_ID (WR_VIRTUAL_HW_ID_BASE + 100) // distinct from BUTTON_MAP's 0..11
 
 static void *g_ui_list_control = NULL;  // &UI_listControl (a struct instance, not a pointer-to-struct)
+// CIRCLE = back/close (wr_circle_back) -- engine globals, resolved in wr_touch_init.
+static int16_t *g_state_nState;
+static int32_t *g_gamestate_nState;
+static uint8_t *g_popupmsg_bOn;
+static int32_t *g_keyset_nData;
+static int (*g_popupmsg_presskey)(int);
 static int g_menu_cursor_index = -1;
 static int g_was_active = 0;
 
@@ -219,23 +225,52 @@ void wr_touch_draw_menu_highlight(void) {
     ui_entry_rect(g_menu_cursor_index, &cx, &cy, &w, &h);
     if (w <= 0) w = 40;
     if (h <= 0) h = 40;
-    float x0 = cx - w / 2.0f, x1 = cx + w / 2.0f;
-    float y0 = cy - h / 2.0f, y1 = cy + h / 2.0f;
-    GLfloat verts[8] = { x0, y0, x1, y0, x1, y1, x0, y1 };
+    // Corner brackets only (Carnivores-vita input.c draw_overlay style): pad 2,
+    // thickness 1.5, arms 25% of the side capped at 10 -- all in 480x320 logical units.
+    float x0 = cx - w / 2.0f - 2.0f, x1 = cx + w / 2.0f + 2.0f;
+    float y0 = cy - h / 2.0f - 2.0f, y1 = cy + h / 2.0f + 2.0f;
+    const float t = 1.5f;
+    float lx = (x1 - x0) * 0.25f, ly = (y1 - y0) * 0.25f;
+    if (lx > 10.0f) lx = 10.0f;
+    if (ly > 10.0f) ly = 10.0f;
+    const float r[8][4] = {
+        { x0 - t, y0 - t, x0 + lx, y0 }, { x0 - t, y0, x0, y0 + ly },          // top-left
+        { x1 - lx, y0 - t, x1 + t, y0 }, { x1, y0, x1 + t, y0 + ly },          // top-right
+        { x0 - t, y1, x0 + lx, y1 + t }, { x0 - t, y1 - ly, x0, y1 },          // bottom-left
+        { x1 - lx, y1, x1 + t, y1 + t }, { x1, y1 - ly, x1 + t, y1 },          // bottom-right
+    };
+    static GLfloat verts[8 * 12]; // static: vitaGL may read client arrays after we return
 
     GLboolean tex2d = glIsEnabled(GL_TEXTURE_2D);
     GLboolean blend = glIsEnabled(GL_BLEND);
+    GLboolean cull = glIsEnabled(GL_CULL_FACE);   // quads can be culled under the y-down ortho (Corrida 92)
+    GLboolean carr = glIsEnabled(GL_COLOR_ARRAY); // a live color array would override glColor4f
     glDisable(GL_TEXTURE_2D);
+    glDisable(GL_CULL_FACE);
+    glDisableClientState(GL_COLOR_ARRAY);
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    glColor4f(1.0f, 1.0f, 0.2f, 0.9f);
-    glLineWidth(2.0f);
     glEnableClientState(GL_VERTEX_ARRAY);
     glVertexPointer(2, GL_FLOAT, 0, verts);
-    glDrawArrays(GL_LINE_LOOP, 0, 4);
+    // Pass 0: dark teal outline (#0E3A40) 1 unit wider so it reads on parchment buttons;
+    // pass 1: Inotia HUD cyan core (#5FF0FF).
+    for (int p = 0; p < 2; p++) {
+        float g = p == 0 ? 1.0f : 0.0f;
+        for (int i = 0; i < 8; i++) {
+            float a0 = r[i][0] - g, b0 = r[i][1] - g, a1 = r[i][2] + g, b1 = r[i][3] + g;
+            GLfloat *v = &verts[i * 12];
+            v[0] = a0; v[1] = b0; v[2] = a1; v[3]  = b0; v[4]  = a1; v[5]  = b1;
+            v[6] = a0; v[7] = b0; v[8] = a1; v[9]  = b1; v[10] = a0; v[11] = b1;
+        }
+        if (p == 0) glColor4f(0x0e / 255.0f, 0x3a / 255.0f, 0x40 / 255.0f, 0.8f);
+        else        glColor4f(0x5f / 255.0f, 0xf0 / 255.0f, 0xff / 255.0f, 0.9f);
+        glDrawArrays(GL_TRIANGLES, 0, 8 * 6);
+    }
     glColor4f(1.0f, 1.0f, 1.0f, 1.0f); // restore a sane default before the next frame's game draws
     if (tex2d) glEnable(GL_TEXTURE_2D); else glDisable(GL_TEXTURE_2D);
     if (!blend) glDisable(GL_BLEND);
+    if (cull) glEnable(GL_CULL_FACE);
+    if (carr) glEnableClientState(GL_COLOR_ARRAY);
 }
 
 void wr_touch_init(void) {
@@ -254,6 +289,11 @@ void wr_touch_init(void) {
         l_warn("wr_touch_init: UI_listControl not found -- "
                "D-pad menu navigation disabled, touch/BUTTON_MAP unaffected");
     }
+    g_state_nState      = (int16_t *) so_symbol(&so_mod, "STATE_nState");
+    g_gamestate_nState  = (int32_t *) so_symbol(&so_mod, "GAMESTATE_nState");
+    g_popupmsg_bOn      = (uint8_t *) so_symbol(&so_mod, "POPUPMSG_bOn");
+    g_keyset_nData      = (int32_t *) so_symbol(&so_mod, "KEYSET_nData");
+    g_popupmsg_presskey = (void *) so_symbol(&so_mod, "POPUPMSG_PressKey");
 }
 
 void wr_process_touch(wr_native_event_fn native_event) {
@@ -407,6 +447,41 @@ static unsigned int g_prev_buttons = 0;
 // fire a spurious in-game tap.
 #define REMAP_MENU_CHORD_MASK (SCE_CTRL_LTRIGGER | SCE_CTRL_RTRIGGER | SCE_CTRL_SELECT)
 
+// L+R together, WITHOUT SELECT, toggles hiding the on-screen touch-control
+// graphics (D-pad art + attack/skill/item circle cluster the game draws
+// every frame) -- a purely visual toggle, see patch.c's VP_Draw*-family
+// hooks (the only code that reads g_touch_ui_hidden, via wr_touch_ui_hidden()
+// below). Deliberately excludes SELECT so this can never fire on the same
+// frame as REMAP_MENU_CHORD_MASK above (checked first, and returns before
+// this is ever reached on that frame); requiring SELECT to be UP here too
+// means holding L+R while SELECT joins in later never double-fires this
+// chord either. LTRIGGER/RTRIGGER are ALSO each individually mapped to an
+// item quick-slot tap in BUTTON_MAP -- consumed_mask below suppresses just
+// those two for the frame the chord fires, same as REMAP_MENU_CHORD_MASK's
+// own comment describes, so toggling never ALSO fires a spurious item tap.
+#define TOGGLE_TOUCH_UI_CHORD_MASK (SCE_CTRL_LTRIGGER | SCE_CTRL_RTRIGGER)
+// START+SELECT is a second toggle combo (same edge-triggered toggle).
+#define TOGGLE_TOUCH_UI_CHORD2_MASK (SCE_CTRL_START | SCE_CTRL_SELECT)
+
+static int g_touch_ui_hidden = 1; // default: HUD cluster at 1% opacity (patch.c wr_vp_dimmed)
+
+int wr_touch_ui_hidden(void) {
+    return g_touch_ui_hidden;
+}
+
+// CIRCLE = back/close. Uses the engine's own Android BACK: nativeEvent(2, 4 /*KEYCODE_BACK*/)
+// -> handleKeyEvent (out_ghidra.c ~25042), which closes in-game menus (STATE 7, GAMESTATE 3..12)
+// but opens the quit Yes/No in the field (GAMESTATE 2) / title (STATE 5) -- skipped there -- and
+// is ignored while a POPUPMSG box is up, which we cancel the way the engine does (KEYSET_nData[18]).
+static void wr_circle_back(wr_native_event_fn native_event) {
+    if (!g_state_nState || !g_gamestate_nState || !g_popupmsg_bOn || !g_keyset_nData || !g_popupmsg_presskey) return;
+    if (*g_popupmsg_bOn) { g_popupmsg_presskey(g_keyset_nData[18]); return; }
+    if (*g_state_nState == 5) return;
+    if (*g_state_nState == 7 && (*g_gamestate_nState < 3 || *g_gamestate_nState > 12)) return;
+    native_event(2, 4, -1, -1); // CS_KEY_PRESSEVENT
+    native_event(3, 4, -1, -1); // CS_KEY_RELEASEEVENT
+}
+
 void wr_process_buttons(wr_native_event_fn native_event) {
     SceCtrlData pad;
     sceCtrlPeekBufferPositive(0, &pad, 1);
@@ -420,6 +495,27 @@ void wr_process_buttons(wr_native_event_fn native_event) {
         g_prev_buttons = pad.buttons;
         return; // skip this frame's normal dispatch; next frame resumes as usual
     }
+
+    // L+R without SELECT -- toggle hiding the on-screen touch-control
+    // graphics (see TOGGLE_TOUCH_UI_CHORD_MASK above). Unlike the remap
+    // chord above, this does NOT return early: it only needs to consume
+    // LTRIGGER/RTRIGGER's own individual BUTTON_MAP taps for this frame, via
+    // consumed_mask below, same as every other BUTTON_MAP entry already
+    // checks.
+    if ((pad.buttons & TOGGLE_TOUCH_UI_CHORD_MASK) == TOGGLE_TOUCH_UI_CHORD_MASK &&
+        (pad.buttons & SCE_CTRL_SELECT) == 0 &&
+        (g_prev_buttons & TOGGLE_TOUCH_UI_CHORD_MASK) != TOGGLE_TOUCH_UI_CHORD_MASK) {
+        g_touch_ui_hidden = !g_touch_ui_hidden;
+        consumed_mask |= TOGGLE_TOUCH_UI_CHORD_MASK;
+    } else if ((pad.buttons & TOGGLE_TOUCH_UI_CHORD2_MASK) == TOGGLE_TOUCH_UI_CHORD2_MASK &&
+               (g_prev_buttons & TOGGLE_TOUCH_UI_CHORD2_MASK) != TOGGLE_TOUCH_UI_CHORD2_MASK) {
+        g_touch_ui_hidden = !g_touch_ui_hidden;
+        consumed_mask |= TOGGLE_TOUCH_UI_CHORD2_MASK;
+    }
+
+    if ((pad.buttons & SCE_CTRL_CIRCLE) && !(g_prev_buttons & SCE_CTRL_CIRCLE))
+        wr_circle_back(native_event);
+    consumed_mask |= SCE_CTRL_CIRCLE; // CIRCLE is back-only, never a BUTTON_MAP tap
 
     int in_menu_cursor_mode = wr_touch_menu_cursor_active();
 

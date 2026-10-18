@@ -53,7 +53,8 @@ void gl_init() {
     // vitaGL defaults to triple buffering; double buffering trades some
     // tearing risk for lower memory/bandwidth pressure. Must be called
     // before vglInitExtended.
-    vglUseTripleBuffering(GL_FALSE);
+    // A/B test: portrait flicker appeared after switching to double buffering (cd6bcbc).
+    vglUseTripleBuffering(GL_TRUE);
     vglInitExtended(0, 960, 544, 6 * 1024 * 1024, SCE_GXM_MULTISAMPLE_NONE);
 }
 
@@ -327,10 +328,19 @@ void glClipPlanex_soloader(GLenum plane, const GLfixed *equation) {
     glClipPlanef(plane, eq);
 }
 
+static float g_alpha_mul = 1.0f, g_last_rgba[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+
 void glColor4x_soloader(GLfixed red, GLfixed green, GLfixed blue, GLfixed alpha) {
     static int c_count = 0;
     if(c_count++ < 10) l_debug("[GL] glColor4x r=%.2f g=%.2f b=%.2f a=%.2f", red/65536.0f, green/65536.0f, blue/65536.0f, alpha/65536.0f);
-    glColor4f(red / 65536.0f, green / 65536.0f, blue / 65536.0f, alpha / 65536.0f);
+    g_last_rgba[0] = red / 65536.0f; g_last_rgba[1] = green / 65536.0f;
+    g_last_rgba[2] = blue / 65536.0f; g_last_rgba[3] = alpha / 65536.0f;
+    glColor4f(g_last_rgba[0], g_last_rgba[1], g_last_rgba[2], g_last_rgba[3] * g_alpha_mul);
+}
+
+void gl_set_alpha_mul(float mul) {
+    g_alpha_mul = mul; // re-emit so draws that reuse the current color are scaled/restored too
+    glColor4f(g_last_rgba[0], g_last_rgba[1], g_last_rgba[2], g_last_rgba[3] * mul);
 }
 
 void glDepthRangex_soloader(GLfixed zNear, GLfixed zFar) {

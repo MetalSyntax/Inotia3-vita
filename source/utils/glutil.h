@@ -74,6 +74,8 @@ void glAlphaFuncx_soloader(GLenum func, GLfixed ref);
 void glClearDepthx_soloader(GLfixed depth);
 void glClipPlanex_soloader(GLenum plane, const GLfixed *equation);
 void glColor4x_soloader(GLfixed red, GLfixed green, GLfixed blue, GLfixed alpha);
+// Scales the alpha of every .so glColor4x (and re-applies the last color now).
+void gl_set_alpha_mul(float mul);
 void glDepthRangex_soloader(GLfixed zNear, GLfixed zFar);
 void glFogx_soloader(GLenum pname, GLfixed param);
 void glFrustumx_soloader(GLfixed left, GLfixed right, GLfixed bottom, GLfixed top, GLfixed zNear, GLfixed zFar);

@@ -165,13 +165,13 @@ void _log_print(int t, const char* fmt, ...) {
         // silently appended onto a previous, already-analyzed log instead of
         // starting a new file, making it look like no new log was ever
         // captured. An incremental counter has no such dependency: scan for
-        // the first log_NNN.txt that doesn't exist yet so every run gets its
+        // the first log_NNN.log that doesn't exist yet so every run gets its
         // own file regardless of the clock. Once all 999 slots are taken,
         // wrap back to 001 and truncate it (oldest log gets overwritten)
         // rather than silently stop logging.
         int slot = 1;
         for (; slot <= 999; slot++) {
-            sceClibSnprintf(log_path, sizeof(log_path), "ux0:data/inotia3/logs/log_%03d.txt", slot);
+            sceClibSnprintf(log_path, sizeof(log_path), "ux0:data/inotia3/logs/log_%03d.log", slot);
             SceUID probe = sceIoOpen(log_path, SCE_O_RDONLY, 0);
             if (probe < 0) {
                 break; // doesn't exist yet -- this is our slot
@@ -180,7 +180,7 @@ void _log_print(int t, const char* fmt, ...) {
         }
         if (slot > 999) {
             slot = 1;
-            sceClibSnprintf(log_path, sizeof(log_path), "ux0:data/inotia3/logs/log_%03d.txt", slot);
+            sceClibSnprintf(log_path, sizeof(log_path), "ux0:data/inotia3/logs/log_%03d.log", slot);
             SceUID trunc = sceIoOpen(log_path, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
             if (trunc >= 0) {
                 sceIoClose(trunc);
