@@ -15,4 +15,7 @@
 // when wr_touch.c detects the button-remap-menu chord.
 void remap_menu_run(void);
 
+// Cycles setting_fps 15 -> 23 -> 25 -> 30 -> 15, saves it, and shows the new value as an OSD toast.
+void fps_menu_cycle(void);
+
 #endif // INOTIA3_REMAP_MENU_H

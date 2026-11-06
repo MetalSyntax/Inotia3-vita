@@ -18,6 +18,7 @@
 #include "utils/logger.h"
 #include "utils/utils.h"
 #include "utils/glutil.h"
+#include "utils/settings.h"
 #include "reimpl/jmp_shim.h"
 #include "wr_touch.h"
 
@@ -450,6 +451,7 @@ static int g_mainprocess_log_count = 0;
 // normally but slowly (nState/LoadFrameCnt advancing tick to tick, elapsed
 // time revealing where the slowness actually is).
 static uint64_t g_last_tick_time = 0;
+static uint16_t *g_ptr_APPINFO_nTimer = NULL; // ms per tick: 66 (15 FPS) set by APPINFO_Initialize, 200 during BACKUP_*
 
 static void MainProcess_hook(uint32_t param_1, uint32_t param_2) {
     if (g_mainprocess_log_count < MAINPROCESS_LOG_MAX) {
@@ -480,6 +482,9 @@ static void MainProcess_hook(uint32_t param_1, uint32_t param_2) {
                 game_loader_ptext, ptext_str ? ptext_str : "");
         g_mainprocess_log_count++;
     }
+    // Game logic is frame-locked (no delta time), so this also scales game speed.
+    if (g_ptr_APPINFO_nTimer && *g_ptr_APPINFO_nTimer != 200 && setting_fps > 0)
+        *g_ptr_APPINFO_nTimer = (uint16_t) (1000 / setting_fps);
     SO_CONTINUE_VOID(h_MainProcess, param_1, param_2);
 }
 
@@ -3159,15 +3164,16 @@ static so_hook h_VP_DrawObj, h_VP_DrawObjectAni_Normal, h_VP_DrawObjectRepeat,
 static char *g_ptr_PLAYER_ShortcutBar;
 static uint8_t *g_ptr_PLAYER_nShortcutIndex; // 1-byte global in the 1-3-2 .so
 
-// Dimmed slots: pause(1), skill/empty circles(3-8, but NOT item/potion
-// slots: shortcut type 2, see UI_SHORTCUT_Draw out_ghidra.c:129705), d-pad(0xc),
+// Dimmed slots: pause(1), EMPTY circles(3-8; assigned ones -- type 1 skill
+// incl. its cooldown pie, type 2 item -- stay visible, see UI_SHORTCUT_Draw
+// out_ghidra.c:129705), d-pad(0xc),
 // attack(0xd), shop(0xe). Map(2) and portraits(9-11) always stay fully visible.
 static int wr_vp_dimmed(int idx) {
     if (!wr_touch_ui_hidden()) return 0;
     if (idx >= 3 && idx <= 8) {
         int e = (g_ptr_PLAYER_nShortcutIndex ? *g_ptr_PLAYER_nShortcutIndex : 0) - 3 + idx;
         return !(g_ptr_PLAYER_ShortcutBar && e >= 0 && e < 12 && // PLAYER_ShortcutBar = 12 x 0xc bytes
-                 g_ptr_PLAYER_ShortcutBar[e * 0xc] == 2);
+                 g_ptr_PLAYER_ShortcutBar[e * 0xc] != 0);
     }
     return idx == 1 || idx == 0xc || idx == 0xd || idx == 0xe;
 }
@@ -3225,6 +3231,7 @@ void so_patch(void) {
 
     uintptr_t addr_MainProcess = so_symbol(&so_mod, "MainProcess");
     g_ptr_gAppSleepInfo = (uint8_t *) so_symbol(&so_mod, "gAppSleepInfo");
+    g_ptr_APPINFO_nTimer = (uint16_t *) so_symbol(&so_mod, "APPINFO_nTimer");
     if (addr_MainProcess) {
         h_MainProcess = hook_addr(addr_MainProcess, (uintptr_t)&MainProcess_hook);
     } else {

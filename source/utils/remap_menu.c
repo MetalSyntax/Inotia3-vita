@@ -8,6 +8,7 @@
 #include "utils/dialog.h"
 #include "utils/glutil.h"
 #include "utils/utils.h"
+#include "overlay.h"
 
 #include <psp2/ctrl.h>
 #include <stdio.h>
@@ -127,4 +128,15 @@ void remap_menu_run(void) {
 
     settings_save();
     show_info_dialog("Listo -- los cambios se guardaron.");
+}
+
+void fps_menu_cycle(void) {
+    static const int FPS[] = { 15, 23, 25, 30 };
+    int i = 0;
+    while (i < 3 && FPS[i] != setting_fps) i++;
+    setting_fps = FPS[(i + 1) % 4];
+    settings_save();
+    char msg[32];
+    snprintf(msg, sizeof(msg), setting_fps == 15 ? "FPS: 15 (ORIGINAL)" : "FPS: %d", setting_fps);
+    osd_show(msg);
 }

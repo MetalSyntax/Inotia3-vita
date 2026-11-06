@@ -113,6 +113,7 @@ add_executable(${CMAKE_PROJECT_NAME}
                source/patch.c
                source/wr_timer.c
                source/wr_touch.c
+               source/overlay.c
                source/audio.c
                source/splash.c
                source/reimpl/apk_zip.c

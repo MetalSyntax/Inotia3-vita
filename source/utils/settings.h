@@ -32,6 +32,10 @@ extern bool setting_sampleSetting2;
 #define SETTING_BUTTON_REMAP_COUNT 12
 extern unsigned int setting_button_remap[SETTING_BUTTON_REMAP_COUNT];
 
+// Game tick rate (FPS): 15 = original (APPINFO_SetTimer(66)); 23/25/30 also
+// speed the game up, its logic is frame-locked. Applied in patch.c MainProcess_hook.
+extern int setting_fps;
+
 void settings_load();
 void settings_save();
 void settings_reset();

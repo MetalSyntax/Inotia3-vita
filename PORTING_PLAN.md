@@ -4094,6 +4094,26 @@ decompilado ante cualquier crash con `.psp2dmp`.
 >
 > Cambios de Corridas 102-107 commiteados en `cd6bcbc` (2026-08-19).
 
+> **Corrida 108 (2026-11-06) — Release 1.0.3: diálogos/arrastre, selector de FPS, toast OSD
+> (`source/wr_touch.c`, `source/overlay.c`, `source/patch.c`, `source/utils/settings.c`, `remap_menu.c`).**
+>
+> - Diálogos que no avanzaban / arrastre roto (bolsa, scroll de misiones): un slot táctil virtual de botón
+>   físico podía quedar sin `TOUCH_UP` (release solo por flanco; si se bloqueaba el botón al abrir un menú,
+>   nunca se soltaba). Ahora el release es por nivel y los acordes liberan todos los slots virtuales.
+> - El cursor de `UI_listControl` solo se activa si no hay popup (POPUPMSG/NPC/choice/wipe-out) y
+>   `IsIfreeEvent()` -- mismo orden de ruteo que `handleCletEvent`.
+> - Stick izquierdo = D-pad. Start+Select cicla `setting_fps` 15/23/25/30 escribiendo `APPINFO_nTimer` en
+>   `MainProcess_hook` (la lógica va por frame: más FPS = juego más rápido). Toast estilo Zenonia 4
+>   (`osd_show`) para FPS y para L+R (que ya no comparte acorde con Start+Select).
+> - Quick-slots con skill asignada (incl. cooldown) siguen visibles con el HUD oculto, no solo los ítems.
+> - **Probado y descartado para este release**: selector extendido (puntero libre con stick + snap a tablas
+>   de rects del menú de pausa/popups, `log_to_dev` vía `SGL_ChangeOrientationPosition`). En consola el
+>   puntero flotaba libre en el campo y los corchetes caían fuera de los botones del menú principal; además
+>   el color debería seguir el de las letras de cada pantalla. Se volvió al cursor de 1.0.2. Pendiente de
+>   investigar (offsets de las tablas en el comentario del código retirado: `OFF_TOUCHUI_MENU_BTN 0x16d74c`,
+>   `OFF_TOUCHUI_TAP_BTN 0x16d7bc`, `OFF_CHOICE_RECTS 0x56eb8c`, botones popup `0xd6924c/0xd692a4/0xd692d0`,
+>   NPC `0xd68b94/0xd68bc0/0xd68c44`; `g_uiView` +0x10 tab, +0x44/+0x48 lista).
+
 ## 3. Riesgos genéricos heredados de la arquitectura SoLoader (aplican igual que en cualquier port)
 ## 3. Riesgos genéricos heredados de la arquitectura SoLoader (aplican igual que en cualquier port)
 - Rutas con espacio en `PSVITA Develop` → build en `/tmp` (`porting_tools/build/build_and_install.sh` ya lo

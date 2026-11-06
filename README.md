@@ -77,7 +77,8 @@ The port supports both hardware buttons (mapped directly to on-screen UI positio
 | **L / R Triggers** | Quick Slots / Target Toggle |
 | **Start** | Pause Menu / System |
 | **Select** | Map / Character Info |
-| **L + R** or **Start + Select** | Show / hide the on-screen touch controls (hidden by default) |
+| **L + R** | Show / hide the on-screen touch controls (hidden by default) |
+| **Start + Select** | Cycle game speed: 15 (original) / 23 / 25 / 30 FPS |
 | **L + R + Select** | Button remap menu |
 | **Front Touchscreen** | Full Touch UI Navigation & Direct Movement |
 
@@ -86,8 +87,9 @@ The port supports both hardware buttons (mapped directly to on-screen UI positio
 ## Known Issues
 
 - **Online Hub / Store Disabled**: Online networking functions (Com2uS Hub, In-App Purchases, and News Banners) are disabled by design for offline stability.
-- **Touch HUD hidden by default**: The on-screen D-pad and action circles are drawn at 1% opacity (still touchable). Press **L + R** or **Start + Select** to show them.
+- **Touch HUD hidden by default**: The on-screen D-pad and action circles are drawn at 1% opacity (still touchable). Press **L + R** to show them.
 - **Main menu online buttons removed**: Tapjoy, Hub Gem and the Terms of Use scroll no longer appear on the title menu.
+- **Higher FPS also speeds the game up**: Game logic advances per frame, so 23/25/30 FPS (Start + Select) makes everything run faster than the original 15 FPS. The choice is saved in `ux0:data/inotia3/config.txt`.
 - **Save File Placement**: Save files are written directly to `ux0:data/inotia3/save<N>.dat` rather than subdirectories to ensure reliable persistence across sessions.
 
 ---

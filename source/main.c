@@ -4,6 +4,7 @@
 #include "utils/logger.h"
 #include "wr_timer.h"
 #include "wr_touch.h"
+#include "overlay.h"
 #include "audio.h"
 
 #include <psp2/kernel/threadmgr.h>
@@ -237,6 +238,7 @@ int main() {
         wr_run_timers(wr_update_time, wr_render);
         if (wr_take_present_request()) {
             wr_touch_draw_menu_highlight();
+            osd_draw();
             gl_swap();
         }
     }

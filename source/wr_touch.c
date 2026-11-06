@@ -8,6 +8,7 @@
 #include "utils/logger.h"
 #include "utils/settings.h"
 #include "utils/remap_menu.h"
+#include "overlay.h"
 
 #include <psp2/touch.h>
 #include <psp2/ctrl.h>
@@ -106,8 +107,18 @@ static int32_t *g_gamestate_nState;
 static uint8_t *g_popupmsg_bOn;
 static int32_t *g_keyset_nData;
 static int (*g_popupmsg_presskey)(int);
+// handleCletEvent (out_ghidra.c ~25243) routes a touch to, in order: the
+// POPUPMSG / NPC / choice / wipe-out popups, then UI_listControl only while
+// IsIfreeEvent(), then per-GAMESTATE ad-hoc handlers (pause menu, shops...).
+static uint8_t *g_npc_popup, *g_choice_popup, *g_wipe_popup;
+static int (*g_is_ifree_event)(void);
 static int g_menu_cursor_index = -1;
 static int g_was_active = 0;
+
+static int popup_active(void) {
+    return (g_popupmsg_bOn && *g_popupmsg_bOn) || (g_npc_popup && *g_npc_popup) ||
+           (g_choice_popup && *g_choice_popup) || (g_wipe_popup && *g_wipe_popup);
+}
 
 static int ui_list_count(void) {
     if (!g_ui_list_control) return 0;
@@ -138,7 +149,7 @@ static void ui_entry_rect(int idx, int *cx, int *cy, int *w, int *h) {
 // D-pad/Cross. Also owns (re)picking a starting selection whenever this just
 // became active, or the current index falls off a resized/changed control list.
 static int wr_touch_menu_cursor_active(void) {
-    int now_active = ui_list_count() > 0;
+    int now_active = ui_list_count() > 0 && !popup_active() && (!g_is_ifree_event || (g_is_ifree_event() & 0xff)); // C bool return: low byte only
     if (!now_active) {
         g_menu_cursor_index = -1;
     } else if (!g_was_active || g_menu_cursor_index < 0 ||
@@ -283,6 +294,7 @@ void wr_touch_init(void) {
     // psvita-porting skill's input_handling.md: sceTouchPeek() always
     // reports reportNum == 0 until sampling is explicitly turned on.
     sceTouchSetSamplingState(SCE_TOUCH_PORT_FRONT, SCE_TOUCH_SAMPLING_STATE_START);
+    sceCtrlSetSamplingMode(SCE_CTRL_MODE_ANALOG); // read_pad()'s left stick
 
     g_ui_list_control = (void *) so_symbol(&so_mod, "UI_listControl");
     if (!g_ui_list_control) {
@@ -294,6 +306,10 @@ void wr_touch_init(void) {
     g_popupmsg_bOn      = (uint8_t *) so_symbol(&so_mod, "POPUPMSG_bOn");
     g_keyset_nData      = (int32_t *) so_symbol(&so_mod, "KEYSET_nData");
     g_popupmsg_presskey = (void *) so_symbol(&so_mod, "POPUPMSG_PressKey");
+    g_npc_popup         = (uint8_t *) so_symbol(&so_mod, "NPCPopup");
+    g_choice_popup      = (uint8_t *) so_symbol(&so_mod, "isChoicePopupActive");
+    g_wipe_popup        = (uint8_t *) so_symbol(&so_mod, "WipeOutPopup");
+    g_is_ifree_event    = (void *) so_symbol(&so_mod, "IsIfreeEvent");
 }
 
 void wr_process_touch(wr_native_event_fn native_event) {
@@ -460,8 +476,8 @@ static unsigned int g_prev_buttons = 0;
 // those two for the frame the chord fires, same as REMAP_MENU_CHORD_MASK's
 // own comment describes, so toggling never ALSO fires a spurious item tap.
 #define TOGGLE_TOUCH_UI_CHORD_MASK (SCE_CTRL_LTRIGGER | SCE_CTRL_RTRIGGER)
-// START+SELECT is a second toggle combo (same edge-triggered toggle).
-#define TOGGLE_TOUCH_UI_CHORD2_MASK (SCE_CTRL_START | SCE_CTRL_SELECT)
+// START+SELECT cycles the FPS setting (fps_menu_cycle, remap_menu.c).
+#define FPS_CHORD_MASK (SCE_CTRL_START | SCE_CTRL_SELECT)
 
 static int g_touch_ui_hidden = 1; // default: HUD cluster at 1% opacity (patch.c wr_vp_dimmed)
 
@@ -482,17 +498,44 @@ static void wr_circle_back(wr_native_event_fn native_event) {
     native_event(3, 4, -1, -1); // CS_KEY_RELEASEEVENT
 }
 
-void wr_process_buttons(wr_native_event_fn native_event) {
+// Sends UP for every slot held by a physical button. A slot that never gets
+// its UP stays "pressed" in the engine forever: dialogue taps stop advancing,
+// drags become multi-touch, and once all slots leak no input works at all.
+static void release_virtual_slots(wr_native_event_fn native_event) {
+    for (int s = 0; s < WR_MAX_TOUCH_POINT; s++) {
+        if (slotHwId[s] >= WR_VIRTUAL_HW_ID_BASE) {
+            native_event(WR_TOUCH_UP, s + 1, makeword(slotX[s], slotY[s]), active_slot_count());
+            slotHwId[s] = -1;
+        }
+    }
+}
+
+// Left stick -> D-pad bits (same deadzone idea as the Zenonia ports).
+static unsigned int read_pad(void) {
     SceCtrlData pad;
     sceCtrlPeekBufferPositive(0, &pad, 1);
+    unsigned int b = pad.buttons;
+    if (pad.lx < 128 - 64) b |= SCE_CTRL_LEFT;
+    else if (pad.lx > 128 + 64) b |= SCE_CTRL_RIGHT;
+    if (pad.ly < 128 - 64) b |= SCE_CTRL_UP;
+    else if (pad.ly > 128 + 64) b |= SCE_CTRL_DOWN;
+    return b;
+}
+
+void wr_process_buttons(wr_native_event_fn native_event) {
+    unsigned int buttons = read_pad();
 
     unsigned int consumed_mask = 0;
 
-    if ((pad.buttons & REMAP_MENU_CHORD_MASK) == REMAP_MENU_CHORD_MASK &&
-        (g_prev_buttons & REMAP_MENU_CHORD_MASK) != REMAP_MENU_CHORD_MASK) {
-        remap_menu_run(); // blocks (own gl_swap() loop) until the flow finishes
-        sceCtrlPeekBufferPositive(0, &pad, 1); // re-sync -- chord buttons are surely released by now
-        g_prev_buttons = pad.buttons;
+    int remap = (buttons & REMAP_MENU_CHORD_MASK) == REMAP_MENU_CHORD_MASK &&
+                (g_prev_buttons & REMAP_MENU_CHORD_MASK) != REMAP_MENU_CHORD_MASK;
+    int fps = (buttons & FPS_CHORD_MASK) == FPS_CHORD_MASK &&
+              (g_prev_buttons & FPS_CHORD_MASK) != FPS_CHORD_MASK;
+    if (remap || fps) {
+        release_virtual_slots(native_event);
+        if (remap) remap_menu_run(); // blocks (own gl_swap() loop) until the flow finishes
+        else fps_menu_cycle();
+        g_prev_buttons = read_pad(); // re-sync so held chord buttons don't fire taps
         return; // skip this frame's normal dispatch; next frame resumes as usual
     }
 
@@ -502,18 +545,15 @@ void wr_process_buttons(wr_native_event_fn native_event) {
     // LTRIGGER/RTRIGGER's own individual BUTTON_MAP taps for this frame, via
     // consumed_mask below, same as every other BUTTON_MAP entry already
     // checks.
-    if ((pad.buttons & TOGGLE_TOUCH_UI_CHORD_MASK) == TOGGLE_TOUCH_UI_CHORD_MASK &&
-        (pad.buttons & SCE_CTRL_SELECT) == 0 &&
+    if ((buttons & TOGGLE_TOUCH_UI_CHORD_MASK) == TOGGLE_TOUCH_UI_CHORD_MASK &&
+        (buttons & SCE_CTRL_SELECT) == 0 &&
         (g_prev_buttons & TOGGLE_TOUCH_UI_CHORD_MASK) != TOGGLE_TOUCH_UI_CHORD_MASK) {
         g_touch_ui_hidden = !g_touch_ui_hidden;
+        osd_show(g_touch_ui_hidden ? "TOUCH CONTROLS: HIDDEN" : "TOUCH CONTROLS: SHOWN");
         consumed_mask |= TOGGLE_TOUCH_UI_CHORD_MASK;
-    } else if ((pad.buttons & TOGGLE_TOUCH_UI_CHORD2_MASK) == TOGGLE_TOUCH_UI_CHORD2_MASK &&
-               (g_prev_buttons & TOGGLE_TOUCH_UI_CHORD2_MASK) != TOGGLE_TOUCH_UI_CHORD2_MASK) {
-        g_touch_ui_hidden = !g_touch_ui_hidden;
-        consumed_mask |= TOGGLE_TOUCH_UI_CHORD2_MASK;
     }
 
-    if ((pad.buttons & SCE_CTRL_CIRCLE) && !(g_prev_buttons & SCE_CTRL_CIRCLE))
+    if ((buttons & SCE_CTRL_CIRCLE) && !(g_prev_buttons & SCE_CTRL_CIRCLE))
         wr_circle_back(native_event);
     consumed_mask |= SCE_CTRL_CIRCLE; // CIRCLE is back-only, never a BUTTON_MAP tap
 
@@ -526,24 +566,28 @@ void wr_process_buttons(wr_native_event_fn native_event) {
         // remapping), used below to tell movement/confirm apart regardless
         // of which physical button currently triggers them.
         unsigned int mapped_button = setting_button_remap[i] != 0 ? setting_button_remap[i] : m->button;
-        if (mapped_button & consumed_mask) continue;
 
-        // While the D-pad menu-cursor is active (UI_listControl has live
-        // entries), movement + confirm are repurposed for cursor nav/select
-        // (wr_touch_process_menu_cursor()) instead of tapping the on-screen
-        // movement d-pad / attack button.
-        if (in_menu_cursor_mode &&
-            (m->button == SCE_CTRL_UP || m->button == SCE_CTRL_DOWN ||
-             m->button == SCE_CTRL_LEFT || m->button == SCE_CTRL_RIGHT ||
-             m->button == SCE_CTRL_CROSS)) {
+        // In menus the D-pad/X drive the selector, and the field
+        // HUD taps (fixed coordinates) would only hit random menu items.
+        int blocked = (mapped_button & consumed_mask) || in_menu_cursor_mode;
+
+        int held = -1;
+        for (int s = 0; s < WR_MAX_TOUCH_POINT; s++)
+            if (slotHwId[s] == m->virtual_hw_id) { held = s; break; }
+        int now = !blocked && (buttons & mapped_button) != 0;
+        int before = (g_prev_buttons & mapped_button) != 0;
+
+        // Release is level-based: a held slot is freed whenever its button is
+        // up OR blocked (e.g. a dialogue opened menu-cursor mode while the
+        // D-pad was held). Edge-only release used to leak the slot forever.
+        if (held >= 0 && !now) {
+            native_event(WR_TOUCH_UP, held + 1, makeword(slotX[held], slotY[held]), active_slot_count());
+            slotHwId[held] = -1;
             continue;
         }
+        if (!now || before || held >= 0) continue; // press only on a fresh edge
 
-        int now = (pad.buttons & mapped_button) != 0;
-        int before = (g_prev_buttons & mapped_button) != 0;
-        if (now == before) continue; // no state change this frame
-
-        if (now) {
+        {
             // Press -- ACTION_DOWN, same slot pool wr_process_touch() uses.
             int slot = -1;
             for (int s = 0; s < WR_MAX_TOUCH_POINT; s++) {
@@ -559,22 +603,12 @@ void wr_process_buttons(wr_native_event_fn native_event) {
             slotY[slot] = m->y;
             slotDragTime[slot] = 0;
             native_event(WR_TOUCH_DOWN, slot + 1, makeword(m->x, m->y), active_slot_count());
-        } else {
-            // Release -- ACTION_UP, find whichever slot this button occupies.
-            for (int s = 0; s < WR_MAX_TOUCH_POINT; s++) {
-                if (slotHwId[s] == m->virtual_hw_id) {
-                    int touchCount = active_slot_count();
-                    native_event(WR_TOUCH_UP, s + 1, makeword(slotX[s], slotY[s]), touchCount);
-                    slotHwId[s] = -1;
-                    break;
-                }
-            }
         }
     }
 
     if (in_menu_cursor_mode) {
-        wr_touch_process_menu_cursor(pad.buttons, g_prev_buttons, native_event);
+        wr_touch_process_menu_cursor(buttons, g_prev_buttons, native_event);
     }
 
-    g_prev_buttons = pad.buttons;
+    g_prev_buttons = buttons;
 }

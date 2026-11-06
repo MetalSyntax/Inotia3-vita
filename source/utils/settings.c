@@ -15,10 +15,12 @@
 int  setting_sampleSetting;
 bool setting_sampleSetting2;
 unsigned int setting_button_remap[SETTING_BUTTON_REMAP_COUNT];
+int setting_fps;
 
 void settings_reset() {
     setting_sampleSetting  = 1;
     setting_sampleSetting2 = true;
+    setting_fps = 15;
     for (int i = 0; i < SETTING_BUTTON_REMAP_COUNT; i++) setting_button_remap[i] = 0;
 }
 
@@ -34,6 +36,7 @@ void settings_load() {
         while (EOF != fscanf(config, "%[^ ] %d\n", buffer, &value)) {
             if 		(strcmp("setting_sampleSetting", buffer) == 0) 	setting_sampleSetting  = (int)value;
             else if (strcmp("setting_sampleSetting2", buffer) == 0) setting_sampleSetting2 = (bool)value;
+            else if (strcmp("setting_fps", buffer) == 0) setting_fps = value;
             else {
                 for (int i = 0; i < SETTING_BUTTON_REMAP_COUNT; i++) {
                     char key[30];
@@ -47,6 +50,7 @@ void settings_load() {
         }
         fclose(config);
     }
+    if (setting_fps < 15 || setting_fps > 30) setting_fps = 15; // config.txt is user-editable
 }
 
 void settings_save() {
@@ -55,6 +59,7 @@ void settings_save() {
     if (config) {
         fprintf(config, "%s %d\n", "setting_sampleSetting", (int)(setting_sampleSetting));
         fprintf(config, "%s %d\n", "setting_sampleSetting2", (int)(setting_sampleSetting2));
+        fprintf(config, "%s %d\n", "setting_fps", setting_fps);
         for (int i = 0; i < SETTING_BUTTON_REMAP_COUNT; i++) {
             fprintf(config, "button_remap_%d %u\n", i, setting_button_remap[i]);
         }

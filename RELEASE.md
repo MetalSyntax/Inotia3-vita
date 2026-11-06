@@ -1,31 +1,65 @@
-# Release notes
+# Inotia 3: Children of Carnia v1.0.3 — PS Vita Port
 
-## 1.0.2 (2026-10-18)
+Bug-fix and quality-of-life update for the native Android-to-PS Vita wrapper port of **Inotia 3: Children of Carnia** (originally by Com2uS). Powered by so-loader, FalsoJNI, and vitaGL.
 
-### Fixed / attempted fixes
+This release builds on **v1.0.2**. It fixes input issues reported while playing on physical PS Vita hardware and adds a game speed option.
 
-| # | Issue | Status | Fix |
-|---|-------|--------|-----|
-| 1 | **Tall skill description panels lose their dark background.** On long skill descriptions (e.g. Fireball, Missile), the text appeared over the skill list with no background behind it. | Fixed (pending console confirmation) | When the popup is taller than the screen allows, the game stores a negative Y position in an unsigned 16-bit value. The original GL code converts it in a way that wraps back to the right negative value, but our `SGL_grpFillRect` hook converted it straight to float and drew the background off-screen at y≈65545. The hook now truncates coordinates to `int16_t` the same way the original does (`source/patch.c`). |
-| 2 | **Text cut off: letters with descenders (g, j, p, q, y) lost their bottom row, and some lines wrapped one word too early.** | Fixed | The glyph renderer now draws all 10 font rows (row 10 holds the descenders). A trailing space no longer forces a line break (`source/java.c`). |
-| 3 | **Circle didn't work as "back".** | Fixed | Circle now sends the engine's own Android BACK key: it closes in-game menus and cancels pop-up messages. It is ignored on the field and title screen, where BACK would open the quit dialog (`source/wr_touch.c`). |
-| 4 | **The on-screen touch controls cover the game when playing with physical buttons.** | Fixed | The D-pad art and action/skill/item circles are now drawn at 1% opacity by default and stay touchable. **L + R** or **Start + Select** toggles them. Skill quick-slots with an assigned skill stay visible (`source/patch.c`, `source/wr_touch.c`). |
-| 5 | **Online-only buttons on the main menu** (Tapjoy, Hub Gem, Terms of Use scroll) did nothing offline. | Fixed | These controls are no longer added to the menu, and the CPI banner flag is cleared (`source/patch.c`). |
-| 6 | **Risk of losing a save.** The game overwrites `save<N>.dat` in place and deletes it as soon as "New Game" is chosen on an occupied slot. | Fixed | Each save keeps the previous file as `save<N>.dat.bak`. Deleting a slot moves it to `save<N>.dat.del` instead (`source/patch.c`). To recover, rename the file back to `save<N>.dat`. |
+## 🛠️ Fixes & Improvements
 
-### Other changes
+1. **Dialogues advance again**: Cutscene dialogues could stop responding to both touch and buttons, forcing a restart. A button press could leave a virtual finger "stuck" on the screen; every press is now always released.
+2. **Dragging works again**: Quest descriptions scroll again, and items can be moved in the bag again, so equipping weapons and armour works.
+3. **Buttons no longer press hidden menu items**: While a pop-up, NPC window or dialogue choice is open, the D-pad and Cross no longer trigger the menu behind it.
+4. **Left stick works as a D-pad** everywhere, including in menus.
+5. **Game speed option (Start + Select)**: Cycles between 15 FPS (original), 23, 25 and 30 FPS. A short notice at the top of the screen shows the new value without pausing the game. The game's logic runs per frame, so a higher FPS also makes the game run faster. The choice is saved.
+6. **Skill quick-slots stay visible**: With the touch controls hidden, quick-slots that have a skill assigned (including its cooldown) are now shown, not only item slots.
+7. **L + R shows or hides the touch controls**, with an on-screen notice. Start + Select no longer does this; it now changes the game speed.
 
-- **vitaGL vendored** in `vendor/vitaGL`: the SDK's global `libvitaGL.a` had been rebuilt with unknown flags and caused a black screen. See `vendor/vitaGL/VENDORED.md`.
-- **Character portrait flicker (attempt):** triple buffering turned back on, because the flicker appeared after the switch to double buffering.
-- **Menu cursor (D-pad navigation):** the highlight is now drawn as cyan corner brackets that stay readable on parchment buttons.
-- Translucent fills now draw on texture unit 0 with a white texture, so they no longer depend on texture unit 1's leftover state.
-- Logs are now named `ux0:data/inotia3/logs/log_NNN.log`.
-- CPU/GPU clock requests no longer abort startup if the firmware rejects a frequency.
+## 📋 Prerequisites & Requirements
 
-## 1.0.1 (2026-08-13)
+Before installing, ensure your PS Vita has:
 
-- Fixed the missing top-left HUD character portrait (multi-texture rendering).
+- Custom Firmware (3.60 / 3.65 Enso recommended).
+- Plugins installed in `ur0:tai/config.txt` under `*KERNEL`:
+  - `kubridge.skprx` (v0.3 or newer)
+  - `fd_fix.skprx` (or rePatch)
+- `libshacccg.suprx` installed in `ur0:data/` (can be extracted using ShaRKBR33D).
 
-## 1.0.0
+## 📦 Installation Guide
 
-- First public release: offline campaign fully playable.
+**Updating from v1.0.0 / v1.0.1 / v1.0.2:** just install the new `inotia3.vpk`. Your game files and saves in `ux0:data/inotia3/` are kept.
+
+**Fresh install:**
+
+1. Install `inotia3.vpk` on your PS Vita using VitaShell.
+2. Legally obtain a copy of the Inotia 3: Children of Carnia Android APK (v1.3.2).
+3. Open the `.apk` using any zip extractor (like 7-Zip).
+4. Copy `lib/armeabi/libgame.so` to:
+   `ux0:data/inotia3/libgame.so`
+5. Extract the `assets/` folder from the `.apk` and copy its contents to:
+   `ux0:data/inotia3/assets/`
+   *(Or copy extracted game resources into `ux0:data/inotia3/assets/common/game_res/`)*
+6. Launch the game from LiveArea!
+
+## 🎮 Controls
+
+| Button | Action |
+| :--- | :--- |
+| D-Pad / Left Analog | Move Character / Navigate menus |
+| Cross (✕) | Attack / Confirm / Action |
+| Circle (◯) | Back / Close menu / Cancel pop-up |
+| Square (▢) | Skill / Quick Slot |
+| Triangle (Δ) | Special Skill / Quick Slot |
+| L / R Triggers | Quick Slots / Target Toggle |
+| Start | Pause Menu |
+| Select | Map / Character Info |
+| L + R | Show / hide on-screen touch controls |
+| **Start + Select** | **Game speed: 15 / 23 / 25 / 30 FPS** *(new)* |
+| L + R + Select | Button remap menu |
+| Touchscreen | Full Touch UI Navigation |
+
+## 📜 Credits
+
+- Original Game by **Com2uS**.
+- **TheOfficialFloW** for so_loader.
+- **Rinnegatamante** for vitaGL & FalsoJNI.
+- **Bythos** for kubridge.
